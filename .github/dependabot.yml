@@ -1,0 +1,47 @@
+# Dependabot version updates. Security updates are separate (repo settings →
+# Dependabot alerts) and fire immediately regardless of these schedules.
+# Shape: weekly, grouped minor/patch per ecosystem, low PR cap — major bumps
+# still arrive as individual PRs and deserve a human eye.
+version: 2
+updates:
+  # Actions are SHA-pinned for supply-chain reasons; dependabot preserves the
+  # pin and updates the version comment — this is what keeps pinning cheap.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # Rust deps (src-tauri); Cargo.lock is committed, and CI runs the full test
+  # suite, clippy, and the Windows cross-check, so bumps are covered.
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Root npm deps include the React runtime plus Tauri/Vite/Vitest tooling. The
+  # app's xterm is vendored under ui/vendor/ and updated deliberately by hand;
+  # CI tests and production-builds the frontend on every PR.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch

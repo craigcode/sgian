@@ -1,0 +1,751 @@
+name: CI
+
+# Supply-chain note: all first- and third-party actions are pinned to full
+# commit SHAs (release tag noted in a trailing comment) so a moved or
+# compromised tag cannot inject code into CI — this matters most for the
+# release job, which runs with contents:write and the signing secrets.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+# Serialize runs per ref so two tags pushed in quick succession cannot race
+# the release upload; an in-progress run is left to finish rather than being
+# cancelled mid-signing/notarization.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: fmt + clippy + test + vitest
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # dtolnay/rust-toolchain publishes only moving refs (stable/beta/nightly),
+      # so the `stable` branch head is pinned by commit SHA like every other
+      # action. Verify against: git ls-remote https://github.com/dtolnay/rust-toolchain refs/heads/stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+      - name: Format
+        working-directory: src-tauri
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        working-directory: src-tauri
+        run: cargo test
+      - name: Frontend tests (vitest)
+        run: |
+          npm ci
+          npm test
+      - name: Native macOS client (SwiftUI + daemon IPC)
+        env:
+          SGIAN_NATIVE_INTEGRATION: "1"
+          SGIAN_BACKEND_BINARY: ${{ github.workspace }}/src-tauri/target/debug/sgian
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml
+          swift test --package-path apps/macos
+      # The Windows transport is held to a "compiles" bar (see README); pin
+      # that bar in CI so cfg(windows) code cannot silently rot. The ring
+      # crate's build script needs the mingw-w64 cross C toolchain, which the
+      # runner image doesn't ship.
+      - name: Windows cross-compile check
+        working-directory: src-tauri
+        run: |
+          brew install mingw-w64
+          rustup target add x86_64-pc-windows-gnu
+          cargo check --target x86_64-pc-windows-gnu
+
+  build:
+    name: build app bundle
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+      - run: npm ci
+      # Fork PRs run without repository secrets, so detect whether the updater
+      # signing key is available instead of hard-requiring it (step-level `if:`
+      # cannot reference secrets directly).
+      - name: Detect updater signing key
+        id: signing
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "TAURI_SIGNING_PRIVATE_KEY is not available (fork PR?); building without updater artifacts."
+          fi
+      # Build only the .app on PR/main: a .dmg isn't useful for an unsigned PR
+      # build and skipping it keeps PR runs fast. DMG bundling IS headless-safe
+      # on GitHub Actions (see the release job comment for the full rationale),
+      # so this is a speed/size choice, not a headless constraint.
+      # TAURI_SIGNING_PRIVATE_KEY is required because createUpdaterArtifacts: true
+      # is set in tauri.conf.json — the updater tarball + .sig are generated even
+      # for --bundles app builds.
+      - name: Build .app
+        if: steps.signing.outputs.available == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --bundles app
+      # Same build for fork PRs, with updater-artifact generation disabled via
+      # an inline --config overlay so the missing signing key cannot fail it.
+      - name: Build .app (no updater signing)
+        if: steps.signing.outputs.available == 'false'
+        run: npm run tauri build -- --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - name: Packaged UI smoke
+        env:
+          SGIAN_UI_SMOKE_TIMEOUT_SECS: "120"
+        run: |
+          set -euo pipefail
+          app="$(ls -d src-tauri/target/release/bundle/macos/*.app | head -n1)"
+          ws="$RUNNER_TEMP/sgian-macos-ui-smoke"
+          marker="$RUNNER_TEMP/sgian-macos-ui-smoke-ok"
+          bash scripts/ui-smoke.sh "$app" "$ws" "$marker"
+      - name: Build and verify native macOS app
+        run: scripts/build-macos-native.sh
+      - name: Packaged native macOS UI smoke
+        env:
+          SGIAN_UI_SMOKE_TIMEOUT_SECS: "120"
+        run: |
+          set -euo pipefail
+          app="$GITHUB_WORKSPACE/apps/macos/build/Sgian.app"
+          ws="$RUNNER_TEMP/sgian-native-macos-ui-smoke"
+          marker="$RUNNER_TEMP/sgian-native-macos-ui-smoke-ok"
+          trap '"$app/Contents/Helpers/sgian" ctl --workspace "$ws" shutdown || true' EXIT
+          bash scripts/ui-smoke.sh "$app" "$ws" "$marker"
+      - name: Archive native macOS app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            apps/macos/build/Sgian.app \
+            apps/macos/build/Sgian-native-macos.zip
+      - name: Upload native macOS artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sgian-macos-native-${{ runner.arch }}
+          path: apps/macos/build/Sgian-native-macos.zip
+          if-no-files-found: error
+
+  # Linux tier-1 validation. Use Ubuntu 22.04 deliberately: it is the oldest
+  # Ubuntu baseline with Tauri 2's WebKitGTK 4.1 packages, so the generated
+  # AppImage does not accidentally acquire a newer glibc floor. In addition to
+  # compiling the GUI, run the Unix transport and agent process end-to-end.
+  build-linux:
+    name: build linux bundles + smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libayatana-appindicator3-dev \
+            libfuse2 \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            xvfb
+      - run: npm ci
+      - name: Linux Rust tests
+        working-directory: src-tauri
+        run: cargo test
+      - name: Build Debian and AppImage bundles
+        run: npm run tauri build -- --bundles deb,appimage --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - name: Smoke test daemon + ctl + agent
+        env:
+          XDG_DATA_HOME: ${{ runner.temp }}/sgian-data
+        run: |
+          set -euo pipefail
+          exe="$GITHUB_WORKSPACE/src-tauri/target/release/sgian"
+          ws="$RUNNER_TEMP/sgian-linux-smoke"
+          driver="$RUNNER_TEMP/fake-claude"
+          mkdir -p "$ws" "$XDG_DATA_HOME"
+          cat > "$driver" <<'SH'
+          #!/bin/sh
+          IFS= read -r message || true
+          printf '%s\n' '{"type":"system","subtype":"init","session_id":"fake-session-1","model":"fake","cwd":"/tmp","tools":[]}'
+          printf '%s\n' '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}}}'
+          printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"smoke-ok"}}}'
+          printf '%s\n' '{"type":"stream_event","event":{"type":"message_stop"}}'
+          printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"smoke-ok"}]}}'
+          printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"smoke-ok","duration_ms":1,"num_turns":1,"total_cost_usd":0.0,"usage":{}}'
+          SH
+          chmod 700 "$driver"
+          export SGIAN_CLAUDE_BIN="$driver"
+
+          dump_diagnostics() {
+            echo "=== Linux smoke diagnostics ==="
+            find "$XDG_DATA_HOME/Sgian" -maxdepth 6 -type f -print 2>/dev/null || true
+            find "$XDG_DATA_HOME/Sgian" -name daemon.log -type f -exec tail -n 80 {} \; 2>/dev/null || true
+            ps -ef | grep '[s]gian' || true
+          }
+          trap dump_diagnostics ERR
+
+          "$exe" ctl --workspace "$ws" new --name smoke
+          pids=()
+          for _ in $(seq 1 32); do
+            "$exe" ctl --workspace "$ws" panes --json >/dev/null &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do
+            wait "$pid"
+          done
+          echo "UNIX SOCKET CONCURRENCY SMOKE OK"
+          "$exe" ctl --workspace "$ws" send smoke 'echo sgian-linux-smoke-ok\n'
+          "$exe" ctl --workspace "$ws" new --agent smokebot
+          "$exe" ctl --workspace "$ws" send smokebot hi
+
+          log=''
+          for _ in $(seq 1 20); do
+            log="$(find "$XDG_DATA_HOME/Sgian/workspaces" -path '*/agents/*.jsonl' -type f -print -quit 2>/dev/null || true)"
+            if [ -n "$log" ] && grep -q '"turn_complete"' "$log"; then
+              break
+            fi
+            sleep 1
+          done
+          test -n "$log"
+          grep -q '"text_delta"' "$log"
+          grep -q '"turn_complete"' "$log"
+          echo "AGENT SMOKE OK ($log)"
+          soak_ws="$RUNNER_TEMP/sgian-linux-soak"
+          mkdir -p "$soak_ws"
+          bash "$GITHUB_WORKSPACE/scripts/transport-soak.sh" "$exe" "$soak_ws"
+          "$exe" ctl --workspace "$soak_ws" shutdown || true
+          "$exe" ctl --workspace "$ws" shutdown
+          trap - ERR
+          echo "LINUX SMOKE OK"
+      - name: Packaged UI smoke
+        env:
+          XDG_DATA_HOME: ${{ runner.temp }}/sgian-data
+          SGIAN_UI_SMOKE_TIMEOUT_SECS: "120"
+        run: |
+          set -euo pipefail
+          exe="$GITHUB_WORKSPACE/src-tauri/target/release/sgian"
+          ws="$RUNNER_TEMP/sgian-linux-ui-smoke"
+          marker="$RUNNER_TEMP/sgian-linux-ui-smoke-ok"
+          xvfb-run -a bash scripts/ui-smoke.sh "$exe" "$ws" "$marker"
+      - name: Upload Linux artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sgian-linux
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: warn
+
+  # Windows tier-1 validation: build a real NSIS installer on a Windows runner
+  # and run a headless daemon/ctl smoke test against it — the named-pipe
+  # transport's first runtime exercise (the macOS job only cross-compiles).
+  # Unsigned for now (no Authenticode cert); SmartScreen will warn. The
+  # installer is uploaded as a workflow artifact for manual testing.
+  build-windows:
+    name: build windows installer + smoke
+    runs-on: windows-latest
+    # Bounded: a hung smoke must fail fast (with diagnostics), never the 6h
+    # default job timeout. 30m covers cold-cache release builds (a full run is
+    # ~15m warm); hung processes still die here with the daemon-log dump.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: src-tauri
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+      - run: npm ci
+      - name: Windows transport unit tests
+        working-directory: src-tauri
+        run: cargo test --lib windows_pipe_tests
+      # Same fork-PR-safe signing-key detection as the macOS build job.
+      - name: Detect updater signing key
+        id: signing
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "TAURI_SIGNING_PRIVATE_KEY is not available (fork PR?); building without updater artifacts."
+          fi
+      - name: Build NSIS installer
+        if: steps.signing.outputs.available == 'true'
+        id: bundle
+        # bash (not the pwsh default) so the inline --config JSON keeps its
+        # double quotes when handed to the native tauri CLI.
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --bundles nsis
+      - name: Build NSIS installer (no updater signing)
+        if: steps.signing.outputs.available == 'false'
+        id: bundle-unsigned
+        shell: bash
+        run: npm run tauri build -- --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - name: Build native WinUI client + unsigned MSIX
+        shell: pwsh
+        run: scripts/build-windows-native.ps1 -Configuration Release -RuntimeIdentifier win-x64 -SkipRust
+      # Headless runtime smoke FROM THE INSTALLED NSIS PAYLOAD: silently install
+      # into an isolated runner directory, then use that executable to spawn the
+      # daemon (via its own current_exe), create/list/send, and shut down. Using
+      # target/release directly missed installed-path/packaging regressions.
+      # Exercises installer layout, self-spawn, named-pipe transport, token auth,
+      # and daemon lifecycle for real.
+      # On any failure, dump the daemon log + data dir + leftover processes —
+      # the smoke is also the Windows transport's diagnostic harness.
+      # NOTE: release builds are GUI-subsystem (windows_subsystem = "windows"),
+      # which pwsh does NOT wait for and never sets $LASTEXITCODE for — invoke
+      # via Start-Process -Wait -PassThru to get real exit codes. Console
+      # output still attaches to this console and lands in the log.
+      - name: Smoke test daemon + ctl
+        shell: pwsh
+        run: |
+          $installer = (Resolve-Path "src-tauri/target/release/bundle/nsis/*-setup.exe").Path
+          $installDir = Join-Path $env:RUNNER_TEMP "sgian-installed"
+          $install = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS silent install failed with exit $($install.ExitCode)" }
+          $installedExe = Get-ChildItem $installDir -Recurse -Filter sgian.exe -File | Select-Object -First 1
+          if (-not $installedExe) {
+            Get-ChildItem $installDir -Recurse -Force | Select-Object FullName, Length | Format-Table -AutoSize | Out-String | Write-Host
+            throw "installed NSIS payload contains no sgian.exe under $installDir"
+          }
+          $exe = $installedExe.FullName
+          Write-Host "SMOKE INSTALLED EXE: $exe"
+          $ws = Join-Path $env:RUNNER_TEMP "sgian-smoke"
+          New-Item -ItemType Directory -Force $ws | Out-Null
+          # Fake Claude driver (minimal probe-verified stream-json protocol):
+          # read one user line, emit init + streamed text + result, exit.
+          # Exercises the Windows agent-pane port end-to-end (.cmd via cmd /c).
+          $driver = Join-Path $env:RUNNER_TEMP "fake-claude.cmd"
+          # (Array-of-strings, not a here-string: pwsh requires the closing
+          # delimiter at column 0, which YAML block scalars forbid.)
+          $driverLines = @(
+            '@echo off',
+            'set /p msg=',
+            'echo {"type":"system","subtype":"init","session_id":"fake-session-1","model":"fake","cwd":"C:\\fake","tools":[]}',
+            'echo {"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}}}',
+            'echo {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"smoke-ok"}}}',
+            'echo {"type":"stream_event","event":{"type":"message_stop"}}',
+            'echo {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"smoke-ok"}]}}',
+            'echo {"type":"result","subtype":"success","is_error":false,"result":"smoke-ok","duration_ms":1,"num_turns":1,"total_cost_usd":0.0,"usage":{}}'
+          )
+          $driverLines | Set-Content -Path $driver -Encoding ascii
+          # The daemon is spawned by the first ctl command and inherits this env.
+          $env:SGIAN_CLAUDE_BIN = $driver
+          function Invoke-Sgian([string[]]$cmdArgs, [int]$timeoutMs = 60000) {
+            # Bounded wait: on timeout, kill the client and throw so the catch
+            # block dumps the daemon log at the exact hang point.
+            $p = Start-Process -FilePath $exe -ArgumentList $cmdArgs -PassThru -NoNewWindow
+            if (-not $p.WaitForExit($timeoutMs)) {
+              try { $p.Kill() } catch {}
+              throw "timed out after $($timeoutMs/1000)s: sgian $($cmdArgs -join ' ')"
+            }
+            return $p.ExitCode
+          }
+          try {
+            if ((Invoke-Sgian @('ctl','--workspace',$ws,'new','--name','smoke')) -ne 0) { throw "ctl new failed" }
+            # Concurrent clients used to lose the listener hand-off race with
+            # ERROR_PIPE_BUSY (231), after which ensure_daemon mislabeled the
+            # healthy daemon as wedged. Exercise a burst large enough to make
+            # that race deterministic on the Windows runner.
+            $burst = foreach ($i in 1..32) {
+              Start-Process -FilePath $exe -ArgumentList @('ctl','--workspace',$ws,'panes','--json') -PassThru -NoNewWindow
+            }
+            foreach ($p in $burst) {
+              if (-not $p.WaitForExit(60000)) {
+                try { $p.Kill() } catch {}
+                throw "concurrent named-pipe client timed out (pid $($p.Id))"
+              }
+              if ($p.ExitCode -ne 0) {
+                throw "concurrent named-pipe client failed with exit $($p.ExitCode) (pid $($p.Id))"
+              }
+            }
+            Write-Host "PIPE CONCURRENCY SMOKE OK"
+            if ((Invoke-Sgian @('ctl','--workspace',$ws,'panes','--json')) -ne 0) { throw "ctl panes failed" }
+            if ((Invoke-Sgian @('ctl','--workspace',$ws,'send','smoke','echo sgian-smoke-ok\n')) -ne 0) { throw "ctl send failed" }
+            if ((Invoke-Sgian @('ctl','--workspace',$ws,'new','--agent','smokebot')) -ne 0) { throw "ctl new --agent failed" }
+            if ((Invoke-Sgian @('ctl','--workspace',$ws,'send','smokebot','hi')) -ne 0) { throw "ctl send-to-agent failed" }
+            $soakWs = Join-Path $env:RUNNER_TEMP "sgian-windows-soak"
+            New-Item -ItemType Directory -Force $soakWs | Out-Null
+            & "$env:GITHUB_WORKSPACE/scripts/transport-soak.ps1" -Exe $exe -Workspace $soakWs -Rounds 3 -Burst 32
+            if ((Invoke-Sgian @('ctl','--workspace',$soakWs,'shutdown')) -ne 0) {
+              Write-Host "soak shutdown returned non-zero (continuing)"
+            }
+            # Wait for the fake driver's turn to land in the conversation log.
+            $log = $null
+            foreach ($i in 1..10) {
+              $log = Get-ChildItem (Join-Path $env:APPDATA 'Sgian\workspaces\*\agents\*.jsonl') -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($log -and (Select-String -Path $log.FullName -Pattern '"turn_complete"' -Quiet)) { break }
+              Start-Sleep -Seconds 3
+            }
+            if (-not $log) { throw "no agent conversation log found" }
+            if (-not (Select-String -Path $log.FullName -Pattern '"text_delta"' -Quiet)) { throw "agent log missing streamed text_delta" }
+            if (-not (Select-String -Path $log.FullName -Pattern '"turn_complete"' -Quiet)) { throw "agent log missing turn_complete" }
+            Write-Host "AGENT SMOKE OK ($($log.FullName))"
+            if ((Invoke-Sgian @('ctl','--workspace',$ws,'shutdown')) -ne 0) { throw "ctl shutdown failed" }
+            Write-Host "SMOKE OK"
+          } catch {
+            Write-Host "=== SMOKE FAILURE: $_ ==="
+            $root = Join-Path $env:APPDATA "Sgian"
+            if (Test-Path $root) {
+              Write-Host "=== data dir tree ($root) ==="
+              Get-ChildItem -Recurse -Force $root | Select-Object FullName, Length | Format-Table -AutoSize | Out-String | Write-Host
+              Get-ChildItem -Recurse -Force -Filter daemon*.log $root | ForEach-Object {
+                Write-Host "=== $($_.FullName) (tail) ==="
+                Get-Content $_.FullName -Tail 60 | Write-Host
+              }
+            } else {
+              Write-Host "=== no data dir at $root ==="
+            }
+            Write-Host "=== sgian processes ==="
+            Get-Process sgian -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime | Format-Table -AutoSize | Out-String | Write-Host
+            throw
+          }
+      - name: Packaged UI smoke
+        shell: pwsh
+        run: |
+          $installer = (Resolve-Path "src-tauri/target/release/bundle/nsis/*-setup.exe").Path
+          $installDir = Join-Path $env:RUNNER_TEMP "sgian-ui-smoke-installed"
+          $install = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS silent install failed with exit $($install.ExitCode)" }
+          $installedExe = Get-ChildItem $installDir -Recurse -Filter sgian.exe -File | Select-Object -First 1
+          if (-not $installedExe) { throw "installed NSIS payload contains no sgian.exe" }
+          $ws = Join-Path $env:RUNNER_TEMP "sgian-windows-ui-smoke"
+          $marker = Join-Path $env:RUNNER_TEMP "sgian-windows-ui-smoke-ok"
+          & "$env:GITHUB_WORKSPACE/scripts/ui-smoke.ps1" -Exe $installedExe.FullName -Workspace $ws -Marker $marker -TimeoutSecs 120
+      - name: Native WinUI UI smoke
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "apps/windows/build/win-x64/Sgian.Windows.exe").Path
+          $backend = Join-Path (Split-Path $exe -Parent) "Helpers/sgian.exe"
+          $ipcWs = Join-Path $env:RUNNER_TEMP "sgian-native-windows-ipc-smoke"
+          dotnet run --project apps/windows/Sgian.Protocol.Tests/Sgian.Protocol.Tests.csproj -c Release -- --integration $backend $ipcWs
+          if ($LASTEXITCODE -ne 0) { throw "Native Windows live IPC smoke failed" }
+          & $backend ctl --workspace $ipcWs shutdown
+          $ws = Join-Path $env:RUNNER_TEMP "sgian-native-windows-ui-smoke"
+          $marker = Join-Path $env:RUNNER_TEMP "sgian-native-windows-ui-smoke-ok"
+          & "$env:GITHUB_WORKSPACE/scripts/smoke-windows-native.ps1" -Exe $exe -Workspace $ws -Marker $marker -TimeoutSecs 120
+      # Upload even when the smoke test fails: the installer is still useful
+      # for manual debugging on real hardware.
+      - name: Upload installer artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sgian-windows-nsis
+          path: src-tauri/target/release/bundle/nsis/*.exe
+      - name: Upload native Windows artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sgian-windows-native-${{ runner.arch }}
+          path: |
+            apps/windows/build/Sgian-native-windows-win-x64.zip
+            apps/windows/build/msix/**/*.msix
+            apps/windows/build/msix/**/*.msixupload
+          if-no-files-found: error
+
+  release:
+    name: signed + notarized release
+    if: startsWith(github.ref, 'refs/tags/v')
+    # Never publish a release from an untested commit: the signed artifacts
+    # only ship after fmt/clippy/tests and the unsigned build both pass.
+    needs: [check, build, build-linux, build-windows]
+    runs-on: macos-latest
+    # softprops/action-gh-release needs contents:write to create the release
+    # on repos whose default GITHUB_TOKEN permission is read-only.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      # Deliberately no rust-cache here: release binaries are Developer-ID
+      # signed, so they must be compiled from scratch rather than linked from
+      # cache-restored object files (cache poisoning would otherwise be
+      # laundered into a signed, notarized artifact).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+      # Fail fast if the tag and the app version disagree: tagging v0.2.0
+      # without bumping tauri.conf.json would ship artifacts whose embedded
+      # version is stale, and the updater's semver check would see no upgrade.
+      - name: Verify tag matches tauri.conf.json version
+        run: |
+          CONF_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          if [ "$GITHUB_REF_NAME" != "v$CONF_VERSION" ]; then
+            echo "ERROR: tag '$GITHUB_REF_NAME' does not match version 'v$CONF_VERSION' in src-tauri/tauri.conf.json." >&2
+            echo "       Bump \"version\" in src-tauri/tauri.conf.json (or retag) and re-run." >&2
+            exit 1
+          fi
+      - run: npm ci
+
+      # Import the Developer ID Application certificate into a temporary keychain.
+      # Secrets are consumed via env: and decoded to files — never printed to stdout.
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Capture the current default keychain and search list BEFORE
+          # mutating them so the teardown step can restore them (matters on
+          # shared/self-hosted runners).
+          security default-keychain -d user > "$RUNNER_TEMP/default-keychain.txt" 2>/dev/null || true
+          security list-keychains -d user > "$RUNNER_TEMP/keychain-search-list.txt" 2>/dev/null || true
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -t 3600 -u "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          # Authorize codesign to use the imported private key without an
+          # interactive authorization prompt (which would hang on a headless
+          # runner).  The partition list grants apple-tool:, apple:, and
+          # codesign: access to the key.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          # Preserve the existing login and system keychains in the search
+          # list while adding the temporary build keychain, then set the build
+          # keychain as the default so codesign resolves the imported identity.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db /Library/Keychains/System.keychain
+          security default-keychain -s "$KEYCHAIN_PATH"
+
+      # Write the App Store Connect API key (.p8) from a base64 secret to a file.
+      - name: Prepare App Store Connect API key
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          echo "$APPLE_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+
+      # Full signed + notarized build: .app + .dmg + updater artifacts.
+      # DMG bundling is headless-safe on GitHub Actions: the runner sets CI=true
+      # automatically, and Tauri's DMG bundler passes --skip-jenkins to bundle_dmg
+      # when CI=true (crates/tauri-bundler/src/bundle/macos/dmg/mod.rs), which
+      # skips the AppleScript/Finder window-decoration step and produces a plain
+      # functional .dmg via hdiutil. No interactive Finder/AppleScript runs on the
+      # runner, so the release job does not require --bundles restriction. Set
+      # TAURI_BUNDLER_DMG_IGNORE_CI=true only if a decorated DMG is desired on a
+      # runner with a full interactive desktop session.
+      - name: Build signed + notarized app and DMG
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build
+
+      # Always clean up the temporary keychain and signing material (Developer
+      # ID .p12 and the App Store Connect API key .p8), and restore the
+      # pre-existing default keychain / search list, even if the build failed.
+      - name: Clean up keychain and signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/build.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/AuthKey.p8"
+          # xargs strips the quoting that `security` prints around each path.
+          if [ -s "$RUNNER_TEMP/keychain-search-list.txt" ]; then
+            xargs security list-keychains -d user -s < "$RUNNER_TEMP/keychain-search-list.txt" || true
+          fi
+          if [ -s "$RUNNER_TEMP/default-keychain.txt" ]; then
+            xargs security default-keychain -d user -s < "$RUNNER_TEMP/default-keychain.txt" || true
+          fi
+          rm -f "$RUNNER_TEMP/keychain-search-list.txt" "$RUNNER_TEMP/default-keychain.txt"
+
+      # Publish SHA-256 checksums alongside the artifacts so downloads can be
+      # verified out-of-band.
+      - name: Generate SHA-256 checksums
+        run: |
+          set -euo pipefail
+          BUNDLE=src-tauri/target/release/bundle
+          OUT="$BUNDLE/SHA256SUMS.txt"
+          : > "$OUT"
+          for f in "$BUNDLE"/dmg/Sgian_*.dmg \
+                   "$BUNDLE"/macos/Sgian.app.tar.gz \
+                   "$BUNDLE"/macos/Sgian.app.tar.gz.sig; do
+            (cd "$(dirname "$f")" && shasum -a 256 "$(basename "$f")") >> "$OUT"
+          done
+          cat "$OUT"
+
+      - name: Upload release artifacts
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          # Fail loudly if a bundler layout change stops any glob from
+          # matching, instead of shipping a release missing an artifact.
+          fail_on_unmatched_files: true
+          files: |
+            src-tauri/target/release/bundle/dmg/Sgian_*.dmg
+            src-tauri/target/release/bundle/macos/Sgian.app.tar.gz
+            src-tauri/target/release/bundle/macos/Sgian.app.tar.gz.sig
+            src-tauri/target/release/bundle/SHA256SUMS.txt
+
+  # Windows half of a tagged release: unsigned (no Authenticode cert yet) NSIS
+  # installer plus the updater-signed zip/sig. The updater's minisign
+  # signature is what update verification relies on, so unsigned-at-OS-level
+  # artifacts still update safely. Uploads land on the SAME GitHub release as
+  # the macOS job (action-gh-release upserts by tag); the checksum file uses a
+  # distinct name so the two jobs' files don't collide.
+  release-windows:
+    name: windows release artifacts
+    if: startsWith(github.ref, 'refs/tags/v')
+    # Do not publish Windows artifacts unless the Windows build and named-pipe
+    # runtime smoke (including its concurrent-client burst) passed.
+    needs: [check, build, build-linux, build-windows]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      # No rust-cache here, same rationale as the macOS release job: these
+      # artifacts are updater-signed, so they must be compiled from scratch
+      # rather than linked from cache-restored objects.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+      - name: Verify tag matches tauri.conf.json version
+        shell: bash
+        run: |
+          CONF_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          if [ "$GITHUB_REF_NAME" != "v$CONF_VERSION" ]; then
+            echo "ERROR: tag '$GITHUB_REF_NAME' does not match version 'v$CONF_VERSION' in src-tauri/tauri.conf.json." >&2
+            exit 1
+          fi
+      - run: npm ci
+        shell: bash
+      - name: Build NSIS installer + updater artifacts
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --bundles nsis
+      - name: Generate SHA-256 checksums
+        shell: pwsh
+        run: |
+          $BUNDLE = "src-tauri/target/release/bundle"
+          $out = "$BUNDLE/SHA256SUMS-windows.txt"
+          Get-ChildItem "$BUNDLE/nsis/Sgian_*-setup.exe", "$BUNDLE/nsis/*.zip", "$BUNDLE/nsis/*.sig" |
+            ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
+            Set-Content $out -Encoding ascii
+          Get-Content $out
+      - name: Upload release artifacts
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            src-tauri/target/release/bundle/nsis/Sgian_*-setup.exe
+            src-tauri/target/release/bundle/nsis/*.zip
+            src-tauri/target/release/bundle/nsis/*.sig
+            src-tauri/target/release/bundle/SHA256SUMS-windows.txt
+
+  # Linux half of a tagged release: a distro-native Debian package plus a
+  # portable AppImage. The AppImage signature is consumed by Tauri's updater;
+  # the checksum file covers every published Linux artifact.
+  release-linux:
+    name: linux release artifacts
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, build, build-linux, build-windows]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      # Deliberately no rust-cache in release jobs: updater-signed artifacts
+      # must be compiled from clean sources rather than restored object files.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libayatana-appindicator3-dev \
+            libfuse2 \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev
+      - name: Verify tag matches tauri.conf.json version
+        run: |
+          CONF_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          if [ "$GITHUB_REF_NAME" != "v$CONF_VERSION" ]; then
+            echo "ERROR: tag '$GITHUB_REF_NAME' does not match version 'v$CONF_VERSION' in src-tauri/tauri.conf.json." >&2
+            exit 1
+          fi
+      - run: npm ci
+      - name: Build Debian package, AppImage, and updater signature
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --bundles deb,appimage
+      - name: Generate SHA-256 checksums
+        run: |
+          set -euo pipefail
+          BUNDLE=src-tauri/target/release/bundle
+          OUT="$BUNDLE/SHA256SUMS-linux.txt"
+          : > "$OUT"
+          for file in "$BUNDLE"/deb/*.deb \
+                      "$BUNDLE"/appimage/*.AppImage \
+                      "$BUNDLE"/appimage/*.AppImage.sig; do
+            (cd "$(dirname "$file")" && sha256sum "$(basename "$file")") >> "$OUT"
+          done
+          cat "$OUT"
+      - name: Upload release artifacts
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.sig
+            src-tauri/target/release/bundle/SHA256SUMS-linux.txt

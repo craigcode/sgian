@@ -1,0 +1,148 @@
+# Sgian — Enhancement Roadmap
+
+This roadmap lists work that remains after the React migration and the macOS,
+Linux, and Windows platform pass. Completed capabilities are documented in the
+[README](README.md); they are not repeated here as future work.
+
+## 1. Windows acceptance and hardening (release blocker)
+
+The codebase now has a native Windows build, per-user named-pipe transport,
+Windows agent panes, and an NSIS installer. The current branch also:
+
+- creates ConPTY with the same default flags as node-pty/VS Code instead of
+  portable-pty's undocumented resize/input flags;
+- treats `ERROR_PIPE_BUSY` as a bounded listener hand-off race and recreates
+  unlimited owner-restricted pipe instances correctly; and
+- exercises a 32-client named-pipe burst in native Windows CI.
+
+What remains is acceptance on the Windows machine that originally reproduced
+the failures:
+
+- Run Claude Code's full-screen TUI from the packaged app at several pane sizes,
+  including repeated splits and resizes. Confirm that borders no longer
+  staircase and that no row loses its first character.
+- Repeat GUI attach/detach, pane creation, and concurrent `ctl panes` bursts.
+  Confirm that error 231 does not recur and that the existing daemon remains
+  responsive.
+- If the TUI still staggers, capture the raw `.ansi` stream and run the same
+  Claude build in VS Code's terminal. A clean VS Code control isolates the
+  remaining difference to Sgian/ConPTY configuration; corruption in both
+  terminals points to Claude Code/Ink.
+- Keep the vendored portable-pty fork minimal and remove it as soon as upstream
+  exposes supported ConPTY flags or adopts the default-zero behavior.
+
+## 2. Release engineering
+
+- **Exercise a release candidate.** Run the tag-gated macOS, Linux, and Windows
+  workflows from a release-candidate tag, install every produced package, and
+  verify updater manifests and checksums before the first public release.
+- **Provision the updater feed.** `updates.sgian.dev` is the committed production
+  endpoint but is not hosted yet. Serve the signed feed before shipping any
+  build that relies on automatic updates, and monitor the domain/certificate so
+  already-installed builds do not lose their update path.
+- **Windows code signing.** The NSIS installer is currently unsigned. Add an
+  Authenticode certificate and CI signing step so SmartScreen does not present
+  the installer as an unknown publisher.
+- **Release operations.** Document version bumping, tag creation, rollback, feed
+  promotion, and certificate/key rotation in a short maintainer runbook.
+
+## 3. Agent and orchestration improvements
+
+Shipped:
+
+- **Structured multi-pane results.** Batched `ctl run` / exec reports per-pane
+  exit code, timeout, elapsed time, and a bounded output tail in text and JSON.
+  `--timeout` also bounds setup (status/subscribe) before the run loop.
+- **Non-PTY execution channel.** `ctl process [--cwd DIR] [--timeout MS] --
+  <argv…>` runs exact argv outside a PTY with concurrent bounded stdout/stderr
+  capture, process-group kill on timeout (Unix), and null exit code + signal
+  metadata when the child is signal-terminated.
+- **Agent diagnostics.** `ctl diagnostic` exports a support bundle (versions,
+  pane/agent state, denylist-scrubbed log tail) without prompts, scrollback, or
+  environment values. Scrubbing is best-effort, not a cryptographic guarantee.
+
+## 4. Workbench UX
+
+Shipped:
+
+- **Command discovery.** Command palette via `⌘/Ctrl+Shift+P` always, and
+  `⌘/Ctrl+K` when focus is not inside a terminal (so shell kill-line stays
+  intact). Combobox + `aria-activedescendant` for the filtered list.
+- **Profiles.** Named shell/agent profiles in config/settings; toolbar select
+  and palette “New pane with profile”; `ctl new --profile NAME`. Shell profiles
+  apply shell/args/env at create time as a frozen per-pane override; that
+  snapshot persists across daemon restarts and in-process pane restarts.
+  Agent profiles select backend/model (already persisted via `agent_specs`).
+  Contradictory kind/field mixes are rejected.
+- **Session overview.** Compact workspace view for pane type, runtime state,
+  and activity since this GUI attach, with focus / restart / close actions.
+  Closing a pane keeps focus inside the overview dialog.
+- **Modal accessibility.** Dialog roles, labelled titles, Tab focus traps, Escape
+  close, and focus restoration for settings, palette, and session overview.
+- **Keyboard split resize.** Separators expose `role="separator"` with arrow-key
+  resize and `aria-valuenow`; Vitest covers keyboard resize and modal Tab traps.
+
+Still open (manual):
+
+- Real assistive-tech validation (VoiceOver / Narrator / Orca) on packaged
+  builds across macOS, Windows, and Linux — not CI-automatable in this suite.
+
+## 5. Reliability and test depth
+
+Shipped:
+
+- Framed IPC fault coverage (truncated/oversized/stalled frames); subscriber
+  connect/disconnect soak returns to a zero baseline; `ctl process` unit
+  coverage; palette + large-layout filter/reconcile performance budgets in
+  Vitest; bootstrap/reattach wall-clock baseline in Rust.
+- **Long-running transport soak.** `scripts/transport-soak.{sh,ps1}` run
+  multi-round 32-client bursts with pane create/restart/send and loose
+  handle/thread checks; wired into Linux and Windows CI after the packaged
+  daemon smoke.
+- **Packaged-app UI smoke.** Env-gated self-test (`SGIAN_UI_SMOKE=1`) splits,
+  opens/closes settings, writes terminal input, re-bootstraps, writes a marker,
+  and exits. CI launches the packaged macOS `.app`, Linux binary under `xvfb`,
+  and Windows NSIS-installed `sgian.exe` via `scripts/ui-smoke.{sh,ps1}`.
+- **Broader fault injection.** Daemon death mid-agent-turn recovers on restart;
+  Windows listener left handle-less after recreate failure fails the next accept
+  cleanly; updater check classification skips network/signature errors without
+  panicking.
+
+## 6. Competitive positioning — Warp scan candidates (2026-08-04)
+
+Source: [REVIEW-2026-08-04-warp.md](REVIEW-2026-08-04-warp.md) — Warp's
+standalone Agent CLI launched 2026-08-04, planting a funded incumbent
+directly in sgian's lane (persistent sessions + supervised agents).
+Sgian's defensible ground: local-first (no account, no cloud, MIT) and a
+scriptable control plane the Warp CLI lacks entirely (no headless mode, no
+JSON, no hooks at launch). Candidates, cheapest first — none committed:
+
+- **Lead with the control plane.** README/positioning currently leads with
+  panes; `ctl --json` + exact exit codes + bounded runs is the
+  differentiator no competitor shipped. A short "drive sgian from scripts"
+  doc section (or demo) makes it legible.
+- **Local-first positioning statement.** One paragraph: no account, no
+  cloud, transcripts never leave the machine. The OpenWarp fork's traction
+  (209 HN points for "Warp without the cloud") is the demand evidence.
+- **Permission-visibility pass.** Warp shipped auto-approve bypassing its
+  denylist by default and replace-not-extend denylists. Sgian's defaults
+  are safer, but: badge any pane running under `auto` / `dontAsk` /
+  `bypassPermissions` so unattended modes are always visible, and audit
+  config surfaces for replace-vs-extend semantics (`scrub_env` vs `env`
+  precedence is documented; make the audit deliberate, not assumed).
+- **Machine-readable agent-state stream.** The daemon already broadcasts
+  working / needs-input / idle transitions; expose them to scripts
+  (`ctl agent --watch --json` or an equivalent subscription) so external
+  tooling — CI, notification glue, or a mission orchestrator like kranz —
+  can react to needs-input without polling.
+- **Additional agent backends.** Codex / Gemini CLI panes behind the same
+  normalized event stream would strengthen the vendor-neutral claim that
+  Warp's own-agent-first launch makes newly legible. Medium effort; only
+  worth it once §1 clears.
+
+## Prioritization note
+
+Windows acceptance (§1) remains the release blocker for a public ship —
+and gains urgency from the Warp scan: Warp's CLI ships Windows day one.
+The Warp client's now-open ConPTY handling is a directly relevant
+reference for §1 (study only — AGPL; sgian is MIT).

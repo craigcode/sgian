@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resize-pane-terminal"
+description = "Enables the resize_pane_terminal command without any pre-configured scope."
+commands.allow = ["resize_pane_terminal"]
+
+[[permission]]
+identifier = "deny-resize-pane-terminal"
+description = "Denies the resize_pane_terminal command without any pre-configured scope."
+commands.deny = ["resize_pane_terminal"]

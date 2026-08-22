@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- WebKit JIT (JavaScript engine in WKWebView). This is the only
+         hardened-runtime exception the app needs. Library validation stays
+         ENABLED: it only governs dylibs loaded into this process, and the app
+         loads no third-party dylibs — spawned PTY child processes are separate
+         processes and are unaffected by it. Keeping validation on blocks
+         dylib-injection into the signed app. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+</dict>
+</plist>

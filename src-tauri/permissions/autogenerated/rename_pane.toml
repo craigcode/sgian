@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-rename-pane"
+description = "Enables the rename_pane command without any pre-configured scope."
+commands.allow = ["rename_pane"]
+
+[[permission]]
+identifier = "deny-rename-pane"
+description = "Denies the rename_pane command without any pre-configured scope."
+commands.deny = ["rename_pane"]

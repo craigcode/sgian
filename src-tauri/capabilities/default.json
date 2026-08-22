@@ -1,0 +1,30 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default desktop window permissions",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "allow-bootstrap-workspace",
+    "allow-create-pane",
+    "allow-close-pane",
+    "allow-rename-pane",
+    "allow-ensure-pane-terminal",
+    "allow-restart-pane-terminal",
+    "allow-write-to-pane",
+    "allow-resize-pane-terminal",
+    "allow-set-active-pane",
+    "allow-update-workspace-layout",
+    "allow-get-config",
+    "allow-write-config",
+    "allow-create-agent-pane",
+    "allow-send-agent-message",
+    "allow-agent-approval",
+    "allow-interrupt-agent",
+    "allow-install-update",
+    "allow-ui-smoke-enabled",
+    "allow-complete-ui-smoke",
+    "updater:default",
+    "process:default"
+  ]
+}

@@ -1,0 +1,46 @@
+[package]
+name = "sgian"
+version = "0.1.0"
+description = "A fast native pane manager for agentic terminals"
+license = "MIT"
+edition = "2021"
+
+[lib]
+name = "sgian_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Local 0.8.1 fork: its Windows CreatePseudoConsole flags are aligned with
+# node-pty/VS Code (0) to avoid portable-pty's undocumented 0x2|0x4 modes.
+# Keep the fork narrow; see vendor/portable-pty/SGIAN-PATCH.md.
+portable-pty = { path = "vendor/portable-pty" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+libc = "0.2"
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"
+fs4 = { version = "1.1.0", features = ["sync"] }
+dirs = "6"
+notify = "8"
+regex = "1"
+vt100 = "0.16.2"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2.3.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

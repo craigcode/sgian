@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-interrupt-agent"
+description = "Enables the interrupt_agent command without any pre-configured scope."
+commands.allow = ["interrupt_agent"]
+
+[[permission]]
+identifier = "deny-interrupt-agent"
+description = "Denies the interrupt_agent command without any pre-configured scope."
+commands.deny = ["interrupt_agent"]

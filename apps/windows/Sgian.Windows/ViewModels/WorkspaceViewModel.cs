@@ -1,0 +1,499 @@
+using System.Collections.ObjectModel;
+using System.Text.Json;
+using Microsoft.UI.Dispatching;
+using Sgian.Protocol;
+
+namespace Sgian.Windows.ViewModels;
+
+public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
+{
+    private readonly DispatcherQueue _dispatcher;
+    private readonly Dictionary<string, AgentChatState> _chats = [];
+    private readonly Dictionary<string, string> _scrollback = [];
+    private DaemonClient? _client;
+    private CancellationTokenSource? _connectionCancellation;
+    private PaneViewModel? _selectedPane;
+    private string _status = "Disconnected";
+    private string? _errorMessage;
+    private string _workspacePath;
+    private double _terminalFontSize;
+    private Guid _generation;
+
+    public WorkspaceViewModel(DispatcherQueue dispatcher)
+    {
+        _dispatcher = dispatcher;
+        var settings = AppSettings.Load();
+        var environment = Environment.GetEnvironmentVariable("SGIAN_WORKSPACE");
+        var fallback = Environment.CurrentDirectory == Path.GetPathRoot(Environment.CurrentDirectory)
+            ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+            : Environment.CurrentDirectory;
+        _workspacePath = environment ?? settings.WorkspacePath ?? fallback;
+        _terminalFontSize = settings.TerminalFontSize is >= 9 and <= 30
+            ? settings.TerminalFontSize
+            : 13;
+    }
+
+    public ObservableCollection<PaneViewModel> Panes { get; } = [];
+    public event EventHandler? WorkspaceChanged;
+    public event EventHandler<ChatChangedEventArgs>? ChatChanged;
+    public event EventHandler<TerminalOutputEventArgs>? TerminalOutput;
+    public event EventHandler? TerminalSettingsChanged;
+
+    public PaneViewModel? SelectedPane
+    {
+        get => _selectedPane;
+        private set => Set(ref _selectedPane, value);
+    }
+
+    public string Status
+    {
+        get => _status;
+        private set => Set(ref _status, value);
+    }
+
+    public string? ErrorMessage
+    {
+        get => _errorMessage;
+        private set => Set(ref _errorMessage, value);
+    }
+
+    public string WorkspacePath
+    {
+        get => _workspacePath;
+        private set => Set(ref _workspacePath, value);
+    }
+
+    public double TerminalFontSize
+    {
+        get => _terminalFontSize;
+        set
+        {
+            var clamped = Math.Clamp(value, 9, 30);
+            if (Set(ref _terminalFontSize, clamped))
+            {
+                SaveSettings();
+                TerminalSettingsChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+    }
+
+    public async Task StartAsync() => await ConnectAsync(WorkspacePath);
+
+    public async Task ConnectAsync(string workspace)
+    {
+        var fullPath = Path.GetFullPath(workspace);
+        if (!Directory.Exists(fullPath))
+        {
+            ErrorMessage = $"Workspace does not exist: {fullPath}";
+            Status = "Connection failed";
+            return;
+        }
+
+        _connectionCancellation?.Cancel();
+        _connectionCancellation?.Dispose();
+        _connectionCancellation = new CancellationTokenSource();
+        var token = _connectionCancellation.Token;
+        var generation = _generation = Guid.NewGuid();
+        if (_client is not null)
+        {
+            await _client.DisposeAsync();
+            _client = null;
+        }
+
+        WorkspacePath = fullPath;
+        SaveSettings();
+        ErrorMessage = null;
+        Status = "Connecting";
+        Panes.Clear();
+        _chats.Clear();
+        _scrollback.Clear();
+        SelectedPane = null;
+        WorkspaceChanged?.Invoke(this, EventArgs.Empty);
+
+        try
+        {
+            App.TraceSmoke("Starting daemon discovery and authentication");
+            var client = await DaemonClient.ConnectAsync(
+                fullPath,
+                cancellationToken: token,
+                onProgress: App.TraceSmoke);
+            if (_generation != generation)
+            {
+                await client.DisposeAsync();
+                return;
+            }
+            _client = client;
+            App.TraceSmoke("Daemon client connected; requesting workspace bootstrap");
+            var snapshot = await BootstrapAsync(client, token);
+            App.TraceSmoke($"Daemon bootstrap returned {snapshot.Panes.Count} pane(s)");
+            Apply(snapshot, resetTerminals: true);
+            Status = "Connected";
+            App.TraceSmoke($"Workspace connected; selected pane is {SelectedPane?.Id ?? "none"}");
+            _ = SubscribeLoopAsync(client, generation, token);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+        }
+        catch (Exception error)
+        {
+            Fail(error);
+        }
+    }
+
+    public AgentChatState ChatFor(string paneId)
+    {
+        if (!_chats.TryGetValue(paneId, out var chat))
+        {
+            chat = new AgentChatState();
+            chat.Changed += (_, _) => ChatChanged?.Invoke(this, new ChatChangedEventArgs(paneId));
+            _chats[paneId] = chat;
+        }
+        return chat;
+    }
+
+    public string InitialScrollback(string paneId) =>
+        _scrollback.TryGetValue(paneId, out var value) ? value : "";
+
+    public async Task SelectAsync(PaneViewModel? pane)
+    {
+        SelectedPane = pane;
+        WorkspaceChanged?.Invoke(this, EventArgs.Empty);
+        if (pane is null || _client is null)
+        {
+            return;
+        }
+        await RunRequestAsync(() => _client.RequestAsync<CommandOk>(Request(
+            ("command", "set_active_pane"), ("pane_id", pane.Id))));
+    }
+
+    public async Task CreateShellAsync()
+    {
+        if (_client is null) return;
+        var pane = await RunRequestAsync(() => _client.RequestAsync<Pane>(Request(
+            ("command", "create_pane"), ("title", null))));
+        if (pane is not null)
+        {
+            var item = Upsert(pane);
+            await SelectAsync(item);
+        }
+    }
+
+    public async Task CreateAgentAsync(string backend, string? model = null)
+    {
+        if (_client is null) return;
+        var pane = await RunRequestAsync(() => _client.RequestAsync<Pane>(Request(
+            ("command", "create_agent_pane_with_spec"), ("title", null),
+            ("backend", backend), ("model", model))));
+        if (pane is not null)
+        {
+            var item = Upsert(pane);
+            item.AgentSpec = new AgentPaneSpec { Backend = backend, Model = model };
+            ChatFor(pane.Id);
+            await SelectAsync(item);
+        }
+    }
+
+    public async Task CloseAsync(PaneViewModel pane)
+    {
+        if (_client is null) return;
+        var snapshot = await RunRequestAsync(() => _client.RequestAsync<WorkspaceSnapshot>(Request(
+            ("command", "close_pane"), ("pane_id", pane.Id))));
+        if (snapshot is not null) Apply(snapshot, resetTerminals: false);
+    }
+
+    public async Task RenameAsync(PaneViewModel pane, string title)
+    {
+        if (_client is null || string.IsNullOrWhiteSpace(title)) return;
+        var renamed = await RunRequestAsync(() => _client.RequestAsync<Pane>(Request(
+            ("command", "rename_pane"), ("pane_id", pane.Id), ("title", title.Trim()))));
+        if (renamed is not null) Upsert(renamed);
+    }
+
+    public async Task RestartAsync(PaneViewModel pane)
+    {
+        if (_client is null) return;
+        var command = pane.IsAgent ? "interrupt_agent" : "restart_pane_terminal";
+        await RunRequestAsync(() => _client.RequestAsync<CommandOk>(Request(
+            ("command", command), ("pane_id", pane.Id))));
+        if (!pane.IsAgent) pane.State = "live";
+    }
+
+    public async Task EnsureTerminalAsync(string paneId)
+    {
+        if (_client is null) return;
+        await RunRequestAsync(() => _client.RequestAsync<CommandOk>(Request(
+            ("command", "ensure_pane_terminal"), ("pane_id", paneId))), showError: false);
+    }
+
+    public async Task WriteTerminalAsync(string paneId, string data)
+    {
+        if (_client is null || data.Length == 0) return;
+        await RunRequestAsync(() => _client.RequestAsync<CommandOk>(Request(
+            ("command", "write_to_pane"), ("pane_id", paneId), ("data", data))), showError: false);
+    }
+
+    public async Task ResizeTerminalAsync(string paneId, ushort columns, ushort rows)
+    {
+        if (_client is null) return;
+        await RunRequestAsync(() => _client.RequestAsync<CommandOk>(Request(
+            ("command", "resize_pane_terminal"), ("pane_id", paneId),
+            ("cols", columns), ("rows", rows))), showError: false);
+    }
+
+    public async Task SendAgentMessageAsync(PaneViewModel pane, string text)
+    {
+        if (_client is null || string.IsNullOrWhiteSpace(text)) return;
+        var chat = ChatFor(pane.Id);
+        var body = text.Trim();
+        chat.AppendUserMessage(body);
+        var result = await RunRequestAsync(() => _client.RequestAsync<CommandOk>(Request(
+            ("command", "send_agent_message"), ("pane_id", pane.Id), ("text", body))));
+        if (result is null) chat.RemoveLastUserMessage(body);
+    }
+
+    public async Task InterruptAgentAsync(PaneViewModel pane)
+    {
+        if (_client is null) return;
+        await RunRequestAsync(() => _client.RequestAsync<CommandOk>(Request(
+            ("command", "interrupt_agent"), ("pane_id", pane.Id))));
+    }
+
+    public async Task ResolvePermissionAsync(PaneViewModel pane, bool allow, string? message = null)
+    {
+        if (_client is null) return;
+        var permission = ChatFor(pane.Id).PendingPermission;
+        if (permission is null) return;
+        await RunRequestAsync(() => _client.RequestAsync<CommandOk>(Request(
+            ("command", "agent_approval"), ("pane_id", pane.Id),
+            ("request_id", permission.RequestId), ("allow", allow), ("message", message))));
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _connectionCancellation?.Cancel();
+        _connectionCancellation?.Dispose();
+        if (_client is not null) await _client.DisposeAsync();
+    }
+
+    private async Task SubscribeLoopAsync(DaemonClient initialClient, Guid generation, CancellationToken token)
+    {
+        var client = initialClient;
+        var attempt = 0;
+        while (!token.IsCancellationRequested && _generation == generation)
+        {
+            try
+            {
+                await client.SubscribeAsync(
+                    onEvent: item =>
+                    {
+                        _dispatcher.TryEnqueue(() => Apply(item));
+                        return Task.CompletedTask;
+                    },
+                    onReady: async () =>
+                    {
+                        var snapshot = await BootstrapAsync(client, token);
+                        _dispatcher.TryEnqueue(() =>
+                        {
+                            if (_generation != generation) return;
+                            Apply(snapshot, resetTerminals: true);
+                            Status = "Connected";
+                            ErrorMessage = null;
+                        });
+                    },
+                    cancellationToken: token);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception error)
+            {
+                _dispatcher.TryEnqueue(() =>
+                {
+                    Status = "Reconnecting";
+                    ErrorMessage = error.Message;
+                });
+            }
+
+            var delay = TimeSpan.FromMilliseconds(Math.Min(750 * (1 << Math.Min(attempt++, 4)), 10000));
+            try
+            {
+                await Task.Delay(delay, token);
+                await client.DisposeAsync();
+                client = await DaemonClient.ConnectAsync(WorkspacePath, cancellationToken: token);
+                if (_generation != generation)
+                {
+                    await client.DisposeAsync();
+                    return;
+                }
+                _client = client;
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                return;
+            }
+            catch
+            {
+                continue;
+            }
+        }
+    }
+
+    private static Task<WorkspaceSnapshot> BootstrapAsync(DaemonClient client, CancellationToken token) =>
+        client.RequestAsync<WorkspaceSnapshot>(Request(("command", "bootstrap_workspace")), token);
+
+    private void Apply(WorkspaceSnapshot snapshot, bool resetTerminals)
+    {
+        var previousSelection = SelectedPane?.Id;
+        var liveIds = snapshot.Panes.Select(pane => pane.Id).ToHashSet(StringComparer.Ordinal);
+        foreach (var stale in Panes.Where(pane => !liveIds.Contains(pane.Id)).ToList())
+        {
+            Panes.Remove(stale);
+            _chats.Remove(stale.Id);
+            _scrollback.Remove(stale.Id);
+        }
+        foreach (var pane in snapshot.Panes)
+        {
+            var item = Upsert(pane);
+            item.State = snapshot.PaneStates.TryGetValue(pane.Id, out var state) ? state : "live";
+            item.Attention = snapshot.AgentStates.TryGetValue(pane.Id, out var info)
+                ? info.Attention
+                : null;
+            item.AgentSpec = snapshot.AgentSpecs.TryGetValue(pane.Id, out var spec) ? spec : null;
+            if (pane.Kind == "agent")
+            {
+                var chat = ChatFor(pane.Id);
+                if (snapshot.AgentEvents.TryGetValue(pane.Id, out var events)) chat.Replay(events);
+                if (item.State == "ended") chat.MarkPaneEnded();
+            }
+            else
+            {
+                var scrollback = snapshot.Scrollback.TryGetValue(pane.Id, out var value) ? value : "";
+                _scrollback[pane.Id] = scrollback;
+                if (resetTerminals)
+                {
+                    TerminalOutput?.Invoke(this, new TerminalOutputEventArgs(pane.Id, scrollback, true));
+                }
+            }
+        }
+        var selectedId = previousSelection is not null && liveIds.Contains(previousSelection)
+            ? previousSelection
+            : snapshot.ActivePaneId ?? snapshot.Panes.FirstOrDefault()?.Id;
+        SelectedPane = Panes.FirstOrDefault(pane => pane.Id == selectedId);
+        WorkspaceChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void Apply(DaemonEvent item)
+    {
+        switch (item.Kind)
+        {
+            case "pty_output":
+                var paneId = item.String("pane_id");
+                var data = item.String("data");
+                if (paneId is not null && data is not null)
+                {
+                    AppendScrollback(paneId, data);
+                    TerminalOutput?.Invoke(this, new TerminalOutputEventArgs(paneId, data, false));
+                }
+                break;
+            case "pane_ended":
+                MarkEnded(item.String("pane_id"), item.Integer("exit_code"));
+                break;
+            case "pane_created":
+            case "pane_renamed":
+                if (item.Value("pane") is { } paneValue && paneValue.Deserialize<Pane>() is { } pane)
+                {
+                    Upsert(pane);
+                    WorkspaceChanged?.Invoke(this, EventArgs.Empty);
+                }
+                break;
+            case "pane_closed":
+                var closedId = item.String("pane_id");
+                var closed = Panes.FirstOrDefault(pane => pane.Id == closedId);
+                if (closed is not null)
+                {
+                    Panes.Remove(closed);
+                    if (SelectedPane == closed) SelectedPane = Panes.FirstOrDefault();
+                    WorkspaceChanged?.Invoke(this, EventArgs.Empty);
+                }
+                break;
+            case "agent_state":
+                var statePane = Panes.FirstOrDefault(pane => pane.Id == item.String("pane_id"));
+                if (statePane is not null) statePane.Attention = item.String("attention");
+                break;
+            case "agent_event":
+                var agentId = item.String("pane_id");
+                if (agentId is not null && item.Value("payload") is { } payload)
+                {
+                    ChatFor(agentId).Apply(payload);
+                }
+                break;
+        }
+    }
+
+    private PaneViewModel Upsert(Pane pane)
+    {
+        var existing = Panes.FirstOrDefault(item => item.Id == pane.Id);
+        if (existing is not null)
+        {
+            existing.Title = pane.Title;
+            return existing;
+        }
+        var created = new PaneViewModel(pane);
+        Panes.Add(created);
+        return created;
+    }
+
+    private void MarkEnded(string? paneId, int? exitCode)
+    {
+        var pane = Panes.FirstOrDefault(item => item.Id == paneId);
+        if (pane is null) return;
+        pane.State = "ended";
+        if (pane.IsAgent) ChatFor(pane.Id).MarkPaneEnded(exitCode);
+        WorkspaceChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void AppendScrollback(string paneId, string data)
+    {
+        var next = (_scrollback.TryGetValue(paneId, out var prior) ? prior : "") + data;
+        const int maximum = 4 * 1024 * 1024;
+        _scrollback[paneId] = next.Length > maximum ? next[^maximum..] : next;
+    }
+
+    private async Task<T?> RunRequestAsync<T>(Func<Task<T>> operation, bool showError = true) where T : class
+    {
+        try
+        {
+            return await operation();
+        }
+        catch (Exception error)
+        {
+            if (showError) Fail(error);
+            return null;
+        }
+    }
+
+    private static Dictionary<string, object?> Request(params (string Key, object? Value)[] values) =>
+        values.ToDictionary(value => value.Key, value => value.Value, StringComparer.Ordinal);
+
+    private void Fail(Exception error)
+    {
+        Status = "Connection failed";
+        ErrorMessage = error.Message;
+        App.CompleteSmoke(error);
+    }
+
+    private void SaveSettings() => new AppSettings(WorkspacePath, TerminalFontSize).Save();
+}
+
+public sealed class ChatChangedEventArgs(string paneId) : EventArgs
+{
+    public string PaneId { get; } = paneId;
+}
+
+public sealed class TerminalOutputEventArgs(string paneId, string data, bool reset) : EventArgs
+{
+    public string PaneId { get; } = paneId;
+    public string Data { get; } = data;
+    public bool Reset { get; } = reset;
+}
