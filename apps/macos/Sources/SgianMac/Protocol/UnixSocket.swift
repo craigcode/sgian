@@ -28,6 +28,12 @@ final class UnixSocket: @unchecked Sendable {
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw SocketError.system("socket", errno) }
         descriptor = fd
+        guard Darwin.fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else {
+            let code = errno
+            Darwin.close(fd)
+            descriptor = -1
+            throw SocketError.system("fcntl(FD_CLOEXEC)", code)
+        }
         var noSigPipe: Int32 = 1
         guard Darwin.setsockopt(
             fd,
@@ -98,7 +104,8 @@ final class UnixSocket: @unchecked Sendable {
     private func setTimeout(option: Int32, seconds: Int?) throws {
         let interval: __darwin_time_t = numericCast(seconds ?? 0)
         var timeout = timeval(tv_sec: interval, tv_usec: 0)
-        let fd = try openDescriptor()
+        let fd = try duplicateDescriptor()
+        defer { Darwin.close(fd) }
         let result = withUnsafePointer(to: &timeout) { pointer in
             Darwin.setsockopt(
                 fd,
@@ -112,12 +119,14 @@ final class UnixSocket: @unchecked Sendable {
     }
 
     func write(_ data: Data) throws {
+        let fd = try duplicateDescriptor()
+        defer { Darwin.close(fd) }
         var sent = 0
         try data.withUnsafeBytes { rawBuffer in
             guard let base = rawBuffer.baseAddress else { return }
             while sent < data.count {
                 let count = Darwin.send(
-                    try openDescriptor(),
+                    fd,
                     base.advanced(by: sent),
                     data.count - sent,
                     0
@@ -139,6 +148,8 @@ final class UnixSocket: @unchecked Sendable {
     }
 
     func readLine() throws -> Data {
+        let fd = try duplicateDescriptor()
+        defer { Darwin.close(fd) }
         while true {
             if let newline = readBuffer.firstIndex(of: 0x0a) {
                 guard newline <= maximumLineBytes else { throw SocketError.lineTooLong }
@@ -148,7 +159,7 @@ final class UnixSocket: @unchecked Sendable {
             }
             guard readBuffer.count < maximumLineBytes else { throw SocketError.lineTooLong }
             var bytes = [UInt8](repeating: 0, count: 16 * 1024)
-            let count = Darwin.recv(try openDescriptor(), &bytes, bytes.count, 0)
+            let count = Darwin.recv(fd, &bytes, bytes.count, 0)
             if count < 0 {
                 if errno == EINTR { continue }
                 throw SocketError.system("receive", errno)
@@ -158,9 +169,15 @@ final class UnixSocket: @unchecked Sendable {
         }
     }
 
-    private func openDescriptor() throws -> Int32 {
-        let fd = descriptorLock.withLock { descriptor }
-        guard fd >= 0 else { throw SocketError.closed }
-        return fd
+    private func duplicateDescriptor() throws -> Int32 {
+        // Pin the underlying socket before releasing the lock. Otherwise close()
+        // can recycle the descriptor between lookup and send/recv, redirecting
+        // IPC to an unrelated socket. shutdown() still wakes the duplicated fd.
+        try descriptorLock.withLock {
+            guard descriptor >= 0 else { throw SocketError.closed }
+            let fd = Darwin.fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
+            guard fd >= 0 else { throw SocketError.system("fcntl(F_DUPFD_CLOEXEC)", errno) }
+            return fd
+        }
     }
 }

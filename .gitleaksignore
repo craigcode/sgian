@@ -1,0 +1,5 @@
+# Reviewed false positives in unchanged upstream xterm UMD bundles: minified
+# FourKeyMap/SequencerByKey exports. Exact commit/file/rule/line fingerprints
+# only. verify-vendored-xterm.mjs independently checks the complete bundle bytes.
+964dee7c0116a2e4bd1fb55de094c5010772eb0e:ui/vendor/xterm/addon-search.js:generic-api-key:1
+964dee7c0116a2e4bd1fb55de094c5010772eb0e:ui/vendor/xterm/xterm.js:generic-api-key:1

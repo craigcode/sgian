@@ -69,13 +69,19 @@ public static class EndpointDiscovery
                 await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
             }
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
             if (!process.HasExited)
             {
                 process.Kill();
             }
+            cancellationToken.ThrowIfCancellationRequested();
             throw new DaemonProtocolException("Sgian backend discovery timed out after 30 seconds.");
+        }
+        catch
+        {
+            if (!process.HasExited) process.Kill();
+            throw;
         }
         onProgress?.Invoke($"Endpoint discovery helper exited with code {process.ExitCode}");
         if (process.ExitCode != 0 && !terminatedAfterResponse)
@@ -120,7 +126,8 @@ public static class EndpointDiscovery
     {
         const int maximumCharacters = 1024 * 1024;
         var json = new StringBuilder();
-        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        using var bounded = new BoundedLineReader(reader, maximumCharacters, leaveOpen: true);
+        while (await bounded.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
         {
             json.AppendLine(line);
             if (json.Length > maximumCharacters)

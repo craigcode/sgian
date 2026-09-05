@@ -50,7 +50,7 @@
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENERjNBREI3Q0I4Nzc0MEQKUldRTmRJZkx0NjN6ellVbllFamxUS1UzeUNSMG5nVmw5aVU1azdCME9QbldmMEMzWlBtTHFIV3kK",
-      "endpoints": ["https://updates.sgian.dev/{{target}}/{{current_version}}"]
+      "endpoints": ["https://github.com/craigcode/sgian/releases/latest/download/latest.json"]
     }
   }
 }

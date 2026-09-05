@@ -2,6 +2,18 @@ import AppKit
 import SwiftTerm
 import SwiftUI
 
+enum TerminalLinkPolicy {
+    static func externalURL(_ link: String) -> URL? {
+        guard let url = URL(string: link),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              let host = url.host, !host.isEmpty,
+              url.user == nil, url.password == nil
+        else { return nil }
+        return url
+    }
+}
+
 @MainActor
 final class TerminalSurface: NSObject, ObservableObject, @preconcurrency TerminalViewDelegate, Identifiable {
     let id: String
@@ -81,6 +93,13 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
 
     func setTerminalTitle(source: TerminalView, title: String) {
         onTitleChange?(title)
+    }
+
+    func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {
+        // OSC 8 links come from terminal output. Do not let a disguised link
+        // launch a local application, file, or arbitrary custom URL handler.
+        guard let url = TerminalLinkPolicy.externalURL(link) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}

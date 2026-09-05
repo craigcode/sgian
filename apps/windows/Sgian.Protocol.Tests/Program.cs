@@ -23,6 +23,8 @@ var tests = new (string Name, Action Body)[]
     ("Agent stream reduction and replay dedupe", AgentStreamReduction),
     ("Permission lifecycle", PermissionLifecycle),
     ("Workspace defaults", WorkspaceDefaults),
+    ("Bounded IPC messages", BoundedMessages),
+    ("Terminal bridge rejects foreign documents", TerminalBridgeOrigins),
 };
 
 var failures = new List<string>();
@@ -53,6 +55,32 @@ static void PipeEndpointParsing()
     Equal("sgian2-S-1-5-21-abcd", EndpointDiscovery.PipeName(@"\\.\pipe\sgian2-S-1-5-21-abcd"));
     Throws<DaemonProtocolException>(() => EndpointDiscovery.PipeName("daemon.sock"));
     Throws<DaemonProtocolException>(() => EndpointDiscovery.PipeName(@"\\.\pipe\"));
+}
+
+static void BoundedMessages()
+{
+    using var lines = new BoundedLineReader(new StringReader("one\ntwo\r\n\n"), 4);
+    Equal("one", lines.ReadLineAsync().GetAwaiter().GetResult());
+    Equal("two", lines.ReadLineAsync().GetAwaiter().GetResult());
+    Equal("", lines.ReadLineAsync().GetAwaiter().GetResult());
+    Equal<string?>(null, lines.ReadLineAsync().GetAwaiter().GetResult());
+    using var oversized = new BoundedLineReader(new StringReader(new string('x', 8192)), 32);
+    Throws<DaemonProtocolException>(() => oversized.ReadLineAsync().GetAwaiter().GetResult());
+    using var truncated = new BoundedLineReader(new StringReader("no-newline"));
+    Throws<DaemonProtocolException>(() => truncated.ReadLineAsync().GetAwaiter().GetResult());
+    using var cancelled = new CancellationTokenSource();
+    cancelled.Cancel();
+    using var pending = new BoundedLineReader(new StringReader("message\n"));
+    Throws<OperationCanceledException>(() => pending.ReadLineAsync(cancelled.Token).GetAwaiter().GetResult());
+}
+
+static void TerminalBridgeOrigins()
+{
+    Equal(true, Sgian.Windows.Terminal.TerminalBridgePolicy.IsTrustedDocument("https://sgian.local/index.html"));
+    foreach (var url in new string?[] { null, "", "https://evil.example/", "https://sgian.local.evil/index.html",
+        "https://sgian.local@evil.example/index.html", "http://sgian.local/index.html", "file:///index.html",
+        "https://sgian.local/other.html", "https://sgian.local:444/index.html", "https://sgian.local/index.html?x=1" })
+        Equal(false, Sgian.Windows.Terminal.TerminalBridgePolicy.IsTrustedDocument(url));
 }
 
 static void AgentStreamReduction()
