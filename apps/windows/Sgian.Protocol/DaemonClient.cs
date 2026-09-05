@@ -105,15 +105,17 @@ public sealed class DaemonClient : IAsyncDisposable
         _subscriptionCancellation?.Dispose();
         _subscriptionCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var token = _subscriptionCancellation.Token;
-        await using var connection = await OpenAuthenticatedPipeAsync(token).ConfigureAwait(false);
+        using var startup = CancellationTokenSource.CreateLinkedTokenSource(token);
+        startup.CancelAfter(RequestTimeout);
+        await using var connection = await OpenAuthenticatedPipeAsync(startup.Token).ConfigureAwait(false);
         await WriteLineAsync(connection.Writer, new Dictionary<string, object?>
         {
             ["command"] = "subscribe",
-        }, token).ConfigureAwait(false);
+        }, startup.Token).ConfigureAwait(false);
 
         if (connection.SupportsSubscribeAck)
         {
-            var acknowledgement = DaemonEvent.Parse(await ReadLineAsync(connection.Reader, token)
+            var acknowledgement = DaemonEvent.Parse(await ReadLineAsync(connection.Reader, startup.Token)
                 .ConfigureAwait(false));
             if (!string.Equals(acknowledgement.Kind, "subscribe_ack", StringComparison.Ordinal))
             {
@@ -155,7 +157,7 @@ public sealed class DaemonClient : IAsyncDisposable
             ".",
             EndpointDiscovery.PipeName(_endpoint.Endpoint),
             PipeDirection.InOut,
-            PipeOptions.Asynchronous);
+            PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -163,7 +165,7 @@ public sealed class DaemonClient : IAsyncDisposable
             onProgress?.Invoke("Connecting to daemon named pipe");
             await pipe.ConnectAsync(timeout.Token).ConfigureAwait(false);
             onProgress?.Invoke("Daemon named pipe connected");
-            var reader = new StreamReader(pipe, new UTF8Encoding(false), false, 4096, leaveOpen: true);
+            var reader = new BoundedLineReader(new StreamReader(pipe, new UTF8Encoding(false), false, 4096, leaveOpen: true));
             var writer = new StreamWriter(pipe, new UTF8Encoding(false), 4096, leaveOpen: true)
             {
                 AutoFlush = true,
@@ -175,9 +177,9 @@ public sealed class DaemonClient : IAsyncDisposable
                 ["version"] = 1,
                 ["token"] = _token,
                 ["capabilities"] = new[] { "subscribe-ack" },
-            }, cancellationToken).ConfigureAwait(false);
+            }, timeout.Token).ConfigureAwait(false);
             onProgress?.Invoke("Daemon hello written; waiting for authentication response");
-            var line = await ReadLineAsync(reader, cancellationToken).ConfigureAwait(false);
+            var line = await ReadLineAsync(reader, timeout.Token).ConfigureAwait(false);
             onProgress?.Invoke("Daemon authentication response received");
             var response = JsonSerializer.Deserialize<IpcResponse>(line, JsonOptions)
                 ?? throw new DaemonProtocolException("The daemon returned an empty handshake.");
@@ -207,7 +209,7 @@ public sealed class DaemonClient : IAsyncDisposable
             cancellationToken).ConfigureAwait(false);
 
     private static async Task<string> ReadLineAsync(
-        StreamReader reader,
+        BoundedLineReader reader,
         CancellationToken cancellationToken) =>
         await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false)
             ?? throw new DaemonProtocolException("The daemon closed the connection.");
@@ -218,7 +220,7 @@ public sealed class DaemonClient : IAsyncDisposable
 
         public AuthenticatedPipe(
             NamedPipeClientStream pipe,
-            StreamReader reader,
+            BoundedLineReader reader,
             StreamWriter writer,
             bool supportsSubscribeAck)
         {
@@ -228,7 +230,7 @@ public sealed class DaemonClient : IAsyncDisposable
             SupportsSubscribeAck = supportsSubscribeAck;
         }
 
-        public StreamReader Reader { get; }
+        public BoundedLineReader Reader { get; }
         public StreamWriter Writer { get; }
         public bool SupportsSubscribeAck { get; }
 

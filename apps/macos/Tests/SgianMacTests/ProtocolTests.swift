@@ -3,6 +3,15 @@ import Testing
 
 @testable import SgianMac
 
+@Test func terminalLinksOnlyOpenWebURLs() {
+    #expect(TerminalLinkPolicy.externalURL("https://example.com/docs") != nil)
+    #expect(TerminalLinkPolicy.externalURL("http://localhost:8080/") != nil)
+    for link in ["file:///Applications/Calculator.app", "javascript:alert(1)", "data:text/html,test",
+                 "ssh://example.com", "custom-app://run", "https://trusted.example@evil.example/", "/relative"] {
+        #expect(TerminalLinkPolicy.externalURL(link) == nil)
+    }
+}
+
 @Test func fnvWorkspaceKeysMatchTheRustAlgorithm() {
     #expect(WorkspaceLocator.fnvWorkspaceKey("") == "cbf29ce484222325")
     #expect(WorkspaceLocator.fnvWorkspaceKey("a") == "af63dc4c8601ec8c")

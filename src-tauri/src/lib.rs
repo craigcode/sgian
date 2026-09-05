@@ -2058,9 +2058,12 @@ fn read_config_file(path: &Path) -> Result<Option<Config>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("failed to read config {}: {error}", path.display())),
     };
-    serde_json::from_str(&data)
-        .map(Some)
-        .map_err(|error| format!("malformed config {}: {error}", path.display()))
+    let config: Config = serde_json::from_str(&data)
+        .map_err(|error| format!("malformed config {}: {error}", path.display()))?;
+    config
+        .validate()
+        .map_err(|error| format!("invalid config {}: {error}", path.display()))?;
+    Ok(Some(config))
 }
 
 /// Load the merged (global overlaid by workspace) config. A malformed layer is
@@ -7148,6 +7151,13 @@ impl DaemonServer {
             command.args(&argv[1..]);
         }
         command.current_dir(&work_dir);
+        // Automation must honor the same environment policy as shell and agent
+        // panes. Clone the policy before spawn so no config lock spans execution.
+        let config = self.effective_config();
+        for key in &config.scrub_env {
+            command.env_remove(key);
+        }
+        command.envs(&config.env);
         command.stdin(std::process::Stdio::null());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
@@ -9088,6 +9098,14 @@ fn classify_accept_error(error: &std::io::Error) -> AcceptErrorClass {
 
 fn run_daemon(cwd: PathBuf, socket_path: PathBuf, data_dir: PathBuf) -> Result<(), String> {
     let (config, config_warnings) = load_config(&data_dir);
+    // There is no previous safe policy at startup. Ignoring a broken layer
+    // could discard scrub_env or inherit a more permissive agent mode.
+    if !config_warnings.is_empty() {
+        return Err(format!(
+            "refusing to start with invalid configuration: {}",
+            config_warnings.join("; ")
+        ));
+    }
     run_daemon_with_config_and_warnings(cwd, socket_path, data_dir, config, config_warnings)
 }
 
@@ -20131,6 +20149,28 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn startup_rejects_invalid_config_before_creating_runtime() {
+        for contents in [
+            r#"{"scrub_env":["SECRET"],}"#,
+            r#"{"agent_permission_mode":"manul"}"#,
+            r#"{"restore_policy":"unknown"}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("runtime/daemon.sock");
+            fs::write(dir.path().join(CONFIG_FILE), contents).unwrap();
+            let error = run_daemon(
+                dir.path().to_path_buf(),
+                socket.clone(),
+                dir.path().to_path_buf(),
+            )
+            .expect_err("invalid policy must prevent startup");
+            assert!(error.contains("refusing to start with invalid configuration"));
+            assert!(!socket.parent().unwrap().exists());
+            assert!(!dir.path().join(TOKEN_FILE).exists());
+        }
+    }
+
     /// M2: a file-watch reload of a malformed config keeps the previous effective
     /// config (and thus broadcasts nothing) instead of resetting to defaults.
     #[test]
@@ -20315,6 +20355,49 @@ mod tests {
             value["stdout"]
         );
         let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_process_honors_scrub_and_explicit_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        // Use an already inherited variable; never mutate global environment
+        // while the rest of the test suite is spawning children concurrently.
+        assert!(std::env::var_os("PATH").is_some());
+        let server = DaemonServer::with_config(
+            dir.path().to_path_buf(),
+            dir.path().join("data"),
+            Config {
+                scrub_env: vec!["PATH".into()],
+                env: HashMap::from([("SGIAN_AUDIT_EXPLICIT".into(), "configured".into())]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let request = || DaemonRequest::RunProcess {
+            argv: vec!["/usr/bin/env".into()],
+            cwd: None,
+            timeout_ms: Some(5_000),
+        };
+        let value = server.handle(request()).unwrap();
+        let output = value["stdout"].as_str().unwrap();
+        assert!(!output.lines().any(|line| line.starts_with("PATH=")));
+        assert!(output
+            .lines()
+            .any(|line| line == "SGIAN_AUDIT_EXPLICIT=configured"));
+
+        server
+            .config
+            .write()
+            .unwrap()
+            .env
+            .insert("PATH".into(), "/configured-path".into());
+        let value = server.handle(request()).unwrap();
+        assert!(value["stdout"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .any(|line| line == "PATH=/configured-path"));
     }
 
     /// A child that exits while a descendant still holds stdout must not pin

@@ -3,7 +3,7 @@ name: CI
 # Supply-chain note: all first- and third-party actions are pinned to full
 # commit SHAs (release tag noted in a trailing comment) so a moved or
 # compromised tag cannot inject code into CI — this matters most for the
-# release job, which runs with contents:write and the signing secrets.
+# signing jobs and the final publication job.
 
 on:
   push:
@@ -11,9 +11,7 @@ on:
     tags: ['v*']
   pull_request:
 
-# Serialize runs per ref so two tags pushed in quick succession cannot race
-# the release upload; an in-progress run is left to finish rather than being
-# cancelled mid-signing/notarization.
+# Serialize repeated runs of a ref; never cancel in-progress signing.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -26,40 +24,52 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Scan Git history for secrets
+        run: |
+          brew install gitleaks
+          gitleaks git --redact --no-banner --log-opts=--all .
       # dtolnay/rust-toolchain publishes only moving refs (stable/beta/nightly),
       # so the `stable` branch head is pinned by commit SHA like every other
       # action. Verify against: git ls-remote https://github.com/dtolnay/rust-toolchain refs/heads/stable
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: 1.94.0
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
       - name: Format
         working-directory: src-tauri
         run: cargo fmt --check
       - name: Clippy
         working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test --locked
       - name: Frontend tests (vitest)
         run: |
-          npm ci
+          npm ci --ignore-scripts
+          npm audit --audit-level=moderate
           npm test
+          npm run release:check
+      - name: Rust dependency audit
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --file src-tauri/Cargo.lock
       - name: Native macOS client (SwiftUI + daemon IPC)
         env:
           SGIAN_NATIVE_INTEGRATION: "1"
           SGIAN_BACKEND_BINARY: ${{ github.workspace }}/src-tauri/target/debug/sgian
         run: |
-          cargo build --manifest-path src-tauri/Cargo.toml
+          cargo build --locked --manifest-path src-tauri/Cargo.toml
           swift test --package-path apps/macos
-      # The Windows transport is held to a "compiles" bar (see README); pin
-      # that bar in CI so cfg(windows) code cannot silently rot. The ring
+      # Cross-compilation supplements the native Windows runtime job. The ring
       # crate's build script needs the mingw-w64 cross C toolchain, which the
       # runner image doesn't ship.
       - name: Windows cross-compile check
@@ -67,7 +77,7 @@ jobs:
         run: |
           brew install mingw-w64
           rustup target add x86_64-pc-windows-gnu
-          cargo check --target x86_64-pc-windows-gnu
+          cargo check --locked --target x86_64-pc-windows-gnu
 
   build:
     name: build app bundle
@@ -77,51 +87,25 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.94.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
-      - run: npm ci
-      # Fork PRs run without repository secrets, so detect whether the updater
-      # signing key is available instead of hard-requiring it (step-level `if:`
-      # cannot reference secrets directly).
-      - name: Detect updater signing key
-        id: signing
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: |
-          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "TAURI_SIGNING_PRIVATE_KEY is not available (fork PR?); building without updater artifacts."
-          fi
-      # Build only the .app on PR/main: a .dmg isn't useful for an unsigned PR
-      # build and skipping it keeps PR runs fast. DMG bundling IS headless-safe
-      # on GitHub Actions (see the release job comment for the full rationale),
-      # so this is a speed/size choice, not a headless constraint.
-      # TAURI_SIGNING_PRIVATE_KEY is required because createUpdaterArtifacts: true
-      # is set in tauri.conf.json — the updater tarball + .sig are generated even
-      # for --bundles app builds.
-      - name: Build .app
-        if: steps.signing.outputs.available == 'true'
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri build -- --bundles app
-      # Same build for fork PRs, with updater-artifact generation disabled via
-      # an inline --config overlay so the missing signing key cannot fail it.
-      - name: Build .app (no updater signing)
-        if: steps.signing.outputs.available == 'false'
-        run: npm run tauri build -- --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          node-version: 22
+      - run: npm ci --ignore-scripts
+      # Validation builds never receive signing secrets or produce trusted updates.
+      - name: Build .app (validation)
+        run: npm run tauri build -- --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
       - name: Packaged UI smoke
         env:
           SGIAN_UI_SMOKE_TIMEOUT_SECS: "120"
         run: |
           set -euo pipefail
-          app="$(ls -d src-tauri/target/release/bundle/macos/*.app | head -n1)"
+          apps=(src-tauri/target/release/bundle/macos/*.app)
+          app="${apps[0]}"
           ws="$RUNNER_TEMP/sgian-macos-ui-smoke"
           marker="$RUNNER_TEMP/sgian-macos-ui-smoke-ok"
           bash scripts/ui-smoke.sh "$app" "$ws" "$marker"
@@ -162,12 +146,14 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.94.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
       - name: Install Tauri Linux dependencies
         run: |
           sudo apt-get update
@@ -180,12 +166,15 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
             xvfb
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - name: Linux Rust tests
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test --locked
+      - name: Optimized GLib security regression
+        working-directory: src-tauri
+        run: cargo test --locked --release --test glib_variant_iter
       - name: Build Debian and AppImage bundles
-        run: npm run tauri build -- --bundles deb,appimage --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        run: npm run tauri build -- --bundles deb,appimage --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
       - name: Smoke test daemon + ctl + agent
         env:
           XDG_DATA_HOME: ${{ runner.temp }}/sgian-data
@@ -212,7 +201,7 @@ jobs:
             echo "=== Linux smoke diagnostics ==="
             find "$XDG_DATA_HOME/Sgian" -maxdepth 6 -type f -print 2>/dev/null || true
             find "$XDG_DATA_HOME/Sgian" -name daemon.log -type f -exec tail -n 80 {} \; 2>/dev/null || true
-            ps -ef | grep '[s]gian' || true
+            pgrep -af sgian || true
           }
           trap dump_diagnostics ERR
 
@@ -286,44 +275,21 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.94.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: src-tauri
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
-      - run: npm ci
+          node-version: 22
+      - run: npm ci --ignore-scripts
       - name: Windows transport unit tests
         working-directory: src-tauri
-        run: cargo test --lib windows_pipe_tests
-      # Same fork-PR-safe signing-key detection as the macOS build job.
-      - name: Detect updater signing key
-        id: signing
+        run: cargo test --locked --lib windows_pipe_tests
+      - name: Build NSIS installer (validation)
         shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: |
-          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "TAURI_SIGNING_PRIVATE_KEY is not available (fork PR?); building without updater artifacts."
-          fi
-      - name: Build NSIS installer
-        if: steps.signing.outputs.available == 'true'
-        id: bundle
-        # bash (not the pwsh default) so the inline --config JSON keeps its
-        # double quotes when handed to the native tauri CLI.
-        shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri build -- --bundles nsis
-      - name: Build NSIS installer (no updater signing)
-        if: steps.signing.outputs.available == 'false'
-        id: bundle-unsigned
-        shell: bash
-        run: npm run tauri build -- --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        run: npm run tauri build -- --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
       - name: Build native WinUI client + unsigned MSIX
         shell: pwsh
         run: scripts/build-windows-native.ps1 -Configuration Release -RuntimeIdentifier win-x64 -SkipRust
@@ -490,35 +456,30 @@ jobs:
     name: signed + notarized release
     if: startsWith(github.ref, 'refs/tags/v')
     # Never publish a release from an untested commit: the signed artifacts
-    # only ship after fmt/clippy/tests and the unsigned build both pass.
+    # are staged only after all platform validation jobs pass.
     needs: [check, build, build-linux, build-windows]
     runs-on: macos-latest
-    # softprops/action-gh-release needs contents:write to create the release
-    # on repos whose default GITHUB_TOKEN permission is read-only.
+    # Only the final publish job receives repository write permission.
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.94.0
       # Deliberately no rust-cache here: release binaries are Developer-ID
       # signed, so they must be compiled from scratch rather than linked from
       # cache-restored object files (cache poisoning would otherwise be
       # laundered into a signed, notarized artifact).
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
       # Fail fast if the tag and the app version disagree: tagging v0.2.0
       # without bumping tauri.conf.json would ship artifacts whose embedded
       # version is stale, and the updater's semver check would see no upgrade.
-      - name: Verify tag matches tauri.conf.json version
-        run: |
-          CONF_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
-          if [ "$GITHUB_REF_NAME" != "v$CONF_VERSION" ]; then
-            echo "ERROR: tag '$GITHUB_REF_NAME' does not match version 'v$CONF_VERSION' in src-tauri/tauri.conf.json." >&2
-            echo "       Bump \"version\" in src-tauri/tauri.conf.json (or retag) and re-run." >&2
-            exit 1
-          fi
-      - run: npm ci
+      - name: Verify release configuration
+        run: node scripts/verify-release-config.mjs
+      - run: npm ci --ignore-scripts
 
       # Import the Developer ID Application certificate into a temporary keychain.
       # Secrets are consumed via env: and decoded to files — never printed to stdout.
@@ -581,7 +542,7 @@ jobs:
           APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri build
+        run: npm run tauri build -- -- --locked
 
       # Always clean up the temporary keychain and signing material (Developer
       # ID .p12 and the App Store Connect API key .p8), and restore the
@@ -615,24 +576,23 @@ jobs:
           done
           cat "$OUT"
 
-      - name: Upload release artifacts
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+      - name: Stage signed macos artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          # Fail loudly if a bundler layout change stops any glob from
-          # matching, instead of shipping a release missing an artifact.
-          fail_on_unmatched_files: true
-          files: |
+          name: signed-macos
+          if-no-files-found: error
+          retention-days: 7
+          path: |
             src-tauri/target/release/bundle/dmg/Sgian_*.dmg
             src-tauri/target/release/bundle/macos/Sgian.app.tar.gz
             src-tauri/target/release/bundle/macos/Sgian.app.tar.gz.sig
             src-tauri/target/release/bundle/SHA256SUMS.txt
 
   # Windows half of a tagged release: unsigned (no Authenticode cert yet) NSIS
-  # installer plus the updater-signed zip/sig. The updater's minisign
+  # installer plus its updater signature. The updater's minisign
   # signature is what update verification relies on, so unsigned-at-OS-level
-  # artifacts still update safely. Uploads land on the SAME GitHub release as
-  # the macOS job (action-gh-release upserts by tag); the checksum file uses a
-  # distinct name so the two jobs' files don't collide.
+  # artifacts still update safely. All three signing jobs stage artifacts for
+  # the final publication gate; no platform publishes independently.
   release-windows:
     name: windows release artifacts
     if: startsWith(github.ref, 'refs/tags/v')
@@ -641,49 +601,46 @@ jobs:
     needs: [check, build, build-linux, build-windows]
     runs-on: windows-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.94.0
       # No rust-cache here, same rationale as the macOS release job: these
       # artifacts are updater-signed, so they must be compiled from scratch
       # rather than linked from cache-restored objects.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
-      - name: Verify tag matches tauri.conf.json version
-        shell: bash
-        run: |
-          CONF_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
-          if [ "$GITHUB_REF_NAME" != "v$CONF_VERSION" ]; then
-            echo "ERROR: tag '$GITHUB_REF_NAME' does not match version 'v$CONF_VERSION' in src-tauri/tauri.conf.json." >&2
-            exit 1
-          fi
-      - run: npm ci
+          node-version: 22
+      - name: Verify release configuration
+        run: node scripts/verify-release-config.mjs
+      - run: npm ci --ignore-scripts
         shell: bash
       - name: Build NSIS installer + updater artifacts
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri build -- --bundles nsis
+        run: npm run tauri build -- --bundles nsis -- --locked
       - name: Generate SHA-256 checksums
         shell: pwsh
         run: |
           $BUNDLE = "src-tauri/target/release/bundle"
           $out = "$BUNDLE/SHA256SUMS-windows.txt"
-          Get-ChildItem "$BUNDLE/nsis/Sgian_*-setup.exe", "$BUNDLE/nsis/*.zip", "$BUNDLE/nsis/*.sig" |
+          Get-ChildItem "$BUNDLE/nsis/Sgian_*-setup.exe", "$BUNDLE/nsis/*-setup.exe.sig" |
             ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" } |
             Set-Content $out -Encoding ascii
           Get-Content $out
-      - name: Upload release artifacts
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+      - name: Stage signed windows artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          fail_on_unmatched_files: true
-          files: |
+          name: signed-windows
+          if-no-files-found: error
+          retention-days: 7
+          path: |
             src-tauri/target/release/bundle/nsis/Sgian_*-setup.exe
-            src-tauri/target/release/bundle/nsis/*.zip
-            src-tauri/target/release/bundle/nsis/*.sig
+            src-tauri/target/release/bundle/nsis/*-setup.exe.sig
             src-tauri/target/release/bundle/SHA256SUMS-windows.txt
 
   # Linux half of a tagged release: a distro-native Debian package plus a
@@ -695,15 +652,17 @@ jobs:
     needs: [check, build, build-linux, build-windows]
     runs-on: ubuntu-22.04
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.94.0
       # Deliberately no rust-cache in release jobs: updater-signed artifacts
       # must be compiled from clean sources rather than restored object files.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: 22
       - name: Install Tauri Linux dependencies
         run: |
           sudo apt-get update
@@ -715,19 +674,14 @@ jobs:
             libssl-dev \
             libwebkit2gtk-4.1-dev \
             libxdo-dev
-      - name: Verify tag matches tauri.conf.json version
-        run: |
-          CONF_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
-          if [ "$GITHUB_REF_NAME" != "v$CONF_VERSION" ]; then
-            echo "ERROR: tag '$GITHUB_REF_NAME' does not match version 'v$CONF_VERSION' in src-tauri/tauri.conf.json." >&2
-            exit 1
-          fi
-      - run: npm ci
+      - name: Verify release configuration
+        run: node scripts/verify-release-config.mjs
+      - run: npm ci --ignore-scripts
       - name: Build Debian package, AppImage, and updater signature
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri build -- --bundles deb,appimage
+        run: npm run tauri build -- --bundles deb,appimage -- --locked
       - name: Generate SHA-256 checksums
         run: |
           set -euo pipefail
@@ -740,12 +694,50 @@ jobs:
             (cd "$(dirname "$file")" && sha256sum "$(basename "$file")") >> "$OUT"
           done
           cat "$OUT"
-      - name: Upload release artifacts
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+      - name: Stage signed linux artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          fail_on_unmatched_files: true
-          files: |
+          name: signed-linux
+          if-no-files-found: error
+          retention-days: 7
+          path: |
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage
             src-tauri/target/release/bundle/appimage/*.AppImage.sig
             src-tauri/target/release/bundle/SHA256SUMS-linux.txt
+
+  publish:
+    name: verify and publish complete release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release, release-windows, release-linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Install signature verifier
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Download this run's signed artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN: ${{ github.run_id }}
+        run: gh run download "$RELEASE_RUN" --name signed-macos --name signed-windows --name signed-linux --dir signed-artifacts
+      - name: Verify signatures and generate updater feed
+        run: node scripts/prepare-release.mjs signed-artifacts release-assets
+      - name: Publish only after every asset is uploaded
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --json isDraft > release-state.json 2>/dev/null; then
+            node -e 'if (!JSON.parse(require("fs").readFileSync("release-state.json")).isDraft) throw Error("Refusing to replace an already public release")'
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "Sgian $RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false

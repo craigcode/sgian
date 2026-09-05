@@ -8,9 +8,13 @@
     "dev": "tauri dev",
     "build": "tauri build",
     "frontend:dev": "vite",
-    "frontend:build": "vite build && node scripts/verify-frontend-bundle.mjs",
+    "frontend:build": "node scripts/verify-vendored-xterm.mjs && vite build && node scripts/verify-frontend-bundle.mjs",
     "tauri": "tauri",
-    "test": "vitest run"
+    "test": "vitest run",
+    "release:check": "node scripts/verify-release-config.mjs"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
@@ -22,6 +26,9 @@
     "vitest": "^4.1.10"
   },
   "dependencies": {
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-search": "0.16.0",
+    "@xterm/xterm": "6.0.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   }

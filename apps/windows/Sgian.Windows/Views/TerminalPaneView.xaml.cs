@@ -2,6 +2,7 @@ using System.Text.Json;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.Web.WebView2.Core;
+using Sgian.Windows.Terminal;
 
 namespace Sgian.Windows.Views;
 
@@ -45,6 +46,15 @@ public sealed partial class TerminalPaneView : UserControl
             TerminalWebView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
             TerminalWebView.CoreWebView2.Settings.AreDevToolsEnabled = false;
             TerminalWebView.CoreWebView2.Settings.IsStatusBarEnabled = false;
+            // Only the bundled terminal may access the shell-input bridge.
+            // Block drag/drop navigation, links, redirects, frames, and popups.
+            TerminalWebView.CoreWebView2.NavigationStarting += (_, args) =>
+                args.Cancel = !TerminalBridgePolicy.IsTrustedDocument(args.Uri);
+            TerminalWebView.CoreWebView2.FrameNavigationStarting += (_, args) => args.Cancel = true;
+            TerminalWebView.CoreWebView2.NewWindowRequested += (_, args) => args.Handled = true;
+            TerminalWebView.CoreWebView2.PermissionRequested += (_, args) =>
+                args.State = CoreWebView2PermissionState.Deny;
+            TerminalWebView.CoreWebView2.DownloadStarting += (_, args) => args.Cancel = true;
             TerminalWebView.CoreWebView2.WebMessageReceived += WebMessageReceived;
             TerminalWebView.NavigationCompleted += (_, args) =>
                 App.TraceSmoke($"Terminal navigation for {paneId}: success={args.IsSuccess}, status={args.WebErrorStatus}");
@@ -53,7 +63,7 @@ public sealed partial class TerminalPaneView : UserControl
             Queue(new { type = "font-size", value = fontSize });
             Queue(new { type = "reset", data = scrollback });
             App.TraceSmoke($"Navigating terminal document for {paneId}");
-            TerminalWebView.Source = new Uri("https://sgian.local/index.html");
+            TerminalWebView.Source = new Uri(TerminalBridgePolicy.DocumentUrl);
         }
         catch (Exception error)
         {
@@ -69,6 +79,8 @@ public sealed partial class TerminalPaneView : UserControl
 
     private async void WebMessageReceived(CoreWebView2 sender, CoreWebView2WebMessageReceivedEventArgs args)
     {
+        if (!TerminalBridgePolicy.IsTrustedDocument(args.Source) ||
+            !TerminalBridgePolicy.IsTrustedDocument(sender.Source)) return;
         try
         {
             using var document = JsonDocument.Parse(args.WebMessageAsJson);
@@ -118,7 +130,8 @@ public sealed partial class TerminalPaneView : UserControl
     private void Queue(object message)
     {
         var json = JsonSerializer.Serialize(message);
-        if (_ready && TerminalWebView.CoreWebView2 is not null)
+        if (_ready && TerminalWebView.CoreWebView2 is not null &&
+            TerminalBridgePolicy.IsTrustedDocument(TerminalWebView.CoreWebView2.Source))
         {
             TerminalWebView.CoreWebView2.PostWebMessageAsJson(json);
         }

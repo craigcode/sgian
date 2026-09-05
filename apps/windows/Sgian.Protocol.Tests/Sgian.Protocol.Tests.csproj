@@ -8,5 +8,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Sgian.Protocol\Sgian.Protocol.csproj" />
+    <Compile Include="..\Sgian.Windows\Terminal\TerminalBridgePolicy.cs" Link="TerminalBridgePolicy.cs" />
   </ItemGroup>
 </Project>

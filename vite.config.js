@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { readFileSync } from "node:fs";
 
 export default defineConfig({
   root: "ui",
@@ -10,7 +11,16 @@ export default defineConfig({
   // Vendored xterm is imported into the application module graph. Do not also
   // copy it as public files, which would reintroduce an independent load path.
   publicDir: false,
-  plugins: [react()],
+  plugins: [react(), {
+    name: "xterm-license",
+    generateBundle() {
+      this.emitFile({
+        type: "asset",
+        fileName: "licenses/xterm.txt",
+        source: readFileSync(new URL("./ui/vendor/xterm/LICENSE", import.meta.url), "utf8"),
+      });
+    },
+  }],
   clearScreen: false,
   server: {
     port: 1420,
