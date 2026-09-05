@@ -30,6 +30,10 @@ if (!existsSync(indexPath)) {
   }
 
   const assets = readdirSync(resolve(root, "dist/assets"));
+  const license = resolve(root, "dist/licenses/xterm.txt");
+  if (!existsSync(license) || !readFileSync(license).equals(readFileSync(resolve(root, "ui/vendor/xterm/LICENSE")))) {
+    fail("missing or altered bundled xterm license");
+  }
   for (const pattern of [/^xterm-.*\.js$/, /^addon-fit-.*\.js$/, /^addon-search-.*\.js$/]) {
     if (!assets.some((name) => pattern.test(name))) fail(`missing emitted asset ${pattern}`);
   }
