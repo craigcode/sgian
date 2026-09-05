@@ -88,7 +88,8 @@ Follow-up: the hardening is now proposed in [PR #11](https://github.com/craigcod
    Its archive checksum was verified against the original lockfile. A source
    comparison confirms no other upstream code changed. The optimized regression
    exercises all five affected methods and mixed forward/backward iteration;
-   it passed locally against system GLib and also runs in Linux CI. Provenance
+   it crashed with unpatched upstream GLib and passed with the backport locally
+   against system GLib; it also runs in Linux CI. Provenance
    and the removal condition are in `src-tauri/vendor/glib/SGIAN-PATCH.md`.
    Seventeen maintenance
    notices cover GTK3 bindings, proc-macro-error, portable-pty's serial crate,
@@ -98,7 +99,20 @@ Follow-up: the hardening is now proposed in [PR #11](https://github.com/craigcod
    readable only after reviewing history and repository content. Enable private
    vulnerability reporting, protect the default branch and release tags, and
    restrict who can trigger secret-bearing tag builds. These hosted settings
-   were not changed by this review.
+   were subsequently configured on September 5: `main` requires all four CI
+   checks and resolved review conversations, with force-push/deletion blocked;
+   only repository administrators can create/update/delete `v*` release tags.
+   The repository remains private. Private vulnerability reporting must still
+   be enabled at public launch.
+
+## CI follow-up
+
+The first complete Windows transport run passed all seven pipe tests, then
+the frontend integrity check detected Git's CRLF conversion of vendored xterm
+files. `.gitattributes` now disables text conversion for those assets. A local
+checkout with `core.autocrlf=true` reproduced the mismatch before the fix and
+preserved all four upstream byte sequences after it. The integrity check was
+kept strict.
 
 ## Sources used for implementation checks
 
