@@ -1,6 +1,11 @@
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
+using Sgian.Protocol;
+using Windows.UI;
+using Windows.System;
+using Microsoft.UI.Xaml.Input;
 using Sgian.Windows.ViewModels;
 using Sgian.Windows.Views;
 using Windows.Graphics;
@@ -14,12 +19,16 @@ public sealed partial class MainWindow : Window
     private readonly Dictionary<string, AgentChatView> _agentChats = [];
     private bool _synchronizingSelection;
     private bool _started;
+    private readonly Dictionary<string, Border> _paneFrames = [];
+    private string? _renderedShape;
 
     public MainWindow()
     {
         InitializeComponent();
         ViewModel = new WorkspaceViewModel(DispatcherQueue);
         PaneList.ItemsSource = ViewModel.Panes;
+        ErrorBar.Closed += (_, _) => ViewModel.DismissError();
+        ViewModel.WorkspaceReset += (_, _) => ClearViews();
         ViewModel.WorkspaceChanged += (_, _) => Refresh();
         ViewModel.ChatChanged += (_, args) =>
         {
@@ -38,6 +47,13 @@ public sealed partial class MainWindow : Window
                 nameof(ViewModel.WorkspacePath)) RefreshChrome();
         };
         Closed += MainWindow_Closed;
+        AddShortcut(VirtualKey.D, VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift, () => ViewModel.CreateShellAsync("row"));
+        AddShortcut(VirtualKey.E, VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift, () => ViewModel.CreateShellAsync("column"));
+        AddShortcut(VirtualKey.Z, VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift, () => { ViewModel.ToggleZoom(); return Task.CompletedTask; });
+        AddShortcut(VirtualKey.F, VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift, ShowSearchAsync);
+        AddShortcut(VirtualKey.P, VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift, ShowCommandsAsync);
+        AddShortcut(VirtualKey.Tab, VirtualKeyModifiers.Control, () => ViewModel.FocusNextAsync(1));
+        AddShortcut(VirtualKey.Tab, VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift, () => ViewModel.FocusNextAsync(-1));
 
         var appWindow = GetAppWindow();
         appWindow.Resize(new SizeInt32(1180, 760));
@@ -73,10 +89,10 @@ public sealed partial class MainWindow : Window
         PaneSubtitle.Text = pane?.Subtitle ?? "Native terminals and coding agents";
         RenameButton.Visibility = pane is null ? Visibility.Collapsed : Visibility.Visible;
         CloseButton.Visibility = pane is null ? Visibility.Collapsed : Visibility.Visible;
-        RestartButton.Visibility = pane?.State == "ended" && pane.IsAgent == false
+        RestartButton.Visibility = pane?.State == "ended"
             ? Visibility.Visible
             : Visibility.Collapsed;
-        ShowPane(pane);
+        ShowLayout();
     }
 
     private void RefreshChrome()
@@ -88,43 +104,138 @@ public sealed partial class MainWindow : Window
         ErrorBar.IsOpen = !string.IsNullOrWhiteSpace(ViewModel.ErrorMessage);
     }
 
-    private void ShowPane(PaneViewModel? pane)
+    private void ClearViews()
     {
-        if (pane is null)
+        PaneContent.Content = null;
+        foreach (var terminal in _terminals.Values) terminal.Dispose();
+        _terminals.Clear();
+        _agentChats.Clear();
+        _paneFrames.Clear();
+        _renderedShape = null;
+    }
+
+    private void ShowLayout()
+    {
+        var live = ViewModel.Panes.Select(pane => pane.Id).ToHashSet();
+        foreach (var id in _paneFrames.Keys.Where(id => !live.Contains(id)).ToList())
         {
-            PaneContent.Content = EmptyWorkspaceContent();
-            return;
+            if (_terminals.Remove(id, out var terminal)) terminal.Dispose();
+            _agentChats.Remove(id);
+            _paneFrames.Remove(id);
         }
+        var tree = ViewModel.Zoomed && ViewModel.SelectedPane is { } selected
+            ? PaneLayout.Leaf(selected.Id) : ViewModel.Layout;
+        if (tree is null) { PaneContent.Content = EmptyWorkspaceContent(); _renderedShape = null; return; }
+        string Shape(PaneLayout node) => node.IsLeaf ? node.Id : $"{node.Id}:{node.Direction}({Shape(node.First!)},{Shape(node.Second!)})";
+        var shape = Shape(tree);
+        if (_renderedShape != shape)
+        {
+            PaneContent.Content = null;
+            foreach (var frame in _paneFrames.Values)
+                if (frame.Parent is Panel panel) panel.Children.Remove(frame);
+                else if (frame.Parent is ContentControl content) content.Content = null;
+            PaneContent.Content = NativeLayoutView.Build(tree, PaneFrame, ViewModel.ResizeSplit);
+            _renderedShape = shape;
+        }
+        foreach (var (id, frame) in _paneFrames)
+        {
+            frame.BorderBrush = new SolidColorBrush(id == ViewModel.SelectedPane?.Id
+                ? Microsoft.UI.Colors.DodgerBlue : Microsoft.UI.Colors.Transparent);
+            if (_agentChats.TryGetValue(id, out var chat)) chat.Refresh();
+        }
+        if (ViewModel.SelectedPane is { IsAgent: false } pane && _terminals.TryGetValue(pane.Id, out var active)) active.FocusTerminal();
+    }
+
+    private FrameworkElement PaneFrame(string id)
+    {
+        if (_paneFrames.TryGetValue(id, out var existing)) return existing;
+        var pane = ViewModel.Panes.First(item => item.Id == id);
+        var generation = ViewModel.Generation;
+        var grid = new Grid();
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        var header = new Button { HorizontalAlignment = HorizontalAlignment.Stretch, HorizontalContentAlignment = HorizontalAlignment.Left, Padding = new Thickness(10, 5, 10, 5) };
+        header.SetBinding(ContentControl.ContentProperty, new Microsoft.UI.Xaml.Data.Binding { Source = pane, Path = new PropertyPath(nameof(pane.Title)), Mode = Microsoft.UI.Xaml.Data.BindingMode.OneWay });
+        header.Click += async (_, _) => { if (ViewModel.Generation == generation) await ViewModel.SelectAsync(pane); };
+        grid.Children.Add(header);
+        FrameworkElement view;
         if (pane.IsAgent)
         {
-            if (!_agentChats.TryGetValue(pane.Id, out var chat))
-            {
-                chat = new AgentChatView();
-                chat.Initialize(ViewModel, pane);
-                _agentChats[pane.Id] = chat;
-            }
-            chat.Refresh();
-            PaneContent.Content = chat;
-            App.CompleteSmoke();
-            return;
+            var chat = new AgentChatView();
+            chat.Initialize(ViewModel, pane);
+            _agentChats[id] = chat;
+            view = chat;
         }
-        if (!_terminals.TryGetValue(pane.Id, out var terminal))
+        else
         {
-            App.TraceSmoke($"Creating terminal view for {pane.Id}");
-            terminal = new TerminalPaneView();
+            var terminal = new TerminalPaneView();
             terminal.Ready += (_, _) => App.CompleteSmoke();
-            _terminals[pane.Id] = terminal;
-            _ = terminal.InitializeAsync(
-                pane.Id,
-                ViewModel.InitialScrollback(pane.Id),
-                ViewModel.TerminalFontSize,
-                data => ViewModel.WriteTerminalAsync(pane.Id, data),
-                (columns, rows) => ViewModel.ResizeTerminalAsync(pane.Id, columns, rows));
-            _ = ViewModel.EnsureTerminalAsync(pane.Id);
+            terminal.Activated += async (_, _) => { if (ViewModel.Generation == generation && ViewModel.SelectedPane != pane) await ViewModel.SelectAsync(pane); };
+            _terminals[id] = terminal;
+            view = terminal;
+            _ = InitializeTerminalAsync(terminal, pane, generation);
         }
-        PaneContent.Content = terminal;
+        Grid.SetRow(view, 1);
+        grid.Children.Add(view);
+        var frame = new Border { BorderThickness = new Thickness(2), Child = grid, MinWidth = 0, MinHeight = 0 };
+        _paneFrames[id] = frame;
+        return frame;
+    }
+
+    private async Task InitializeTerminalAsync(TerminalPaneView terminal, PaneViewModel pane, Guid generation)
+    {
+        await terminal.InitializeAsync(pane.Id, ViewModel.InitialScrollback(pane.Id), ViewModel.TerminalFontSize,
+            data => generation == ViewModel.Generation ? ViewModel.WriteTerminalAsync(pane.Id, data) : Task.CompletedTask,
+            (columns, rows) => generation == ViewModel.Generation ? ViewModel.ResizeTerminalAsync(pane.Id, columns, rows) : Task.CompletedTask);
+        if (generation == ViewModel.Generation) await ViewModel.EnsureTerminalAsync(pane.Id);
+    }
+
+    private void AddShortcut(VirtualKey key, VirtualKeyModifiers modifiers, Func<Task> action)
+    {
+        var shortcut = new KeyboardAccelerator { Key = key, Modifiers = modifiers };
+        shortcut.Invoked += async (_, args) => { args.Handled = true; await action(); };
+        Root.KeyboardAccelerators.Add(shortcut);
+    }
+
+    private async Task ShowSearchAsync()
+    {
+        if (ViewModel.SelectedPane is not { } pane || !_terminals.TryGetValue(pane.Id, out var terminal)) return;
+        var input = new TextBox { PlaceholderText = "Find in terminal" };
+        var dialog = new ContentDialog { XamlRoot = Root.XamlRoot, Title = "Find in terminal", Content = input,
+            PrimaryButtonText = "Next", SecondaryButtonText = "Previous", CloseButtonText = "Done" };
+        dialog.PrimaryButtonClick += (_, args) => { args.Cancel = true; terminal.Search(input.Text, false); };
+        dialog.SecondaryButtonClick += (_, args) => { args.Cancel = true; terminal.Search(input.Text, true); };
+        await dialog.ShowAsync();
         terminal.FocusTerminal();
     }
+
+    private async Task ShowCommandsAsync()
+    {
+        var actions = new List<(string Label, Func<Task> Run)> {
+            ("Split right", () => ViewModel.CreateShellAsync("row")),
+            ("Split down", () => ViewModel.CreateShellAsync("column")),
+            ("New Claude agent", () => ViewModel.CreateAgentAsync("claude")),
+            ("New Factory Droid agent", () => ViewModel.CreateAgentAsync("droid")),
+            ("Zoom / Show all panes", () => { ViewModel.ToggleZoom(); return Task.CompletedTask; }),
+            ("Reconnect", () => ViewModel.StartAsync()),
+        };
+        actions.AddRange(ViewModel.Panes.Select(pane => ($"Focus: {pane.Title} [{pane.Id}]", (Func<Task>)(() => ViewModel.SelectAsync(pane)))));
+        actions.AddRange(ViewModel.RecentWorkspaces.Select(path => ($"Workspace: {path}", (Func<Task>)(() => ViewModel.ConnectAsync(path)))));
+        var input = new TextBox { PlaceholderText = "Search commands and panes" };
+        var list = new ListView { Height = 260, ItemsSource = actions.Select(item => item.Label).ToList() };
+        input.TextChanged += (_, _) => list.ItemsSource = actions.Where(item => item.Label.Contains(input.Text, StringComparison.OrdinalIgnoreCase)).Select(item => item.Label).ToList();
+        var panel = new StackPanel { Spacing = 12, MinWidth = 420 }; panel.Children.Add(input); panel.Children.Add(list);
+        var dialog = new ContentDialog { XamlRoot = Root.XamlRoot, Title = "Commands", Content = panel,
+            PrimaryButtonText = "Run", CloseButtonText = "Cancel", DefaultButton = ContentDialogButton.Primary };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary && list.SelectedItem is string label)
+            await actions.First(item => item.Label == label).Run();
+    }
+
+    private async void SplitRight_Click(object sender, RoutedEventArgs e) => await ViewModel.CreateShellAsync("row");
+    private async void SplitDown_Click(object sender, RoutedEventArgs e) => await ViewModel.CreateShellAsync("column");
+    private void Zoom_Click(object sender, RoutedEventArgs e) => ViewModel.ToggleZoom();
+    private async void Commands_Click(object sender, RoutedEventArgs e) => await ShowCommandsAsync();
+    private async void Search_Click(object sender, RoutedEventArgs e) => await ShowSearchAsync();
 
     private UIElement EmptyWorkspaceContent()
     {
@@ -193,8 +304,6 @@ public sealed partial class MainWindow : Window
         if (await dialog.ShowAsync() == ContentDialogResult.Primary)
         {
             await ViewModel.CloseAsync(pane);
-            _terminals.Remove(pane.Id);
-            _agentChats.Remove(pane.Id);
         }
     }
 
@@ -264,6 +373,9 @@ public sealed partial class MainWindow : Window
         await dialog.ShowAsync();
     }
 
-    private async void MainWindow_Closed(object sender, WindowEventArgs args) =>
+    private async void MainWindow_Closed(object sender, WindowEventArgs args)
+    {
+        ClearViews();
         await ViewModel.DisposeAsync();
+    }
 }

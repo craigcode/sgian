@@ -67,7 +67,7 @@ struct SidebarView: View {
             }
             Button("Restart") { model.restart(pane.id) }
             Divider()
-            Button("Close Pane", role: .destructive) { model.close(pane.id) }
+            Button("Close Pane", role: .destructive) { model.requestClose(pane) }
         }
     }
 

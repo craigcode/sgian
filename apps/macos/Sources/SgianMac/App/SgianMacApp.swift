@@ -18,6 +18,21 @@ struct SgianMacApp: App {
                     .keyboardShortcut("a", modifiers: [.command, .shift])
             }
             CommandMenu("Pane") {
+                Button("Split Right") { model.createShell(direction: "row") }
+                    .keyboardShortcut("d", modifiers: .command)
+                Button("Split Down") { model.createShell(direction: "column") }
+                    .keyboardShortcut("d", modifiers: [.command, .shift])
+                Button("Zoom Pane", action: model.toggleZoom)
+                    .keyboardShortcut("z", modifiers: [.command, .shift])
+                Button("Next Pane") { model.focusNext(1) }
+                    .keyboardShortcut("]", modifiers: [.command, .shift])
+                Button("Previous Pane") { model.focusNext(-1) }
+                    .keyboardShortcut("[", modifiers: [.command, .shift])
+                Button("Find in Terminal") { model.showingSearch = true }
+                    .keyboardShortcut("f", modifiers: [.command, .shift])
+                Button("Command Palette") { model.showingCommands = true }
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                Divider()
                 Button("Restart Pane") {
                     if let paneID = model.selectedPaneID { model.restart(paneID) }
                 }
@@ -26,13 +41,18 @@ struct SgianMacApp: App {
                     .keyboardShortcut("k", modifiers: .command)
                 Divider()
                 Button("Close Pane") {
-                    if let paneID = model.selectedPaneID { model.close(paneID) }
+                    model.requestClose()
                 }
                 .keyboardShortcut("w", modifiers: [.command, .shift])
             }
             CommandMenu("Workspace") {
                 Button("Open Workspace…", action: model.chooseWorkspace)
                     .keyboardShortcut("o", modifiers: [.command, .shift])
+                Menu("Recent Workspaces") {
+                    ForEach(model.recentWorkspaces, id: \.self) { path in
+                        Button(path) { model.connect(to: URL(fileURLWithPath: path)) }
+                    }
+                }
                 Button("Reconnect") { model.connect(to: model.workspaceURL) }
             }
         }

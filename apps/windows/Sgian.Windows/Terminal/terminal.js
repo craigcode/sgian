@@ -16,6 +16,8 @@
   });
   const fit = new FitAddon.FitAddon();
   terminal.loadAddon(fit);
+  const search = new SearchAddon.SearchAddon();
+  terminal.loadAddon(search);
   terminal.open(document.getElementById('terminal'));
 
   const postSize = () => {
@@ -30,7 +32,13 @@
     if (message.type === 'reset') { terminal.reset(); if (message.data) terminal.write(message.data); }
     if (message.type === 'font-size') { terminal.options.fontSize = message.value; postSize(); }
     if (message.type === 'focus') terminal.focus();
+    if (message.type === 'search') {
+      const found = message.previous ? search.findPrevious(message.query || '') : search.findNext(message.query || '');
+      window.chrome.webview.postMessage({ type: 'search-result', found });
+    }
   });
+  document.addEventListener('pointerdown', () => window.chrome.webview.postMessage({ type: 'activated' }));
+  terminal.textarea.addEventListener('focus', () => window.chrome.webview.postMessage({ type: 'activated' }));
   new ResizeObserver(() => postSize()).observe(document.getElementById('terminal'));
   // Readiness means the terminal and host bridge are wired. Do not gate it on
   // requestAnimationFrame: WebView2 can throttle animation frames in a

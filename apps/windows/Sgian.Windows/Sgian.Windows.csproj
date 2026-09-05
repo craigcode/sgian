@@ -39,6 +39,7 @@
     <Content Include="..\..\..\ui\vendor\xterm\xterm.css" Link="Terminal\vendor\xterm.css" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\..\..\ui\vendor\xterm\LICENSE" Link="Terminal\vendor\LICENSE" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\..\..\ui\vendor\xterm\addon-fit.js" Link="Terminal\vendor\addon-fit.js" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\ui\vendor\xterm\addon-search.js" Link="Terminal\vendor\addon-search.js" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Terminal\index.html" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Terminal\terminal.js" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="$(SgianBackendPath)" Condition="Exists('$(SgianBackendPath)')" Link="Helpers\sgian.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />

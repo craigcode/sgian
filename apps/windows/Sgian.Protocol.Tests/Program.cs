@@ -25,6 +25,7 @@ var tests = new (string Name, Action Body)[]
     ("Workspace defaults", WorkspaceDefaults),
     ("Bounded IPC messages", BoundedMessages),
     ("Terminal bridge rejects foreign documents", TerminalBridgeOrigins),
+    ("Native layout restoration and pane reconciliation", NativeLayouts),
 };
 
 var failures = new List<string>();
@@ -49,6 +50,28 @@ if (failures.Count > 0)
 
 Console.WriteLine($"Sgian.Protocol: {tests.Length} checks passed");
 return 0;
+
+static void NativeLayouts()
+{
+    using var document = JsonDocument.Parse("""
+        {"type":"split","id":"split-1","direction":"column","ratio":0.3,
+         "first":{"type":"leaf","id":"one"},"second":{"type":"leaf","id":"two"}}
+        """);
+    var tree = PaneLayout.Parse(document.RootElement) ?? throw new Exception("Layout did not decode");
+    Equal("one,two", string.Join(",", tree.PaneIds));
+    Equal(0.7, tree.Resize("split-1", 0.7).Ratio);
+    var repaired = PaneLayout.Reconcile(tree, ["two", "three"])!;
+    Equal("two,three", string.Join(",", repaired.PaneIds));
+    Equal("two", repaired.Remove("three")!.Id);
+    Equal(true, PaneLayout.Reconcile(tree, []) is null);
+    var inserted = tree.Insert("three", "one", "row");
+    Equal("one,three,two", string.Join(",", inserted.PaneIds));
+    Equal("row", inserted.First!.Direction);
+    var duplicate = JsonSerializer.SerializeToElement(PaneLayout.Join(PaneLayout.Leaf("one"), PaneLayout.Leaf("one"), "row"));
+    Equal(true, PaneLayout.Parse(duplicate) is null);
+    Equal(0.5, PaneLayout.Clamp(double.NaN));
+    Equal(0.82, tree.Resize("split-1", 100).Ratio);
+}
 
 static void PipeEndpointParsing()
 {

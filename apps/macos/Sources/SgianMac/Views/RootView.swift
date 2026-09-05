@@ -13,6 +13,16 @@ struct RootView: View {
         .frame(minWidth: 900, minHeight: 580)
         .toolbar { toolbar }
         .task { model.start() }
+        .sheet(isPresented: $model.showingCommands) { NativeCommandPalette(model: model) }
+        .confirmationDialog("Close pane?", isPresented: Binding(
+            get: { model.panePendingClose != nil },
+            set: { if !$0 { model.panePendingClose = nil } }
+        ), titleVisibility: .visible) {
+            if let pane = model.panePendingClose {
+                Button("Close \(pane.title)", role: .destructive) { model.close(pane.id); model.panePendingClose = nil }
+                Button("Cancel", role: .cancel) { model.panePendingClose = nil }
+            }
+        } message: { Text("This stops the pane’s running process. Closing the window leaves sessions running.") }
         .alert("Sgian", isPresented: errorPresented) {
             Button("OK") { model.errorMessage = nil }
         } message: {
@@ -22,28 +32,14 @@ struct RootView: View {
 
     @ViewBuilder
     private var detail: some View {
-        if let pane = model.selectedPane {
-            VStack(spacing: 0) {
-                PaneHeader(model: model, pane: pane)
-                Divider()
-                if pane.kind == .shell, let terminal = model.terminals[pane.id] {
-                    TerminalSurfaceView(surface: terminal)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 6)
-                        .background(Color(nsColor: terminal.view.nativeBackgroundColor))
-                        .overlay {
-                            Rectangle()
-                                .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
-                                .accessibilityHidden(true)
-                        }
-                } else if pane.kind == .agent {
-                    AgentChatView(model: model, pane: pane)
-                } else {
-                    ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
+        VStack(spacing: 0) {
+            if model.showingSearch { TerminalSearchBar(model: model) }
+            if let layout = model.layout {
+                NativePaneTree(model: model, node: model.zoomed && model.selectedPaneID != nil
+                    ? .leaf(model.selectedPaneID!) : layout)
+            } else {
+                EmptyWorkspaceView(model: model)
             }
-        } else {
-            EmptyWorkspaceView(model: model)
         }
     }
 
@@ -55,6 +51,13 @@ struct RootView: View {
             }
             .help("New terminal (⌘T)")
 
+            Button { model.createShell(direction: "column") } label: {
+                Label("Split Down", systemImage: "rectangle.split.1x2")
+            }
+            Button { model.toggleZoom() } label: {
+                Label(model.zoomed ? "Show All Panes" : "Zoom Pane", systemImage: "arrow.up.left.and.arrow.down.right")
+            }
+            Button { model.showingCommands = true } label: { Label("Commands", systemImage: "command") }
             Menu {
                 Button("Claude") { model.createAgent(backend: .claude) }
                 Button("Factory Droid") { model.createAgent(backend: .droid) }
@@ -70,7 +73,7 @@ struct RootView: View {
     }
 }
 
-private struct PaneHeader: View {
+struct PaneHeader: View {
     @ObservedObject var model: WorkspaceModel
     let pane: Pane
 
@@ -85,6 +88,11 @@ private struct PaneHeader: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Button { model.select(pane.id); model.toggleZoom() } label: {
+                Image(systemName: model.zoomed ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+            }.buttonStyle(.plain).help("Zoom pane")
+            Button { model.requestClose(pane) } label: { Image(systemName: "xmark") }
+                .buttonStyle(.plain).help("Close pane")
             if model.paneStates[pane.id] == .ended {
                 Button("Restart", systemImage: "arrow.clockwise") { model.restart(pane.id) }
                     .buttonStyle(.bordered)

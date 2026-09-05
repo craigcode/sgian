@@ -14,6 +14,12 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var status: ConnectionStatus = .disconnected
     @Published var errorMessage: String?
     @Published private(set) var workspaceURL: URL
+    @Published private(set) var layout: PaneLayout?
+    @Published var zoomed = false
+    @Published var showingCommands = false
+    @Published var showingSearch = false
+    @Published var panePendingClose: Pane?
+    @Published private(set) var recentWorkspaces: [String] = UserDefaults.standard.stringArray(forKey: "recentWorkspaces") ?? []
     @Published var terminalFontSize: Double {
         didSet {
             UserDefaults.standard.set(terminalFontSize, forKey: "terminalFontSize")
@@ -30,6 +36,7 @@ final class WorkspaceModel: ObservableObject {
     private var pendingInput: [String: String] = [:]
     private var inputDrains: [String: Task<Void, Never>] = [:]
     private var ensuringTerminals: Set<String> = []
+    private var layoutSaveTask: Task<Void, Never>?
 
     init() {
         let defaults = UserDefaults.standard
@@ -54,16 +61,19 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func start() {
+        guard connectionTask == nil else { return }
         connect(to: workspaceURL)
     }
 
     func connect(to url: URL) {
         let nextURL = url.standardizedFileURL.resolvingSymlinksInPath()
-        guard FileManager.default.fileExists(atPath: nextURL.path) else {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: nextURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             errorMessage = "Workspace does not exist: \(nextURL.path)"
             return
         }
         connectionTask?.cancel()
+        layoutSaveTask?.cancel()
         reconnectTask?.cancel()
         reconnectTask = nil
         reconnectAttempt = 0
@@ -78,6 +88,8 @@ final class WorkspaceModel: ObservableObject {
         let currentGeneration = generation
         workspaceURL = nextURL
         UserDefaults.standard.set(nextURL.path, forKey: "workspacePath")
+        recentWorkspaces = Array(([nextURL.path] + recentWorkspaces.filter { $0 != nextURL.path }).prefix(10))
+        UserDefaults.standard.set(recentWorkspaces, forKey: "recentWorkspaces")
         status = .connecting
         errorMessage = nil
         panes = []
@@ -87,6 +99,9 @@ final class WorkspaceModel: ObservableObject {
         agentSpecs = [:]
         terminals = [:]
         chats = [:]
+        layout = nil
+        zoomed = false
+        panePendingClose = nil
 
         connectionTask = Task { [weak self] in
             guard let self else { return }
@@ -140,13 +155,19 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
-    func createShell(title: String? = nil) {
+    func createShell(title: String? = nil, direction: String = "row", profile: String? = nil) {
+        let anchor = selectedPaneID
         perform { client in
             let pane: Pane = try await client.request([
                 "command": .string("create_pane"),
                 "title": title.map(JSONValue.string) ?? .null,
+                "profile": profile.map(JSONValue.string) ?? .null,
             ], as: Pane.self)
+            guard self.client === client else { return }
             self.upsert(pane)
+            self.layout = self.layout?.inserting(pane.id, beside: anchor, direction: direction) ?? .leaf(pane.id)
+            self.zoomed = false
+            self.saveLayout()
             self.select(pane.id)
         }
     }
@@ -159,8 +180,10 @@ final class WorkspaceModel: ObservableObject {
                 "backend": .string(backend.rawValue),
                 "model": model.map(JSONValue.string) ?? .null,
             ], as: Pane.self)
+            guard self.client === client else { return }
             self.agentSpecs[pane.id] = AgentPaneSpec(backend: backend, model: model)
             self.upsert(pane)
+            self.saveLayout()
             self.select(pane.id)
         }
     }
@@ -171,7 +194,9 @@ final class WorkspaceModel: ObservableObject {
                 "command": .string("close_pane"),
                 "pane_id": .string(paneID),
             ], as: WorkspaceSnapshot.self)
+            guard self.client === client else { return }
             self.apply(snapshot)
+            self.saveLayout()
         }
     }
 
@@ -184,6 +209,7 @@ final class WorkspaceModel: ObservableObject {
                 "pane_id": .string(paneID),
                 "title": .string(trimmed),
             ], as: Pane.self)
+            guard self.client === client else { return }
             self.upsert(pane)
         }
     }
@@ -194,6 +220,7 @@ final class WorkspaceModel: ObservableObject {
                 "command": .string("restart_pane_terminal"),
                 "pane_id": .string(paneID),
             ], as: CommandOK.self)
+            guard self.client === client else { return }
             self.paneStates[paneID] = .live
             if self.panes.first(where: { $0.id == paneID })?.kind == .shell {
                 self.terminals[paneID]?.feed("\u{1b}[2J\u{1b}[H")
@@ -215,6 +242,7 @@ final class WorkspaceModel: ObservableObject {
                     "text": .string(trimmed),
                 ], as: CommandOK.self)
             } catch {
+                guard self.client === client else { return }
                 var failed = self.chats[paneID] ?? AgentChatState()
                 failed.removeLastUserMessage(matching: trimmed)
                 self.chats[paneID] = failed
@@ -241,6 +269,7 @@ final class WorkspaceModel: ObservableObject {
                 "allow": .bool(allow),
                 "message": message.map(JSONValue.string) ?? .null,
             ], as: CommandOK.self)
+            guard self.client === client else { return }
             var chat = self.chats[paneID] ?? AgentChatState()
             if chat.pendingPermission?.requestID == requestID { chat.pendingPermission = nil }
             self.chats[paneID] = chat
@@ -250,6 +279,40 @@ final class WorkspaceModel: ObservableObject {
     func clearSelectedTerminal() {
         guard let selectedPaneID else { return }
         terminals[selectedPaneID]?.clearScrollback()
+    }
+
+    func resizeSplit(_ id: String, ratio: Double) {
+        layout = layout?.resizing(id, ratio: ratio)
+        saveLayout()
+    }
+
+    func toggleZoom() { zoomed.toggle() }
+
+    func focusNext(_ offset: Int) {
+        let ids = layout?.paneIDs ?? panes.map(\.id)
+        guard !ids.isEmpty else { return }
+        let index = ids.firstIndex(of: selectedPaneID ?? "") ?? 0
+        select(ids[(index + offset + ids.count) % ids.count])
+    }
+
+    func requestClose(_ pane: Pane? = nil) { panePendingClose = pane ?? selectedPane }
+
+    private func saveLayout() {
+        layoutSaveTask?.cancel()
+        guard let client else { return }
+        let value = layout?.json ?? .null
+        layoutSaveTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(200))
+                guard let self, self.client === client, !Task.isCancelled else { return }
+                let _: CommandOK = try await client.request([
+                    "command": .string("update_workspace_layout"), "layout": value,
+                ], as: CommandOK.self)
+            } catch is CancellationError {} catch {
+                guard let self, self.client === client else { return }
+                self.present(error)
+            }
+        }
     }
 
     private func beginSubscription(client: DaemonIPCClient, generation: UUID) {
@@ -330,6 +393,7 @@ final class WorkspaceModel: ObservableObject {
         paneStates = snapshot.paneStates
         agentStates = snapshot.agentStates
         agentSpecs = snapshot.agentSpecs
+        layout = PaneLayout.reconcile(PaneLayout.parse(snapshot.layout), paneIDs: snapshot.panes.map(\.id))
 
         let liveIDs = Set(snapshot.panes.map(\.id))
         terminals = terminals.filter { liveIDs.contains($0.key) }
@@ -497,6 +561,7 @@ final class WorkspaceModel: ObservableObject {
             panes.append(pane)
         }
         paneStates[pane.id] = paneStates[pane.id] ?? .live
+        layout = PaneLayout.reconcile(layout, paneIDs: panes.map(\.id))
         if pane.kind == .shell {
             _ = terminal(for: pane.id)
             if let client { ensureTerminal(pane.id, client: client) }
@@ -511,6 +576,7 @@ final class WorkspaceModel: ObservableObject {
         agentSpecs.removeValue(forKey: paneID)
         terminals.removeValue(forKey: paneID)
         chats.removeValue(forKey: paneID)
+        layout = layout?.removing(paneID)
         if selectedPaneID == paneID { selectedPaneID = panes.first?.id }
     }
 
@@ -518,10 +584,11 @@ final class WorkspaceModel: ObservableObject {
         reportErrors: Bool = true,
         _ operation: @escaping (DaemonIPCClient) async throws -> Void
     ) {
+        guard let client else { return }
         Task { [weak self] in
-            guard let self, let client else { return }
+            guard let self, self.client === client else { return }
             do { try await operation(client) }
-            catch { if reportErrors { present(error) } }
+            catch { if reportErrors, self.client === client { present(error) } }
         }
     }
 
