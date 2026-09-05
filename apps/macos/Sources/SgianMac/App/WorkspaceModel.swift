@@ -19,6 +19,7 @@ final class WorkspaceModel: ObservableObject {
     @Published var showingCommands = false
     @Published var showingSearch = false
     @Published var panePendingClose: Pane?
+    @Published private(set) var profiles: [JSONValue] = []
     @Published private(set) var recentWorkspaces: [String] = UserDefaults.standard.stringArray(forKey: "recentWorkspaces") ?? []
     @Published var terminalFontSize: Double {
         didSet {
@@ -118,6 +119,7 @@ final class WorkspaceModel: ObservableObject {
                 apply(snapshot)
                 status = .connected
                 beginSubscription(client: client, generation: currentGeneration)
+                _ = try? await readConfiguration()
                 try await completeUISmokeIfRequested()
             } catch {
                 guard currentGeneration == generation else { return }
@@ -173,6 +175,7 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func createAgent(backend: AgentBackend, model: String? = nil) {
+        let model = model ?? UserDefaults.standard.string(forKey: "defaultAgentModel").flatMap { $0.isEmpty ? nil : $0 }
         perform { client in
             let pane: Pane = try await client.request([
                 "command": .string("create_agent_pane_with_spec"),
@@ -297,6 +300,30 @@ final class WorkspaceModel: ObservableObject {
 
     func requestClose(_ pane: Pane? = nil) { panePendingClose = pane ?? selectedPane }
 
+    func createProfile(_ profile: JSONValue) {
+        if profile["kind"]?.stringValue == "agent" {
+            createAgent(backend: AgentBackend(rawValue: profile["backend"]?.stringValue ?? "claude") ?? .claude,
+                        model: profile["model"]?.stringValue)
+        } else { createShell(profile: profile["name"]?.stringValue) }
+    }
+
+    func readConfiguration() async throws -> [String: JSONValue] {
+        guard let client else { throw CocoaError(.fileReadUnknown) }
+        let config: JSONValue = try await client.request(["command": .string("get_config")], as: JSONValue.self)
+        guard self.client === client else { throw CancellationError() }
+        profiles = config["profiles"]?.arrayValue ?? []
+        return config.objectValue ?? [:]
+    }
+
+    func writeConfiguration(_ config: [String: JSONValue]) async throws {
+        guard let client else { throw CocoaError(.fileWriteUnknown) }
+        let _: CommandOK = try await client.request([
+            "command": .string("write_config"), "config": .object(config),
+        ], as: CommandOK.self)
+        guard self.client === client else { throw CancellationError() }
+        profiles = config["profiles"]?.arrayValue ?? []
+    }
+
     private func saveLayout() {
         layoutSaveTask?.cancel()
         guard let client else { return }
@@ -410,7 +437,7 @@ final class WorkspaceModel: ObservableObject {
             if pane.kind == .shell {
                 let surface = terminal(for: pane.id, size: snapshot.sizes[pane.id])
                 surface.loadInitialScrollback(snapshot.scrollback[pane.id] ?? "")
-                if let client { ensureTerminal(pane.id, client: client) }
+                if snapshot.paneStates[pane.id] != .ended, let client { ensureTerminal(pane.id, client: client) }
             } else {
                 // User prompts are rendered locally because the daemon does
                 // not echo them. Fold replay into an existing chat so a close,

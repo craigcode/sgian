@@ -218,6 +218,7 @@ public sealed partial class MainWindow : Window
             ("New Factory Droid agent", () => ViewModel.CreateAgentAsync("droid")),
             ("Zoom / Show all panes", () => { ViewModel.ToggleZoom(); return Task.CompletedTask; }),
             ("Reconnect", () => ViewModel.StartAsync()),
+            ("Check for updates", () => NativeUpdates.CheckAsync(Root.XamlRoot)),
         };
         actions.AddRange(ViewModel.Panes.Select(pane => ($"Focus: {pane.Title} [{pane.Id}]", (Func<Task>)(() => ViewModel.SelectAsync(pane)))));
         actions.AddRange(ViewModel.RecentWorkspaces.Select(path => ($"Workspace: {path}", (Func<Task>)(() => ViewModel.ConnectAsync(path)))));
@@ -341,37 +342,8 @@ public sealed partial class MainWindow : Window
         if (folder is not null) await ViewModel.ConnectAsync(folder.Path);
     }
 
-    private async void Settings_Click(object sender, RoutedEventArgs e)
-    {
-        var slider = new Slider
-        {
-            Minimum = 9,
-            Maximum = 30,
-            StepFrequency = 1,
-            Value = ViewModel.TerminalFontSize,
-            Header = "Terminal font size",
-        };
-        var workspace = new TextBlock
-        {
-            Text = ViewModel.WorkspacePath,
-            TextWrapping = TextWrapping.Wrap,
-            Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["TextFillColorSecondaryBrush"],
-        };
-        var panel = new StackPanel { Spacing = 12, MinWidth = 420 };
-        panel.Children.Add(slider);
-        panel.Children.Add(new TextBlock { Text = "Workspace", FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
-        panel.Children.Add(workspace);
-        var dialog = new ContentDialog
-        {
-            XamlRoot = Root.XamlRoot,
-            Title = "Sgian settings",
-            Content = panel,
-            PrimaryButtonText = "Done",
-            DefaultButton = ContentDialogButton.Primary,
-        };
-        slider.ValueChanged += (_, args) => ViewModel.TerminalFontSize = args.NewValue;
-        await dialog.ShowAsync();
-    }
+    private async void Settings_Click(object sender, RoutedEventArgs e) =>
+        await WorkspaceSettingsDialog.ShowAsync(Root.XamlRoot, ViewModel);
 
     private async void MainWindow_Closed(object sender, WindowEventArgs args)
     {

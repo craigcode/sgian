@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.UI.Dispatching;
 using Sgian.Protocol;
 
@@ -239,6 +240,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
 
     public async Task EnsureTerminalAsync(string paneId)
     {
+        if (Panes.FirstOrDefault(pane => pane.Id == paneId)?.State == "ended") return;
         if (_client is null) return;
         await RunRequestAsync(() => _client.RequestAsync<CommandOk>(Request(
             ("command", "ensure_pane_terminal"), ("pane_id", paneId))), showError: false);
@@ -513,6 +515,22 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     }
 
     public void DismissError() => ErrorMessage = null;
+
+    public async Task<JsonObject> ReadConfigurationAsync()
+    {
+        var client = _client ?? throw new InvalidOperationException("Connect to a workspace first.");
+        var generation = _generation;
+        var config = await client.RequestAsync<JsonObject>(Request(("command", "get_config")));
+        if (generation != _generation) throw new OperationCanceledException("Workspace changed.");
+        return config;
+    }
+
+    public async Task WriteConfigurationAsync(JsonObject config, Guid generation)
+    {
+        if (generation != _generation) throw new OperationCanceledException("Workspace changed. Reopen settings.");
+        var client = _client ?? throw new InvalidOperationException("Connect to a workspace first.");
+        await client.RequestAsync<CommandOk>(Request(("command", "write_config"), ("config", config)));
+    }
 
     public void ToggleZoom() { Zoomed = !Zoomed; WorkspaceChanged?.Invoke(this, EventArgs.Empty); }
 

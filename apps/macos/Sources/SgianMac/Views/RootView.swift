@@ -61,6 +61,12 @@ struct RootView: View {
             Menu {
                 Button("Claude") { model.createAgent(backend: .claude) }
                 Button("Factory Droid") { model.createAgent(backend: .droid) }
+                if !model.profiles.isEmpty {
+                    Divider()
+                    ForEach(model.profiles, id: \.prettyPrinted) { profile in
+                        Button(profile["name"]?.stringValue ?? "Profile") { model.createProfile(profile) }
+                    }
+                }
             } label: {
                 Label("New Agent", systemImage: "sparkles")
             }

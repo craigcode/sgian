@@ -12,13 +12,15 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", exact: "1.19.0"),
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.6"),
     ],
     targets: [
         .executableTarget(
             name: "SgianMac",
-            dependencies: ["SwiftTerm"],
+            dependencies: ["SwiftTerm", .product(name: "Sparkle", package: "Sparkle")],
             path: "Sources/SgianMac",
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            swiftSettings: [.swiftLanguageMode(.v5)],
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]
         ),
         .testTarget(
             name: "SgianMacTests",

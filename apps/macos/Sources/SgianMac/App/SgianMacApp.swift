@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct SgianMacApp: App {
     @StateObject private var model = WorkspaceModel()
+    @StateObject private var updater = NativeUpdater()
 
     var body: some Scene {
         WindowGroup("Sgian") {
@@ -11,6 +12,9 @@ struct SgianMacApp: App {
         .defaultSize(width: 1220, height: 780)
         .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…", action: updater.check).disabled(!updater.canCheck)
+            }
             CommandGroup(replacing: .newItem) {
                 Button("New Terminal") { model.createShell() }
                     .keyboardShortcut("t", modifiers: .command)
