@@ -5,7 +5,8 @@ The review focused on daemon trust boundaries, process/configuration handling,
 UI content and native bridges, dependencies, and release automation.
 Status: **release candidate prepared; platform and production-signing gates
 must pass before public distribution.** No tag, push, release publication, or
-repository-visibility change was performed during this review.
+repository-visibility change was performed during the initial local review.
+Follow-up: the hardening is now proposed in [PR #11](https://github.com/craigcode/sgian/pull/11).
 
 ## Fixed findings
 
@@ -47,9 +48,12 @@ repository-visibility change was performed during this review.
   GHSA-2v37-7h3g-55p8, GHSA-fxqj-rqcc-2cmp and GHSA-r28c-9q8g-f849.
 - RustSec: 521 locked dependencies checked against database commit
   `5a0ebedfe8bdd2e295b171f4162f8c977bcad9a5` (updated September 2, 2026).
-  Zero vulnerability-class advisories; **17 unmaintained notices and one
-  unsoundness advisory remain**, described below. These are not a clean bill
-  of health for every dependency.
+  Zero vulnerability-class advisories; **17 unmaintained notices remain**.
+  The GLib unsoundness was subsequently fixed by backporting the exact upstream
+  patch, described below. Cargo audit does not report the advisory for a local
+  path dependency; the source comparison and optimized regression provide the
+  evidence for the fix. These checks are not a clean bill of health for every
+  dependency.
 - Gitleaks 8.30.1 scanned all 8 locally available Git commits (about 2.98 MB).
   Four detections were minified xterm FourKeyMap/SequencerByKey exports, verified
   against identical upstream package bytes. Their two exact historical
@@ -62,7 +66,9 @@ repository-visibility change was performed during this review.
 1. **Run the changed CI workflow on the final commit.** Linux bundle/runtime
    checks and Windows WinUI/installer/pipe checks cannot be substituted by the
    successful macOS runs. The workflow's release jobs depend on these checks.
-2. **Production signing and update exercise.** Configure the Developer ID,
+2. **Production signing and update exercise.** GitHub's API reports **zero
+   repository Actions secrets and no environments** as of September 5, 2026.
+   Configure the Developer ID,
    notarization, and updater secrets named in `.github/workflows/ci.yml`.
    The final signature verifier rejects a private/public key mismatch. Exercise
    installation and a real version-to-version update from production-signed
@@ -73,15 +79,21 @@ repository-visibility change was performed during this review.
    Apple Silicon macOS builds. Native SwiftUI/WinUI bundles remain CI artifacts;
    macOS native Developer ID signing/notarization is not wired. Windows NSIS/MSIX
    lacks Authenticode signing and may trigger SmartScreen warnings.
-4. **Linux upstream debt.** `glib` 0.18.5 carries
+4. **Linux upstream debt and GLib backport.** Upstream `glib` 0.18.5 carries
    [RUSTSEC-2024-0429](https://rustsec.org/advisories/RUSTSEC-2024-0429.html):
    unsound `VariantStrIter` operations, fixed upstream in 0.20.0. Tauri's GTK3
    dependency chain requires the older series, so a direct version bump is not
-   compatible. No direct use of that iterator was found in Sgian's source; its
-   complete transitive reachability was not proven. Seventeen maintenance
+   compatible. Sgian now selects a local copy of 0.18.5 with precisely the
+   two-line upstream fix from commit `b5a4071e439bef2b5eea76c3aa25e5ae84839e34`.
+   Its archive checksum was verified against the original lockfile. A source
+   comparison confirms no other upstream code changed. The optimized regression
+   exercises all five affected methods and mixed forward/backward iteration;
+   it passed locally against system GLib and also runs in Linux CI. Provenance
+   and the removal condition are in `src-tauri/vendor/glib/SGIAN-PATCH.md`.
+   Seventeen maintenance
    notices cover GTK3 bindings, proc-macro-error, portable-pty's serial crate,
    and rust-unic crates. Retain visibility of these warnings and evaluate an
-   upstream migration or a reviewed backport; do not claim they are fixed.
+   upstream migration; these maintenance notices are not fixed by the backport.
 5. **Repository launch settings.** Make the repository and releases publicly
    readable only after reviewing history and repository content. Enable private
    vulnerability reporting, protect the default branch and release tags, and

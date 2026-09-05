@@ -170,6 +170,9 @@ jobs:
       - name: Linux Rust tests
         working-directory: src-tauri
         run: cargo test --locked
+      - name: Optimized GLib security regression
+        working-directory: src-tauri
+        run: cargo test --locked --release --test glib_variant_iter
       - name: Build Debian and AppImage bundles
         run: npm run tauri build -- --bundles deb,appimage --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
       - name: Smoke test daemon + ctl + agent

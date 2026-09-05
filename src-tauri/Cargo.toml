@@ -45,3 +45,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+glib = "=0.18.5"
+
+[patch.crates-io]
+# GTK3 requires the 0.18 API. Backport upstream's VariantStrIter UB fix.
+# See vendor/glib/SGIAN-PATCH.md for provenance and the removal condition.
+glib = { path = "vendor/glib" }
