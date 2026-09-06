@@ -21,6 +21,8 @@ public sealed partial class MainWindow : Window
     private bool _started;
     private readonly Dictionary<string, Border> _paneFrames = [];
     private string? _renderedShape;
+    private bool _nativeSmokeRunning;
+    private string? _focusedPaneId;
 
     public MainWindow()
     {
@@ -29,6 +31,7 @@ public sealed partial class MainWindow : Window
         PaneList.ItemsSource = ViewModel.Panes;
         ErrorBar.Closed += (_, _) => ViewModel.DismissError();
         ViewModel.WorkspaceReset += (_, _) => ClearViews();
+        ViewModel.LayoutRestored += (_, _) => _renderedShape = null;
         ViewModel.WorkspaceChanged += (_, _) => Refresh();
         ViewModel.ChatChanged += (_, args) =>
         {
@@ -37,7 +40,7 @@ public sealed partial class MainWindow : Window
         ViewModel.TerminalOutput += (_, args) =>
         {
             if (!_terminals.TryGetValue(args.PaneId, out var view)) return;
-            if (args.Reset) view.Reset(args.Data); else view.Write(args.Data);
+            if (args.Reset) view.Reset(args.Data, args.Size); else view.Write(args.Data);
         };
         ViewModel.TerminalSettingsChanged += (_, _) =>
             _terminals.Values.ToList().ForEach(view => view.SetFontSize(ViewModel.TerminalFontSize));
@@ -112,6 +115,7 @@ public sealed partial class MainWindow : Window
         _agentChats.Clear();
         _paneFrames.Clear();
         _renderedShape = null;
+        _focusedPaneId = null;
     }
 
     private void ShowLayout()
@@ -143,7 +147,8 @@ public sealed partial class MainWindow : Window
                 ? Microsoft.UI.Colors.DodgerBlue : Microsoft.UI.Colors.Transparent);
             if (_agentChats.TryGetValue(id, out var chat)) chat.Refresh();
         }
-        if (ViewModel.SelectedPane is { IsAgent: false } pane && _terminals.TryGetValue(pane.Id, out var active)) active.FocusTerminal();
+        if (ViewModel.SelectedPane is { IsAgent: false } pane && _focusedPaneId != pane.Id && _terminals.TryGetValue(pane.Id, out var active))
+        { _focusedPaneId = pane.Id; active.FocusTerminal(); }
     }
 
     private FrameworkElement PaneFrame(string id)
@@ -169,7 +174,7 @@ public sealed partial class MainWindow : Window
         else
         {
             var terminal = new TerminalPaneView();
-            terminal.Ready += (_, _) => App.CompleteSmoke();
+            terminal.Ready += OnTerminalReady;
             terminal.Activated += async (_, _) => { if (ViewModel.Generation == generation && ViewModel.SelectedPane != pane) await ViewModel.SelectAsync(pane); };
             _terminals[id] = terminal;
             view = terminal;
@@ -184,10 +189,38 @@ public sealed partial class MainWindow : Window
 
     private async Task InitializeTerminalAsync(TerminalPaneView terminal, PaneViewModel pane, Guid generation)
     {
-        await terminal.InitializeAsync(pane.Id, ViewModel.InitialScrollback(pane.Id), ViewModel.TerminalFontSize,
+        await terminal.InitializeAsync(pane.Id, ViewModel.InitialScrollback(pane.Id), ViewModel.InitialSize(pane.Id), ViewModel.TerminalFontSize,
             data => generation == ViewModel.Generation ? ViewModel.WriteTerminalAsync(pane.Id, data) : Task.CompletedTask,
             (columns, rows) => generation == ViewModel.Generation ? ViewModel.ResizeTerminalAsync(pane.Id, columns, rows) : Task.CompletedTask);
         if (generation == ViewModel.Generation) await ViewModel.EnsureTerminalAsync(pane.Id);
+    }
+
+    private async void OnTerminalReady(object? sender, EventArgs args)
+    {
+        if (Environment.GetEnvironmentVariable("SGIAN_UI_SMOKE") != "1" || _nativeSmokeRunning) return;
+        _nativeSmokeRunning = true;
+        try
+        {
+            await ViewModel.CreateShellAsync("column");
+            for (var attempt = 0; attempt < 80; attempt++)
+            {
+                if (_terminals.Count >= 2 && _terminals.Values.All(view => view.IsReady)) break;
+                await Task.Delay(100);
+            }
+            if (_terminals.Count < 2 || _terminals.Values.Any(view => !view.IsReady)) throw new InvalidOperationException("Native split terminals did not initialize");
+            await Task.Delay(350);
+            var snapshot = await ViewModel.ReadSnapshotAsync();
+            if (PaneLayout.Parse(snapshot.Layout)?.PaneIds.Count != 2) throw new InvalidOperationException("Native split layout did not persist");
+            var terminal = _terminals.Values.Last();
+            var searched = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            terminal.SearchCompleted += result => searched.TrySetResult(result != "No matches");
+            terminal.Write("\r\nnative-search-smoke\r\n");
+            await Task.Delay(250);
+            terminal.Search("native-search-smoke", false);
+            if (!await searched.Task.WaitAsync(TimeSpan.FromSeconds(5))) throw new InvalidOperationException("Native terminal search failed");
+            App.CompleteSmoke();
+        }
+        catch (Exception error) { App.CompleteSmoke(error); }
     }
 
     private void AddShortcut(VirtualKey key, VirtualKeyModifiers modifiers, Func<Task> action)
@@ -201,11 +234,16 @@ public sealed partial class MainWindow : Window
     {
         if (ViewModel.SelectedPane is not { } pane || !_terminals.TryGetValue(pane.Id, out var terminal)) return;
         var input = new TextBox { PlaceholderText = "Find in terminal" };
-        var dialog = new ContentDialog { XamlRoot = Root.XamlRoot, Title = "Find in terminal", Content = input,
+        var status = new TextBlock { Text = "Enter text to search the terminal buffer." };
+        var content = new StackPanel { Spacing = 10 }; content.Children.Add(input); content.Children.Add(status);
+        void Result(string result) => status.Text = result;
+        terminal.SearchCompleted += Result;
+        var dialog = new ContentDialog { XamlRoot = Root.XamlRoot, Title = "Find in terminal", Content = content,
             PrimaryButtonText = "Next", SecondaryButtonText = "Previous", CloseButtonText = "Done" };
         dialog.PrimaryButtonClick += (_, args) => { args.Cancel = true; terminal.Search(input.Text, false); };
         dialog.SecondaryButtonClick += (_, args) => { args.Cancel = true; terminal.Search(input.Text, true); };
-        await dialog.ShowAsync();
+        try { await dialog.ShowAsync(); }
+        finally { terminal.SearchCompleted -= Result; }
         terminal.FocusTerminal();
     }
 
@@ -222,6 +260,15 @@ public sealed partial class MainWindow : Window
         };
         actions.AddRange(ViewModel.Panes.Select(pane => ($"Focus: {pane.Title} [{pane.Id}]", (Func<Task>)(() => ViewModel.SelectAsync(pane)))));
         actions.AddRange(ViewModel.RecentWorkspaces.Select(path => ($"Workspace: {path}", (Func<Task>)(() => ViewModel.ConnectAsync(path)))));
+        try
+        {
+            var config = await ViewModel.ReadConfigurationAsync();
+            if (config["profiles"] is System.Text.Json.Nodes.JsonArray profiles)
+                foreach (var profile in profiles)
+                    if (profile?["name"]?.GetValue<string>() is { } name)
+                        actions.Add(($"New pane with profile: {name}", () => ViewModel.CreateShellAsync(profile: name)));
+        }
+        catch (Exception error) { App.TraceSmoke($"Command profile loading: {error.Message}"); }
         var input = new TextBox { PlaceholderText = "Search commands and panes" };
         var list = new ListView { Height = 260, ItemsSource = actions.Select(item => item.Label).ToList() };
         input.TextChanged += (_, _) => list.ItemsSource = actions.Where(item => item.Label.Contains(input.Text, StringComparison.OrdinalIgnoreCase)).Select(item => item.Label).ToList();

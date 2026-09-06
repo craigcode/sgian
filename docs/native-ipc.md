@@ -65,6 +65,7 @@ whose sequence is not newer than the last applied sequence.
 The native clients currently use:
 
 - `ping`, `bootstrap_workspace`, `subscribe`
+- `update_workspace_layout`, `get_config`, `write_config`
 - `create_pane`, `close_pane`, `rename_pane`
 - `ensure_pane_terminal`, `restart_pane_terminal`
 - `write_to_pane`, `resize_pane_terminal`, `set_active_pane`
@@ -82,3 +83,7 @@ The native client handles `pty_output`, `pane_ended`, `pane_created`,
 `pane_closed`, `pane_renamed`, `agent_state` and `agent_event`. Unknown events
 are ignored for forward compatibility. Subscription disconnects are retried;
 the daemon and its sessions are never tied to the client process lifetime.
+
+Native split layouts use the same binary JSON tree as Tauri. Clients validate
+tree depth, directions, ratios and unique pane IDs, reconcile stale membership,
+and debounce persisted resize changes. See [native release](native-release.md).

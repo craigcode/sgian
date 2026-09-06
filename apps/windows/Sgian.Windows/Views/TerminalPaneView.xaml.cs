@@ -3,6 +3,7 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.Web.WebView2.Core;
 using Sgian.Windows.Terminal;
+using Sgian.Protocol;
 
 namespace Sgian.Windows.Views;
 
@@ -26,10 +27,12 @@ public sealed partial class TerminalPaneView : UserControl, IDisposable
     public event EventHandler? Activated;
     public event Action<string>? SearchCompleted;
     public string PaneId { get; private set; } = "";
+    public bool IsReady => _ready && !_disposed;
 
     public async Task InitializeAsync(
         string paneId,
         string scrollback,
+        PaneSize? size,
         double fontSize,
         Func<string, Task> input,
         Func<ushort, ushort, Task> resize)
@@ -38,7 +41,7 @@ public sealed partial class TerminalPaneView : UserControl, IDisposable
         _input = input;
         _resize = resize;
         Queue(new { type = "font-size", value = fontSize });
-        Queue(new { type = "reset", data = scrollback });
+        Reset(scrollback, size);
         App.TraceSmoke($"Initializing WebView2 for {paneId}");
         try
         {
@@ -80,7 +83,7 @@ public sealed partial class TerminalPaneView : UserControl, IDisposable
     }
 
     public void Write(string data) => Queue(new { type = "output", data });
-    public void Reset(string data) => Queue(new { type = "reset", data });
+    public void Reset(string data, PaneSize? size = null) => Queue(new { type = "reset", data, cols = size?.Columns, rows = size?.Rows });
     public void SetFontSize(double value) => Queue(new { type = "font-size", value });
     public void FocusTerminal() => Queue(new { type = "focus" });
     public void Search(string query, bool previous) => Queue(new { type = "search", query, previous });
@@ -127,6 +130,7 @@ public sealed partial class TerminalPaneView : UserControl, IDisposable
                 finally { _inputGate.Release(); }
             }
             else if (type == "activated") Activated?.Invoke(this, EventArgs.Empty);
+            else if (type == "error") throw new InvalidOperationException(root.GetProperty("message").GetString());
             else if (type == "search-result") SearchCompleted?.Invoke(root.GetProperty("found").GetBoolean() ? "Match selected in terminal" : "No matches");
             else if (type == "resize" && _resize is not null)
             {

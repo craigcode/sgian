@@ -11,8 +11,8 @@ version="$(node -p "require('$repo/package.json').version")"
 [[ "$SGIAN_CODESIGN_IDENTITY" != '-' ]] || { echo 'Refusing ad-hoc release' >&2; exit 1; }
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")" == "$version" ]] || exit 1
 /usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$app/Contents/Info.plist" >/dev/null
-lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/Sgian"
-lipo -verify_arch arm64 x86_64 "$app/Contents/Helpers/sgian"
+lipo "$app/Contents/MacOS/Sgian" -verify_arch arm64 x86_64
+lipo "$app/Contents/Helpers/sgian" -verify_arch arm64 x86_64
 codesign --verify --deep --strict "$app"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -40,7 +40,7 @@ codesign --force --timestamp --sign "$SGIAN_CODESIGN_IDENTITY" "$dmg"
 notarize "$dmg"
 xcrun stapler staple "$dmg"
 xcrun stapler validate "$dmg"
-sparkle="$repo/apps/macos/.build/artifacts/sparkle/Sparkle/bin"
+sparkle="$repo/apps/macos/.build/native-x86_64/artifacts/sparkle/Sparkle/bin"
 "$sparkle/generate_appcast" --ed-key-file "$SGIAN_SPARKLE_PRIVATE_KEY_FILE" --download-url-prefix "https://github.com/craigcode/sgian/releases/download/v${version}/" "$out"
 python3 - "$out" "$app/Contents/Info.plist" "$version" "$repo" <<'PY'
 import hashlib,json,plistlib,sys,subprocess,xml.etree.ElementTree as ET

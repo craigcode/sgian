@@ -18,6 +18,7 @@ if [[ "${SGIAN_RELEASE:-0}" == 1 ]]; then
   [[ "$signing_identity" != '-' && "$configuration" == release ]] || { echo 'Release requires Developer ID signing and a release build' >&2; exit 1; }
   [[ -n "${SGIAN_SPARKLE_PUBLIC_KEY:-}" ]] || { echo 'Release requires SGIAN_SPARKLE_PUBLIC_KEY' >&2; exit 1; }
 fi
+(cd "$repo_root" && npm ci --ignore-scripts && npm run frontend:build)
 version="$(node -p "require('$repo_root/package.json').version")"
 mkdir -p "$output_root"
 staging="$(mktemp -d "$output_root/.native-build.XXXXXX")"
@@ -32,26 +33,32 @@ for arch in "${architectures[@]}"; do
   cargo_args=(build --locked --manifest-path "$repo_root/src-tauri/Cargo.toml" --target "$target")
   if [[ "$configuration" == release ]]; then cargo_args+=(--release); fi
   cargo "${cargo_args[@]}"
-  swift build --disable-sandbox --package-path "$package_root" -c "$configuration" --arch "$arch"
-  swift_bin_dir="$(swift build --disable-sandbox --package-path "$package_root" -c "$configuration" --arch "$arch" --show-bin-path)"
-  cp "$swift_bin_dir/SgianMac" "$staging/Sgian-$arch"
-  cp "$repo_root/src-tauri/target/$target/$configuration/sgian" "$staging/sgian-$arch"
+  # SwiftPM's build plan/database must not be shared between architecture runs.
+  swift_scratch="$package_root/.build/native-$arch"
+  swift build --disable-sandbox --package-path "$package_root" --scratch-path "$swift_scratch" -c "$configuration" --arch "$arch"
+  swift_bin_dir="$(swift build --disable-sandbox --package-path "$package_root" --scratch-path "$swift_scratch" -c "$configuration" --arch "$arch" --show-bin-path)"
+  cp "$swift_bin_dir/SgianMac" "$staging/native-client-$arch"
+  cp "$repo_root/src-tauri/target/$target/$configuration/sgian" "$staging/daemon-helper-$arch"
 done
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Helpers" "$app/Contents/Resources" "$app/Contents/Frameworks"
 cp "$package_root/Info.plist" "$app/Contents/Info.plist"
 if [[ "$architecture" == universal ]]; then
-  lipo -create "$staging/Sgian-arm64" "$staging/Sgian-x86_64" -output "$app/Contents/MacOS/Sgian"
-  lipo -create "$staging/sgian-arm64" "$staging/sgian-x86_64" -output "$app/Contents/Helpers/sgian"
+  lipo -create "$staging/native-client-arm64" "$staging/native-client-x86_64" -output "$app/Contents/MacOS/Sgian"
+  lipo -create "$staging/daemon-helper-arm64" "$staging/daemon-helper-x86_64" -output "$app/Contents/Helpers/sgian"
 else
-  cp "$staging/Sgian-$architecture" "$app/Contents/MacOS/Sgian"
-  cp "$staging/sgian-$architecture" "$app/Contents/Helpers/sgian"
+  cp "$staging/native-client-$architecture" "$app/Contents/MacOS/Sgian"
+  cp "$staging/daemon-helper-$architecture" "$app/Contents/Helpers/sgian"
+fi
+if cmp -s "$app/Contents/MacOS/Sgian" "$app/Contents/Helpers/sgian"; then
+  echo 'Native client and daemon helper must be separate executables' >&2
+  exit 1
 fi
 cp "$repo_root/src-tauri/icons/icon.icns" "$app/Contents/Resources/Sgian.icns"
 cp "$repo_root/LICENSE" "$app/Contents/Resources/Sgian-LICENSE.txt"
-cp "$package_root/.build/checkouts/SwiftTerm/LICENSE" "$app/Contents/Resources/SwiftTerm-LICENSE.txt"
-sparkle="$package_root/.build/artifacts/sparkle/Sparkle"
+cp "$swift_scratch/checkouts/SwiftTerm/LICENSE" "$app/Contents/Resources/SwiftTerm-LICENSE.txt"
+sparkle="$swift_scratch/artifacts/sparkle/Sparkle"
 cp "$sparkle/LICENSE" "$app/Contents/Resources/Sparkle-LICENSE.txt"
 ditto "$sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework" "$app/Contents/Frameworks/Sparkle.framework"
 for resource_bundle in "$swift_bin_dir"/*.bundle; do

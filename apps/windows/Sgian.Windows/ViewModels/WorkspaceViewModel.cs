@@ -11,6 +11,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     private readonly DispatcherQueue _dispatcher;
     private readonly Dictionary<string, AgentChatState> _chats = [];
     private readonly Dictionary<string, string> _scrollback = [];
+    private readonly Dictionary<string, PaneSize> _sizes = [];
     private DaemonClient? _client;
     private CancellationTokenSource? _connectionCancellation;
     private PaneViewModel? _selectedPane;
@@ -22,9 +23,11 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     private CancellationTokenSource? _layoutSaveCancellation;
     public PaneLayout? Layout { get; private set; }
     public bool Zoomed { get; private set; }
+    public string PermissionMode { get; private set; } = "manual";
     public IReadOnlyList<string> RecentWorkspaces { get; private set; }
     public Guid Generation => _generation;
     public event EventHandler? WorkspaceReset;
+    public event EventHandler? LayoutRestored;
 
     public WorkspaceViewModel(DispatcherQueue dispatcher)
     {
@@ -105,8 +108,10 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         var generation = _generation = Guid.NewGuid();
         if (_client is not null)
         {
-            await _client.DisposeAsync();
+            var previous = _client;
             _client = null;
+            await previous.DisposeAsync();
+            if (generation != _generation) return;
         }
 
         WorkspacePath = fullPath;
@@ -118,6 +123,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         Panes.Clear();
         _chats.Clear();
         _scrollback.Clear();
+        _sizes.Clear();
         SelectedPane = null;
         Layout = null;
         Zoomed = false;
@@ -145,6 +151,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             Status = "Connected";
             App.TraceSmoke($"Workspace connected; selected pane is {SelectedPane?.Id ?? "none"}");
             _ = SubscribeLoopAsync(client, generation, token);
+            await RefreshConfigurationAsync();
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -161,7 +168,12 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         if (!_chats.TryGetValue(paneId, out var chat))
         {
             chat = new AgentChatState();
-            chat.Changed += (_, _) => ChatChanged?.Invoke(this, new ChatChangedEventArgs(paneId));
+            chat.Changed += (_, _) =>
+            {
+                var pane = Panes.FirstOrDefault(item => item.Id == paneId);
+                if (pane is not null) pane.Attention = chat.PendingPermission is not null ? "needs_input" : chat.Busy ? "working" : "idle";
+                ChatChanged?.Invoke(this, new ChatChangedEventArgs(paneId));
+            };
             _chats[paneId] = chat;
         }
         return chat;
@@ -169,6 +181,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
 
     public string InitialScrollback(string paneId) =>
         _scrollback.TryGetValue(paneId, out var value) ? value : "";
+    public PaneSize? InitialSize(string paneId) => _sizes.GetValueOrDefault(paneId);
 
     public async Task SelectAsync(PaneViewModel? pane)
     {
@@ -250,7 +263,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     {
         if (_client is null || data.Length == 0) return;
         await RunRequestAsync(() => _client.RequestAsync<CommandOk>(Request(
-            ("command", "write_to_pane"), ("pane_id", paneId), ("data", data))), showError: false);
+            ("command", "write_to_pane"), ("pane_id", paneId), ("data", data))));
     }
 
     public async Task ResizeTerminalAsync(string paneId, ushort columns, ushort rows)
@@ -375,6 +388,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             Panes.Remove(stale);
             _chats.Remove(stale.Id);
             _scrollback.Remove(stale.Id);
+            _sizes.Remove(stale.Id);
         }
         foreach (var pane in snapshot.Panes)
         {
@@ -394,13 +408,16 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             {
                 var scrollback = snapshot.Scrollback.TryGetValue(pane.Id, out var value) ? value : "";
                 _scrollback[pane.Id] = scrollback;
+                var size = snapshot.Sizes.GetValueOrDefault(pane.Id);
+                if (size is not null) _sizes[pane.Id] = size;
                 if (resetTerminals)
                 {
-                    TerminalOutput?.Invoke(this, new TerminalOutputEventArgs(pane.Id, scrollback, true));
+                    TerminalOutput?.Invoke(this, new TerminalOutputEventArgs(pane.Id, scrollback, true, size));
                 }
             }
         }
         Layout = PaneLayout.Reconcile(PaneLayout.Parse(snapshot.Layout), snapshot.Panes.Select(pane => pane.Id));
+        LayoutRestored?.Invoke(this, EventArgs.Empty);
         var selectedId = previousSelection is not null && liveIds.Contains(previousSelection)
             ? previousSelection
             : snapshot.ActivePaneId ?? snapshot.Panes.FirstOrDefault()?.Id;
@@ -440,6 +457,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                     Panes.Remove(closed);
                     _chats.Remove(closed.Id);
                     _scrollback.Remove(closed.Id);
+                    _sizes.Remove(closed.Id);
                     Layout = Layout?.Remove(closed.Id);
                     if (SelectedPane == closed) SelectedPane = Panes.FirstOrDefault();
                     WorkspaceChanged?.Invoke(this, EventArgs.Empty);
@@ -455,6 +473,9 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                 {
                     ChatFor(agentId).Apply(payload);
                 }
+                break;
+            case "config_changed":
+                _ = RefreshConfigurationAsync();
                 break;
         }
     }
@@ -522,7 +543,21 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         var generation = _generation;
         var config = await client.RequestAsync<JsonObject>(Request(("command", "get_config")));
         if (generation != _generation) throw new OperationCanceledException("Workspace changed.");
+        PermissionMode = config["agent_permission_mode"]?.GetValue<string>() ?? "manual";
+        WorkspaceChanged?.Invoke(this, EventArgs.Empty);
         return config;
+    }
+
+    private async Task RefreshConfigurationAsync()
+    {
+        try { await ReadConfigurationAsync(); }
+        catch (Exception error) { App.TraceSmoke($"Workspace settings refresh: {error.Message}"); }
+    }
+
+    public async Task<WorkspaceSnapshot> ReadSnapshotAsync()
+    {
+        var client = _client ?? throw new InvalidOperationException("Connect to a workspace first.");
+        return await BootstrapAsync(client, _connectionCancellation?.Token ?? CancellationToken.None);
     }
 
     public async Task WriteConfigurationAsync(JsonObject config, Guid generation)
@@ -530,6 +565,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         if (generation != _generation) throw new OperationCanceledException("Workspace changed. Reopen settings.");
         var client = _client ?? throw new InvalidOperationException("Connect to a workspace first.");
         await client.RequestAsync<CommandOk>(Request(("command", "write_config"), ("config", config)));
+        if (generation == _generation) await RefreshConfigurationAsync();
     }
 
     public void ToggleZoom() { Zoomed = !Zoomed; WorkspaceChanged?.Invoke(this, EventArgs.Empty); }
@@ -580,9 +616,10 @@ public sealed class ChatChangedEventArgs(string paneId) : EventArgs
     public string PaneId { get; } = paneId;
 }
 
-public sealed class TerminalOutputEventArgs(string paneId, string data, bool reset) : EventArgs
+public sealed class TerminalOutputEventArgs(string paneId, string data, bool reset, PaneSize? size = null) : EventArgs
 {
     public string PaneId { get; } = paneId;
     public string Data { get; } = data;
     public bool Reset { get; } = reset;
+    public PaneSize? Size { get; } = size;
 }

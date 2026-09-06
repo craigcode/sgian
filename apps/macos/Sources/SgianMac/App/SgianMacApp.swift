@@ -2,12 +2,13 @@ import SwiftUI
 
 @main
 struct SgianMacApp: App {
-    @StateObject private var model = WorkspaceModel()
+    @StateObject private var windows = WorkspaceWindows()
     @StateObject private var updater = NativeUpdater()
+    private var model: WorkspaceModel { windows.activeModel }
 
     var body: some Scene {
         WindowGroup("Sgian") {
-            RootView(model: model)
+            WorkspaceWindow(windows: windows)
         }
         .defaultSize(width: 1220, height: 780)
         .windowToolbarStyle(.unified(showsTitle: false))
@@ -68,5 +69,45 @@ struct SgianMacApp: App {
 
     private var defaultAgentBackend: AgentBackend {
         AgentBackend(rawValue: UserDefaults.standard.string(forKey: "defaultAgentBackend") ?? "claude") ?? .claude
+    }
+}
+
+@MainActor
+private final class WorkspaceWindows: ObservableObject {
+    @Published var activeModel = WorkspaceModel()
+}
+
+private struct WorkspaceWindow: View {
+    @ObservedObject var windows: WorkspaceWindows
+    @StateObject private var model = WorkspaceModel()
+
+    var body: some View {
+        RootView(model: model)
+            .background(WindowFocusObserver { windows.activeModel = model }.frame(width: 0, height: 0))
+            .onAppear { windows.activeModel = model }
+    }
+}
+
+// Each window owns its NSViews. Commands and Settings follow the key window.
+private struct WindowFocusObserver: NSViewRepresentable {
+    let focused: () -> Void
+    func makeNSView(context: Context) -> ObserverView { ObserverView(focused: focused) }
+    func updateNSView(_ nsView: ObserverView, context: Context) { nsView.focused = focused }
+
+    final class ObserverView: NSView {
+        var focused: () -> Void
+        private var observer: NSObjectProtocol?
+        init(focused: @escaping () -> Void) { self.focused = focused; super.init(frame: .zero) }
+        required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+            guard let window else { observer = nil; return }
+            observer = NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification,
+                object: window, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.focused() }
+                }
+        }
+        deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
     }
 }

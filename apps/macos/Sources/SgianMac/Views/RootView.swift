@@ -88,6 +88,10 @@ struct PaneHeader: View {
             Image(systemName: pane.kind == .shell ? "terminal" : "bubble.left.and.bubble.right")
                 .foregroundStyle(.secondary)
             Text(pane.title).font(.headline)
+            if pane.kind == .agent && model.permissionMode != "manual" {
+                Label(model.permissionMode, systemImage: "exclamationmark.shield")
+                    .font(.caption).foregroundStyle(.orange)
+            }
             if pane.kind == .agent, let spec = model.agentSpecs[pane.id] {
                 Text([spec.backend.displayName, spec.model].compactMap { $0 }.joined(separator: " · "))
                     .font(.caption)

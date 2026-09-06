@@ -110,8 +110,10 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
 
 struct TerminalSurfaceView: NSViewRepresentable {
     let surface: TerminalSurface
+    var focusOnAppear = false
 
     func makeNSView(context: Context) -> TerminalView {
+        if focusOnAppear { DispatchQueue.main.async { surface.focus() } }
         return surface.view
     }
 

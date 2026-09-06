@@ -16,7 +16,7 @@ struct NativePaneTree: View {
                             .contentShape(Rectangle())
                             .onTapGesture { model.select(id) }
                         if pane.kind == .shell, let surface = model.terminals[id] {
-                            TerminalSurfaceView(surface: surface)
+                            TerminalSurfaceView(surface: surface, focusOnAppear: model.selectedPaneID == id)
                                 .padding(4)
                                 .background(Color(nsColor: surface.view.nativeBackgroundColor))
                         } else if pane.kind == .agent {

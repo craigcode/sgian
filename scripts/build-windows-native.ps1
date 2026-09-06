@@ -26,6 +26,10 @@ $archive = Join-Path $buildRoot "Sgian-native-windows-$RuntimeIdentifier.zip"
 
 Push-Location $repo
 try {
+    & npm ci --ignore-scripts
+    if ($LASTEXITCODE -ne 0) { throw "Frontend dependency installation failed" }
+    & npm run frontend:build
+    if ($LASTEXITCODE -ne 0) { throw "Frontend build failed" }
     if ($ReleaseSigning) {
         if ($Configuration -ne "Release") { throw "Signing requires a Release build" }
         if (-not $env:SGIAN_WINDOWS_CERTIFICATE_PATH -or -not $env:SGIAN_WINDOWS_CERTIFICATE_PASSWORD) { throw "Windows signing credentials are required" }
@@ -33,7 +37,8 @@ try {
         $pfx = Get-PfxData -FilePath $env:SGIAN_WINDOWS_CERTIFICATE_PATH -Password $password
         $thumbprint = $pfx.EndEntityCertificates[0].Thumbprint
         $removeCertificate = -not (Test-Path "Cert:\CurrentUser\My\$thumbprint")
-        $certificate = Import-PfxCertificate -FilePath $env:SGIAN_WINDOWS_CERTIFICATE_PATH -Password $password -CertStoreLocation Cert:\CurrentUser\My
+        Import-PfxCertificate -FilePath $env:SGIAN_WINDOWS_CERTIFICATE_PATH -Password $password -CertStoreLocation Cert:\CurrentUser\My | Out-Null
+        $certificate = Get-Item "Cert:\CurrentUser\My\$thumbprint"
         if (-not $certificate.HasPrivateKey) { throw "Signing certificate has no private key" }
     }
     [xml]$manifest = $originalManifest

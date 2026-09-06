@@ -20,22 +20,40 @@
   terminal.loadAddon(search);
   terminal.open(document.getElementById('terminal'));
 
+  let restoring = false;
+  let messages = Promise.resolve();
+  const write = data => data ? new Promise(resolve => terminal.write(data, resolve)) : Promise.resolve();
   const postSize = () => {
+    if (restoring) return;
     fit.fit();
     window.chrome.webview.postMessage({ type: 'resize', cols: terminal.cols, rows: terminal.rows });
   };
   terminal.onData(data => window.chrome.webview.postMessage({ type: 'input', data }));
-  terminal.onResize(size => window.chrome.webview.postMessage({ type: 'resize', cols: size.cols, rows: size.rows }));
+  terminal.onResize(size => {
+    if (!restoring) window.chrome.webview.postMessage({ type: 'resize', cols: size.cols, rows: size.rows });
+  });
   window.chrome.webview.addEventListener('message', event => {
     const message = event.data || {};
-    if (message.type === 'output') terminal.write(message.data || '');
-    if (message.type === 'reset') { terminal.reset(); if (message.data) terminal.write(message.data); }
-    if (message.type === 'font-size') { terminal.options.fontSize = message.value; postSize(); }
-    if (message.type === 'focus') terminal.focus();
-    if (message.type === 'search') {
-      const found = message.previous ? search.findPrevious(message.query || '') : search.findNext(message.query || '');
-      window.chrome.webview.postMessage({ type: 'search-result', found });
-    }
+    // Parse replay at the saved PTY dimensions before fitting the new view.
+    // Serialize writes and searches so search sees all previously sent output.
+    messages = messages.then(async () => {
+      if (message.type === 'output') await write(message.data);
+      if (message.type === 'reset') {
+        restoring = true;
+        try {
+          terminal.reset();
+          if (Number.isInteger(message.cols) && Number.isInteger(message.rows) && message.cols >= 2 && message.rows >= 2)
+            terminal.resize(message.cols, message.rows);
+          await write(message.data);
+        } finally { restoring = false; postSize(); }
+      }
+      if (message.type === 'font-size') { terminal.options.fontSize = message.value; postSize(); }
+      if (message.type === 'focus') terminal.focus();
+      if (message.type === 'search') {
+        const found = message.previous ? search.findPrevious(message.query || '') : search.findNext(message.query || '');
+        window.chrome.webview.postMessage({ type: 'search-result', found });
+      }
+    }).catch(error => window.chrome.webview.postMessage({ type: 'error', message: String(error) }));
   });
   document.addEventListener('pointerdown', () => window.chrome.webview.postMessage({ type: 'activated' }));
   terminal.textarea.addEventListener('focus', () => window.chrome.webview.postMessage({ type: 'activated' }));
@@ -46,6 +64,5 @@
   window.chrome.webview.postMessage({ type: 'ready', cols: terminal.cols, rows: terminal.rows });
   requestAnimationFrame(() => {
     postSize();
-    terminal.focus();
   });
 })();

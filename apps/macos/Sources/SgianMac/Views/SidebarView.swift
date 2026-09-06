@@ -56,7 +56,7 @@ struct SidebarView: View {
         PaneRow(
             pane: pane,
             runtime: model.paneStates[pane.id] ?? .live,
-            attention: model.agentStates[pane.id]?.attention,
+            attention: model.attention(for: pane.id),
             spec: model.agentSpecs[pane.id]
         )
         .tag(pane.id)

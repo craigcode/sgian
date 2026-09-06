@@ -20,6 +20,7 @@ final class WorkspaceModel: ObservableObject {
     @Published var showingSearch = false
     @Published var panePendingClose: Pane?
     @Published private(set) var profiles: [JSONValue] = []
+    @Published private(set) var permissionMode = "manual"
     @Published private(set) var recentWorkspaces: [String] = UserDefaults.standard.stringArray(forKey: "recentWorkspaces") ?? []
     @Published var terminalFontSize: Double {
         didSet {
@@ -47,7 +48,7 @@ final class WorkspaceModel: ObservableObject {
         let fallback = current == "/" ? FileManager.default.homeDirectoryForCurrentUser.path : current
         workspaceURL = URL(fileURLWithPath: environmentPath ?? savedPath ?? fallback, isDirectory: true)
         let savedFont = defaults.double(forKey: "terminalFontSize")
-        terminalFontSize = savedFont == 0 ? 13 : savedFont
+        terminalFontSize = savedFont == 0 ? 13 : min(30, max(9, savedFont))
     }
 
     deinit {
@@ -152,8 +153,9 @@ final class WorkspaceModel: ObservableObject {
                     "command": .string("set_active_pane"),
                     "pane_id": .string(paneID),
                 ], as: CommandOK.self)
+                guard self.client === client, selectedPaneID == paneID else { return }
                 terminals[paneID]?.focus()
-            } catch { present(error) }
+            } catch { if self.client === client { present(error) } }
         }
     }
 
@@ -312,6 +314,7 @@ final class WorkspaceModel: ObservableObject {
         let config: JSONValue = try await client.request(["command": .string("get_config")], as: JSONValue.self)
         guard self.client === client else { throw CancellationError() }
         profiles = config["profiles"]?.arrayValue ?? []
+        permissionMode = config["agent_permission_mode"]?.stringValue ?? "manual"
         return config.objectValue ?? [:]
     }
 
@@ -322,6 +325,14 @@ final class WorkspaceModel: ObservableObject {
         ], as: CommandOK.self)
         guard self.client === client else { throw CancellationError() }
         profiles = config["profiles"]?.arrayValue ?? []
+        permissionMode = config["agent_permission_mode"]?.stringValue ?? "manual"
+    }
+
+    func attention(for paneID: String) -> AgentAttention? {
+        if let chat = chats[paneID] {
+            return chat.pendingPermission != nil ? .needsInput : chat.busy ? .working : .idle
+        }
+        return agentStates[paneID]?.attention
     }
 
     private func saveLayout() {
@@ -498,6 +509,8 @@ final class WorkspaceModel: ObservableObject {
             chat.apply(payload)
             chats[paneID] = chat
 
+        case "config_changed":
+            Task { [weak self] in _ = try? await self?.readConfiguration() }
         default:
             break
         }
@@ -507,7 +520,7 @@ final class WorkspaceModel: ObservableObject {
         guard ensuringTerminals.insert(paneID).inserted else { return }
         Task { [weak self] in
             guard let self else { return }
-            defer { self.ensuringTerminals.remove(paneID) }
+            defer { if self.client === client { self.ensuringTerminals.remove(paneID) } }
             do {
                 let _: CommandOK = try await client.request([
                     "command": .string("ensure_pane_terminal"),
@@ -533,25 +546,28 @@ final class WorkspaceModel: ObservableObject {
             columns: size?.cols ?? 120,
             rows: size?.rows ?? 40
         )
+        let surfaceGeneration = generation
         surface.onInput = { [weak self] data in
-            guard let self else { return }
+            guard let self, self.generation == surfaceGeneration else { return }
             let text = String(decoding: data, as: UTF8.self)
             self.write(text, to: paneID)
         }
         surface.onResize = { [weak self] columns, rows in
-            self?.resize(paneID, columns: columns, rows: rows)
+            guard let self, self.generation == surfaceGeneration else { return }
+            self.resize(paneID, columns: columns, rows: rows)
         }
         terminals[paneID] = surface
         return surface
     }
 
     private func write(_ text: String, to paneID: String) {
+        let inputGeneration = generation
         pendingInput[paneID, default: ""] += text
         guard inputDrains[paneID] == nil else { return }
         inputDrains[paneID] = Task { [weak self] in
             guard let self else { return }
-            defer { inputDrains[paneID] = nil }
-            while !Task.isCancelled {
+            defer { if generation == inputGeneration { inputDrains[paneID] = nil } }
+            while !Task.isCancelled && generation == inputGeneration {
                 guard let client, let chunk = pendingInput[paneID], !chunk.isEmpty else { return }
                 pendingInput[paneID] = ""
                 do {
@@ -561,9 +577,10 @@ final class WorkspaceModel: ObservableObject {
                         "data": .string(chunk),
                     ], as: CommandOK.self)
                 } catch {
-                    // Preserve bytes that have not reached the daemon so a
-                    // transient failure cannot silently reorder later input.
-                    pendingInput[paneID] = chunk + pendingInput[paneID, default: ""]
+                    guard generation == inputGeneration else { return }
+                    // The server may have accepted input before its response failed.
+                    // Never replay ambiguous input into a live shell.
+                    errorMessage = "Terminal input could not be confirmed. Check the terminal before retrying. \(error.localizedDescription)"
                     return
                 }
             }
@@ -624,11 +641,16 @@ final class WorkspaceModel: ObservableObject {
     }
 
     private var uiSmokeRequested: Bool {
+        if ProcessInfo.processInfo.arguments.contains("--ui-smoke") { return true }
         guard let value = ProcessInfo.processInfo.environment["SGIAN_UI_SMOKE"] else { return false }
         return ["1", "true", "yes"].contains(value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
     private var uiSmokeMarkerURL: URL {
+        let args = ProcessInfo.processInfo.arguments
+        if let index = args.firstIndex(of: "--ui-smoke-marker"), args.indices.contains(index + 1) {
+            return URL(fileURLWithPath: args[index + 1])
+        }
         if let path = ProcessInfo.processInfo.environment["SGIAN_UI_SMOKE_MARKER"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !path.isEmpty
@@ -640,13 +662,29 @@ final class WorkspaceModel: ObservableObject {
 
     private func completeUISmokeIfRequested() async throws {
         guard uiSmokeRequested else { return }
+        guard let client, let first = panes.first else { throw DaemonClientError.request("No initial pane") }
+        let second: Pane = try await client.request([
+            "command": .string("create_pane"), "title": .string("Native smoke split"),
+        ], as: Pane.self)
+        upsert(second)
+        layout = PaneLayout.joined(.leaf(first.id), .leaf(second.id), direction: "column")
+        let _: CommandOK = try await client.request([
+            "command": .string("update_workspace_layout"), "layout": layout!.json,
+        ], as: CommandOK.self)
+        let restored: WorkspaceSnapshot = try await client.request(["command": .string("bootstrap_workspace")], as: WorkspaceSnapshot.self)
+        guard PaneLayout.parse(restored.layout)?.paneIDs == [first.id, second.id] else {
+            throw DaemonClientError.request("Native layout did not persist")
+        }
         // Let SwiftUI install the selected detail view so this checks the
         // packaged application lifecycle, not only the IPC bootstrap.
         for _ in 0..<50 {
-            if let pane = selectedPane,
-               pane.kind == .shell,
-               terminals[pane.id]?.view.window != nil
+            if terminals[first.id]?.view.window != nil,
+               let surface = terminals[second.id], surface.view.window != nil
             {
+                surface.feed("\r\nnative-search-smoke\r\n")
+                guard surface.view.findNext("native-search-smoke") else {
+                    throw DaemonClientError.request("Native terminal search failed")
+                }
                 let marker = uiSmokeMarkerURL
                 try FileManager.default.createDirectory(
                     at: marker.deletingLastPathComponent(),

@@ -10,7 +10,10 @@
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <TextBlock x:Name="SessionStatus" Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="12" />
+        <StackPanel Spacing="4">
+            <TextBlock x:Name="SessionStatus" Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="12" />
+            <TextBlock x:Name="PermissionModeNotice" Visibility="Collapsed" TextWrapping="Wrap" Foreground="{ThemeResource SystemFillColorCautionBrush}" FontSize="12" />
+        </StackPanel>
 
         <ListView x:Name="Messages" Grid.Row="1" SelectionMode="None" IsItemClickEnabled="False">
             <ListView.ItemTemplate>
