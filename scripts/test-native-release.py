@@ -59,6 +59,9 @@ signature: sign(null,readFileSync(process.argv[1]),privateKey).toString('base64'
         package=installer.find('{http://schemas.microsoft.com/appx/appinstaller/2018}MainPackage')
         self.assertEqual(package.get('Publisher'),'CN=Sgian Publisher')
         self.assertEqual(package.get('Version'),'0.1.0.0')
+        launch=installer.find('.//{http://schemas.microsoft.com/appx/appinstaller/2018}OnLaunch')
+        self.assertNotIn('ShowPrompt', launch.attrib)
+        self.assertNotIn('UpdateBlocksActivation', launch.attrib)
         self.assertIn('Sgian.appinstaller',(self.output/'SHA256SUMS.txt').read_text())
 
     def test_missing_windows_package_prevents_any_output(self):

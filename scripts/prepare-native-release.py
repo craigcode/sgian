@@ -94,7 +94,10 @@ def prepare(source, output, config, sparkle_key, mac_verifier=verify_mac, linux_
     ET.SubElement(installer, 'MainPackage', {'Name': 'dev.sgian.windows', 'Publisher': publisher,
         'Version': version + '.0', 'ProcessorArchitecture': 'x64', 'Uri': base_url + windows.name})
     settings = ET.SubElement(installer, 'UpdateSettings')
-    ET.SubElement(settings, 'OnLaunch', {'HoursBetweenUpdateChecks': '4', 'ShowPrompt': 'true', 'UpdateBlocksActivation': 'false'})
+    # Keep the descriptor compatible with Windows 10 1809. ShowPrompt and
+    # UpdateBlocksActivation require 1903 and do not prompt for desktop apps:
+    # https://learn.microsoft.com/uwp/schemas/appinstallerschema/element-s3-onlaunch
+    ET.SubElement(settings, 'OnLaunch', {'HoursBetweenUpdateChecks': '4'})
     ET.SubElement(settings, 'AutomaticBackgroundTask')
     ET.ElementTree(installer).write(output / 'Sgian.appinstaller', encoding='utf-8', xml_declaration=True)
     feed = {'version': version, 'platforms': {'linux-x86_64': {'signature': linux_signature.read_text().strip(), 'url': base_url + linux.name}}}
