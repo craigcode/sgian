@@ -144,6 +144,7 @@ public sealed partial class TerminalPaneView : UserControl, IDisposable
                 try
                 {
                     await Task.Delay(75, token);
+                    if (_disposed || token.IsCancellationRequested || _resize is null) return;
                     await _resize(columns, rows);
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested)
