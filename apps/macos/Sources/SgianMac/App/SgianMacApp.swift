@@ -2,12 +2,15 @@ import SwiftUI
 
 @main
 struct SgianMacApp: App {
+    @NSApplicationDelegateAdaptor(NativeApplicationDelegate.self) private var lifecycle
+    @Environment(\.openWindow) private var openWindow
     @StateObject private var windows = WorkspaceWindows()
     @StateObject private var updater = NativeUpdater()
     private var model: WorkspaceModel { windows.activeModel }
 
     var body: some Scene {
-        WindowGroup("Sgian", id: "workspace") {
+        let _ = configureLifecycle()
+        WindowGroup("Sgian", id: NativeApplicationDelegate.workspaceID) {
             WorkspaceWindow(windows: windows)
         }
         .defaultSize(width: 1220, height: 780)
@@ -69,6 +72,35 @@ struct SgianMacApp: App {
 
     private var defaultAgentBackend: AgentBackend {
         AgentBackend(rawValue: UserDefaults.standard.string(forKey: "defaultAgentBackend") ?? "claude") ?? .claude
+    }
+
+    private func configureLifecycle() {
+        let action = openWindow
+        lifecycle.openWorkspace = { action(id: NativeApplicationDelegate.workspaceID) }
+    }
+}
+
+@MainActor
+final class NativeApplicationDelegate: NSObject, NSApplicationDelegate {
+    static let workspaceID = "workspace"
+    var openWorkspace: (() -> Void)?
+
+    private func hasWorkspaceWindow(_ app: NSApplication) -> Bool {
+        app.windows.contains { $0.identifier?.rawValue.hasPrefix(Self.workspaceID) == true }
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // An older development build may have saved an obsolete SwiftUI scene
+        // identifier. Let normal restoration finish, then recover an empty app.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if !self.hasWorkspaceWindow(.shared) { self.openWorkspace?() }
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !hasWorkspaceWindow(sender) { openWorkspace?(); return false }
+        return true
     }
 }
 
