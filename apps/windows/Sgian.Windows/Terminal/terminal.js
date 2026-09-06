@@ -21,6 +21,7 @@
   terminal.open(document.getElementById('terminal'));
 
   let restoring = false;
+  let hostFocus = false;
   let messages = Promise.resolve();
   const write = data => data ? new Promise(resolve => terminal.write(data, resolve)) : Promise.resolve();
   const postSize = () => {
@@ -48,7 +49,10 @@
         } finally { restoring = false; postSize(); }
       }
       if (message.type === 'font-size') { terminal.options.fontSize = message.value; postSize(); }
-      if (message.type === 'focus') terminal.focus();
+      if (message.type === 'focus') {
+        hostFocus = true;
+        try { terminal.focus(); } finally { hostFocus = false; }
+      }
       if (message.type === 'search') {
         const found = message.previous ? search.findPrevious(message.query || '') : search.findNext(message.query || '');
         window.chrome.webview.postMessage({ type: 'search-result', found });
@@ -56,7 +60,9 @@
     }).catch(error => window.chrome.webview.postMessage({ type: 'error', message: String(error) }));
   });
   document.addEventListener('pointerdown', () => window.chrome.webview.postMessage({ type: 'activated' }));
-  terminal.textarea.addEventListener('focus', () => window.chrome.webview.postMessage({ type: 'activated' }));
+  terminal.textarea.addEventListener('focus', () => {
+    if (!hostFocus) window.chrome.webview.postMessage({ type: 'activated' });
+  });
   new ResizeObserver(() => postSize()).observe(document.getElementById('terminal'));
   // Readiness means the terminal and host bridge are wired. Do not gate it on
   // requestAnimationFrame: WebView2 can throttle animation frames in a

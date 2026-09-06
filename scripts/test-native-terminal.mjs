@@ -6,10 +6,11 @@ import test from 'node:test';
 function terminalHarness() {
   const trace = [], sent = [], listeners = {};
   let resizeListener;
+  let focusListener;
   class Terminal {
     cols = 80; rows = 24; options = {};
-    textarea = { addEventListener() {} };
-    loadAddon() {} open() {} onData() {} focus() { trace.push(['focus']); }
+    textarea = { addEventListener(name, callback) { if (name === 'focus') focusListener = callback; } };
+    loadAddon() {} open() {} onData() {} focus() { trace.push(['focus']); focusListener?.(); }
     onResize(callback) { resizeListener = callback; }
     reset() { trace.push(['reset']); }
     resize(cols, rows) { this.cols = cols; this.rows = rows; trace.push(['size', cols, rows]); resizeListener({ cols, rows }); }
@@ -49,4 +50,12 @@ test('empty replay without dimensions still completes and does not steal focus',
   send({ type: 'search', query: 'missing' });
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.deepEqual(trace, [['reset'], ['fit'], ['search', 'missing']]);
+});
+
+test('host focus does not echo a second pane activation back to the native client', async () => {
+  const { trace, sent, send } = terminalHarness();
+  send({ type: 'focus' });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(trace, [['focus']]);
+  assert.equal(sent.some(message => message.type === 'activated'), false);
 });

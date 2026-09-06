@@ -145,6 +145,7 @@ public sealed partial class MainWindow : Window
                 else if (frame.Parent is ContentControl content) content.Content = null;
             _layoutHost.Children.Add(NativeLayoutView.Build(tree, PaneFrame, ViewModel.ResizeSplit));
             _renderedShape = shape;
+            _focusedPaneId = null;
         }
         foreach (var (id, frame) in _paneFrames)
         {
@@ -152,8 +153,12 @@ public sealed partial class MainWindow : Window
                 ? Microsoft.UI.Colors.DodgerBlue : Microsoft.UI.Colors.Transparent);
             if (_agentChats.TryGetValue(id, out var chat)) chat.Refresh();
         }
-        if (ViewModel.SelectedPane is { IsAgent: false } pane && _focusedPaneId != pane.Id && _terminals.TryGetValue(pane.Id, out var active))
-        { _focusedPaneId = pane.Id; active.FocusTerminal(); }
+        if (_focusedPaneId != ViewModel.SelectedPane?.Id)
+        {
+            _focusedPaneId = ViewModel.SelectedPane?.Id;
+            if (ViewModel.SelectedPane is { IsAgent: false } pane && _terminals.TryGetValue(pane.Id, out var active))
+                active.FocusTerminal();
+        }
     }
 
     private FrameworkElement PaneFrame(string id)
