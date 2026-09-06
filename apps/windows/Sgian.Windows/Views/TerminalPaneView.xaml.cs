@@ -20,7 +20,7 @@ public sealed partial class TerminalPaneView : UserControl, IDisposable
     public TerminalPaneView()
     {
         InitializeComponent();
-        Unloaded += (_, _) => _resizeDebounce?.Cancel();
+        Unloaded += (_, _) => { if (!_disposed) _resizeDebounce?.Cancel(); };
     }
 
     public event EventHandler? Ready;
@@ -94,6 +94,7 @@ public sealed partial class TerminalPaneView : UserControl, IDisposable
         _disposed = true;
         _resizeDebounce?.Cancel();
         _resizeDebounce?.Dispose();
+        _resizeDebounce = null;
         _input = null;
         _resize = null;
         _pendingMessages.Clear();

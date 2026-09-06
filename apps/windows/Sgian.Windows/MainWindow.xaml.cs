@@ -136,13 +136,7 @@ public sealed partial class MainWindow : Window
         var shape = Shape(tree);
         if (_renderedShape != shape)
         {
-            // A stable Grid parent detaches a root leaf synchronously. A
-            // ContentPresenter can retain its former Content until layout,
-            // which makes WinUI reject moving that leaf into a new split.
-            _layoutHost.Children.Clear();
-            foreach (var frame in _paneFrames.Values)
-                if (frame.Parent is Panel panel) panel.Children.Remove(frame);
-                else if (frame.Parent is ContentControl content) content.Content = null;
+            NativeLayoutView.Detach(_layoutHost);
             _layoutHost.Children.Add(NativeLayoutView.Build(tree, PaneFrame, ViewModel.ResizeSplit));
             _renderedShape = shape;
             _focusedPaneId = null;

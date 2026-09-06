@@ -10,6 +10,15 @@ namespace Sgian.Windows.Views;
 
 internal static class NativeLayoutView
 {
+    public static void Detach(Grid container)
+    {
+        // Native split containers are Grids; reusable pane frames are Borders.
+        // Clear the owning collections explicitly instead of relying on Parent,
+        // which WinUI can null while a detached tree still owns its children.
+        foreach (var split in container.Children.OfType<Grid>().ToArray()) Detach(split);
+        container.Children.Clear();
+    }
+
     public static FrameworkElement Build(PaneLayout node, Func<string, FrameworkElement> pane,
         Action<string, double> saveRatio)
     {
@@ -60,7 +69,9 @@ internal static class NativeLayoutView
         Grid.SetColumn(first, 0); Grid.SetRow(first, 0);
         Grid.SetColumn(second, horizontal ? 2 : 0); Grid.SetRow(second, horizontal ? 0 : 2);
         Grid.SetColumn(divider, horizontal ? 1 : 0); Grid.SetRow(divider, horizontal ? 0 : 1);
-        grid.Children.Add(first); grid.Children.Add(divider); grid.Children.Add(second);
+        grid.Children.Add(first);
+        grid.Children.Add(divider);
+        grid.Children.Add(second);
         return grid;
     }
 }
