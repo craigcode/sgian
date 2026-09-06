@@ -24,10 +24,13 @@ struct SidebarView: View {
                 }
             }
             .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
 
             Divider()
             workspaceFooter
         }
+        .background(.white)
+        .environment(\.colorScheme, .light)
         .navigationTitle("Sgian")
         .toolbar {
             ToolbarItem(placement: .navigation) {

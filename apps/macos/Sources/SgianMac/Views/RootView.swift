@@ -11,6 +11,7 @@ struct RootView: View {
             detail
         }
         .frame(minWidth: 900, minHeight: 580)
+        .background(.white)
         .toolbar { toolbar }
         .task { model.start() }
         .sheet(isPresented: $model.showingCommands) { NativeCommandPalette(model: model) }
@@ -41,6 +42,7 @@ struct RootView: View {
                 EmptyWorkspaceView(model: model)
             }
         }
+        .clipped()
     }
 
     @ToolbarContentBuilder

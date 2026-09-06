@@ -18,7 +18,7 @@ struct NativePaneTree: View {
                         if pane.kind == .shell, let surface = model.terminals[id] {
                             TerminalSurfaceView(surface: surface, focusOnAppear: model.selectedPaneID == id)
                                 .padding(4)
-                                .background(Color(nsColor: surface.view.nativeBackgroundColor))
+                                .background(Color(nsColor: surface.view.nativeBackgroundColor), ignoresSafeAreaEdges: [])
                         } else if pane.kind == .agent {
                             AgentChatView(model: model, pane: pane)
                         }
