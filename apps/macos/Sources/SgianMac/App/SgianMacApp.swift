@@ -7,7 +7,7 @@ struct SgianMacApp: App {
     private var model: WorkspaceModel { windows.activeModel }
 
     var body: some Scene {
-        WindowGroup("Sgian") {
+        WindowGroup("Sgian", id: "workspace") {
             WorkspaceWindow(windows: windows)
         }
         .defaultSize(width: 1220, height: 780)
