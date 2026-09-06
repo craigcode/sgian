@@ -23,10 +23,12 @@ public sealed partial class MainWindow : Window
     private string? _renderedShape;
     private bool _nativeSmokeRunning;
     private string? _focusedPaneId;
+    private readonly Grid _layoutHost = new();
 
     public MainWindow()
     {
         InitializeComponent();
+        PaneContent.Content = _layoutHost;
         ViewModel = new WorkspaceViewModel(DispatcherQueue);
         PaneList.ItemsSource = ViewModel.Panes;
         ErrorBar.Closed += (_, _) => ViewModel.DismissError();
@@ -109,7 +111,7 @@ public sealed partial class MainWindow : Window
 
     private void ClearViews()
     {
-        PaneContent.Content = null;
+        _layoutHost.Children.Clear();
         foreach (var terminal in _terminals.Values) terminal.Dispose();
         _terminals.Clear();
         _agentChats.Clear();
@@ -129,16 +131,19 @@ public sealed partial class MainWindow : Window
         }
         var tree = ViewModel.Zoomed && ViewModel.SelectedPane is { } selected
             ? PaneLayout.Leaf(selected.Id) : ViewModel.Layout;
-        if (tree is null) { PaneContent.Content = EmptyWorkspaceContent(); _renderedShape = null; return; }
+        if (tree is null) { _layoutHost.Children.Clear(); _layoutHost.Children.Add(EmptyWorkspaceContent()); _renderedShape = null; return; }
         string Shape(PaneLayout node) => node.IsLeaf ? node.Id : $"{node.Id}:{node.Direction}({Shape(node.First!)},{Shape(node.Second!)})";
         var shape = Shape(tree);
         if (_renderedShape != shape)
         {
-            PaneContent.Content = null;
+            // A stable Grid parent detaches a root leaf synchronously. A
+            // ContentPresenter can retain its former Content until layout,
+            // which makes WinUI reject moving that leaf into a new split.
+            _layoutHost.Children.Clear();
             foreach (var frame in _paneFrames.Values)
                 if (frame.Parent is Panel panel) panel.Children.Remove(frame);
                 else if (frame.Parent is ContentControl content) content.Content = null;
-            PaneContent.Content = NativeLayoutView.Build(tree, PaneFrame, ViewModel.ResizeSplit);
+            _layoutHost.Children.Add(NativeLayoutView.Build(tree, PaneFrame, ViewModel.ResizeSplit));
             _renderedShape = shape;
         }
         foreach (var (id, frame) in _paneFrames)
@@ -208,6 +213,8 @@ public sealed partial class MainWindow : Window
                 await Task.Delay(100);
             }
             if (_terminals.Count < 2 || _terminals.Values.Any(view => !view.IsReady)) throw new InvalidOperationException("Native split terminals did not initialize");
+            ViewModel.ToggleZoom();
+            ViewModel.ToggleZoom();
             await Task.Delay(350);
             var snapshot = await ViewModel.ReadSnapshotAsync();
             if (PaneLayout.Parse(snapshot.Layout)?.PaneIds.Count != 2) throw new InvalidOperationException("Native split layout did not persist");

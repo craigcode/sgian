@@ -55,8 +55,11 @@ internal static class NativeLayoutView
         };
         var first = Build(node.First!, pane, saveRatio);
         var second = Build(node.Second!, pane, saveRatio);
-        if (horizontal) { Grid.SetColumn(divider, 1); Grid.SetColumn(second, 2); }
-        else { Grid.SetRow(divider, 1); Grid.SetRow(second, 2); }
+        // Cached pane frames may previously have occupied the other axis or
+        // the second slot. Reset both attached positions when reparenting.
+        Grid.SetColumn(first, 0); Grid.SetRow(first, 0);
+        Grid.SetColumn(second, horizontal ? 2 : 0); Grid.SetRow(second, horizontal ? 0 : 2);
+        Grid.SetColumn(divider, horizontal ? 1 : 0); Grid.SetRow(divider, horizontal ? 0 : 1);
         grid.Children.Add(first); grid.Children.Add(divider); grid.Children.Add(second);
         return grid;
     }

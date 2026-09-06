@@ -54,6 +54,7 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSecs)
     while ([DateTime]::UtcNow -lt $deadline) {
         if (Test-Path "$Marker.err") {
+            Write-NativeDiagnostics
             throw "Native Windows UI smoke failed: $(Get-Content "$Marker.err" -Raw)"
         }
         if (Test-Path $Marker) {
