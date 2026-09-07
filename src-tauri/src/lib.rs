@@ -5709,6 +5709,7 @@ fn agent_handle_permission_request(
             }
             json!({
                 "jsonrpc": "2.0",
+                "factoryApiVersion": "1.0.0",
                 "type": "response",
                 "id": request_id,
                 "result": result,
@@ -5816,6 +5817,7 @@ fn agent_reader_main(ctx: AgentReaderCtx) {
             if let Some(request_id) = raw.get("id").and_then(Value::as_str) {
                 let response = json!({
                     "jsonrpc": "2.0",
+                    "factoryApiVersion": "1.0.0",
                     "type": "response",
                     "id": request_id,
                     "result": {"cancelled": true, "answers": []},
@@ -5987,6 +5989,7 @@ impl TerminalStore {
             let request = if let Some(session_id) = &resume_session_id {
                 json!({
                     "jsonrpc": "2.0",
+                    "factoryApiVersion": "1.0.0",
                     "type": "request",
                     "id": format!("sgian-load-{pane_id}"),
                     "method": "droid.load_session",
@@ -6005,6 +6008,7 @@ impl TerminalStore {
                 }
                 json!({
                     "jsonrpc": "2.0",
+                    "factoryApiVersion": "1.0.0",
                     "type": "request",
                     "id": format!("sgian-init-{pane_id}"),
                     "method": "droid.initialize_session",
@@ -8234,6 +8238,7 @@ impl DaemonServer {
             }),
             AgentBackendKind::Droid => json!({
                 "jsonrpc": "2.0",
+                "factoryApiVersion": "1.0.0",
                 "type": "request",
                 "id": format!("sgian-message-{seq}"),
                 "method": "droid.add_user_message",
@@ -8337,6 +8342,7 @@ impl DaemonServer {
             }),
             AgentBackendKind::Droid => json!({
                 "jsonrpc": "2.0",
+                "factoryApiVersion": "1.0.0",
                 "type": "request",
                 "id": format!("sgian-interrupt-{seq}"),
                 "method": "droid.interrupt_session",
@@ -29252,6 +29258,8 @@ exit 0
     /// Minimal long-lived Factory Droid JSON-RPC driver. It intentionally
     /// emits an idle notification immediately after initialization so the
     /// integration test also pins suppression of startup-idle turn events.
+    /// The real CLI also requires factoryApiVersion on every RPC envelope,
+    /// including responses; accepting plain JSON-RPC hid launch failures.
     #[cfg(unix)]
     const FAKE_DROID_SH: &str = r#"#!/bin/sh
 LOG="__FAKE_DROID_LOG__"
@@ -29260,6 +29268,10 @@ printf '%s\n' '{"jsonrpc":"2.0","type":"response","id":"init","result":{"session
 printf '%s\n' '{"jsonrpc":"2.0","type":"notification","method":"droid.session_notification","params":{"notification":{"type":"droid_working_state_changed","newState":"idle"}}}'
 while IFS= read -r line; do
   printf 'stdin %s\n' "$line" >> "$LOG"
+  case "$line" in
+    *'"factoryApiVersion":"1.0.0"'*) ;;
+    *) printf '%s\n' '{"jsonrpc":"2.0","type":"response","id":null,"error":{"code":-32600,"message":"Invalid JSON-RPC message: missing factoryApiVersion"}}'; exit 1 ;;
+  esac
   case "$line" in
     *'"method":"droid.initialize_session"'*)
       ;;
