@@ -121,6 +121,11 @@
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <Button Content="Split right" Click="SplitRight_Click" ToolTipService.ToolTip="Split right (Ctrl+Shift+D)" />
+                    <Button Content="Split down" Click="SplitDown_Click" ToolTipService.ToolTip="Split down (Ctrl+Shift+E)" />
+                    <Button Content="Zoom" Click="Zoom_Click" ToolTipService.ToolTip="Zoom pane (Ctrl+Shift+Z)" />
+                    <Button Content="Find" Click="Search_Click" ToolTipService.ToolTip="Find in terminal (Ctrl+Shift+F)" />
+                    <Button Content="Commands" Click="Commands_Click" ToolTipService.ToolTip="Commands (Ctrl+Shift+P)" />
                     <Button x:Name="RestartButton" Content="Restart" Visibility="Collapsed" Click="Restart_Click" />
                     <Button x:Name="RenameButton" Content="Rename" Visibility="Collapsed" Click="Rename_Click" />
                     <Button x:Name="CloseButton" Visibility="Collapsed" Click="Close_Click"

@@ -2,7 +2,7 @@ using System.Text.Json;
 
 namespace Sgian.Windows;
 
-internal sealed record AppSettings(string? WorkspacePath, double TerminalFontSize)
+internal sealed record AppSettings(string? WorkspacePath, double TerminalFontSize, IReadOnlyList<string>? RecentWorkspaces = null)
 {
     private static string SettingsPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -20,6 +20,7 @@ internal sealed record AppSettings(string? WorkspacePath, double TerminalFontSiz
         {
             return new AppSettings(null, 13);
         }
+        catch (UnauthorizedAccessException) { return new AppSettings(null, 13); }
         catch (JsonException)
         {
             return new AppSettings(null, 13);

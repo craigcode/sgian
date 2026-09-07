@@ -5,6 +5,7 @@ namespace Sgian.Windows;
 public partial class App : Application
 {
     private Window? _window;
+    private static int _smokeCompleted;
 
     public App()
     {
@@ -60,6 +61,7 @@ public partial class App : Application
         {
             return;
         }
+        if (Interlocked.Exchange(ref _smokeCompleted, 1) != 0) return;
         try
         {
             TraceSmoke(error is null ? "Smoke completed" : $"Smoke failed: {error}");

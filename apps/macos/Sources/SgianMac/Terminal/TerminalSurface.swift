@@ -20,6 +20,7 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
     let view: TerminalView
     var onInput: ((Data) -> Void)?
     var onResize: ((Int, Int) -> Void)?
+    var onFocus: (() -> Void)?
     var onTitleChange: ((String) -> Void)?
 
     private var resizeTask: Task<Void, Never>?
@@ -109,9 +110,10 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
 
 struct TerminalSurfaceView: NSViewRepresentable {
     let surface: TerminalSurface
+    var focusOnAppear = false
 
     func makeNSView(context: Context) -> TerminalView {
-        DispatchQueue.main.async { surface.focus() }
+        if focusOnAppear { DispatchQueue.main.async { surface.focus() } }
         return surface.view
     }
 

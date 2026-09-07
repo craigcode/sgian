@@ -65,6 +65,7 @@ whose sequence is not newer than the last applied sequence.
 The native clients currently use:
 
 - `ping`, `bootstrap_workspace`, `subscribe`
+- `update_workspace_layout`, `get_config`, `write_config`
 - `create_pane`, `close_pane`, `rename_pane`
 - `ensure_pane_terminal`, `restart_pane_terminal`
 - `write_to_pane`, `resize_pane_terminal`, `set_active_pane`
@@ -76,9 +77,27 @@ recorded PTY dimensions, runtime state, agent attention, provider/model specs
 and bounded normalized agent-event replay. Clients size their terminal emulator
 to those dimensions before replaying raw ANSI scrollback.
 
+`send_agent_message` accepts an optional `message_id` (1–128 bytes). Clients
+generate a unique ID for each prompt and attach it to the optimistic user bubble.
+After enqueueing the provider input, the daemon persists and broadcasts an
+`agent_event` with `kind: "user_message"`, `text`, the supplied `message_id`
+(or null), and the next pane sequence. This shares the provider-output log and
+ordering lock, so the accepted prompt precedes its reply in live and replayed
+history. A rejected enqueue does not create a history entry. The ID correlates
+the event with a local bubble; it is not a server-side idempotency key.
+
+Clients reconcile by ID rather than text, preserving distinct identical prompts
+sent by different clients. Only pending local bubbles may be rolled back after
+a failed request. Older daemons ignore the additive ID, and their history cannot
+restore prompts that were never saved.
+
 ## Event handling
 
 The native client handles `pty_output`, `pane_ended`, `pane_created`,
 `pane_closed`, `pane_renamed`, `agent_state` and `agent_event`. Unknown events
 are ignored for forward compatibility. Subscription disconnects are retried;
 the daemon and its sessions are never tied to the client process lifetime.
+
+Native split layouts use the same binary JSON tree as Tauri. Clients validate
+tree depth, directions, ratios and unique pane IDs, reconcile stale membership,
+and debounce persisted resize changes. See [native release](native-release.md).

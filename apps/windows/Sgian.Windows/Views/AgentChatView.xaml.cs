@@ -29,6 +29,8 @@ public sealed partial class AgentChatView : UserControl
         var chat = _workspace.ChatFor(_pane.Id);
         Messages.ItemsSource = chat.Messages.ToList();
         SessionStatus.Text = BuildStatus(chat);
+        PermissionModeNotice.Text = $"Permission mode: {_workspace.PermissionMode}. Tools may run without asking.";
+        PermissionModeNotice.Visibility = _workspace.PermissionMode == "manual" ? Visibility.Collapsed : Visibility.Visible;
         PermissionCard.Visibility = chat.PendingPermission is null ? Visibility.Collapsed : Visibility.Visible;
         if (chat.PendingPermission is { } permission)
         {

@@ -10,6 +10,7 @@ import {
   applyAgentEvent,
   replayAgentEvents,
   appendUserMessage,
+  removeUserMessage,
   clearAgentPermission,
   clampAgentChatToPaneEnded,
   normalizeToolContent,
@@ -17,6 +18,24 @@ import {
 } from "../ui/src/agent.js";
 
 const SESSION = { kind: "session", session_id: "s-1", model: "claude-x" };
+
+it("restores prompts, reconciles echoes by id, and retains identical messages from other clients", () => {
+  const event = { kind: "user_message", text: "hello", message_id: "send-1", seq: 1 };
+  const chat = createAgentChat();
+  appendUserMessage(chat, "hello", "send-1");
+  applyAgentEvent(chat, event);
+  applyAgentEvent(chat, event);
+  expect(chat.messages).toHaveLength(1);
+  expect(removeUserMessage(chat, "hello", "send-1")).toBe(false);
+  applyAgentEvent(chat, { ...event, message_id: "send-2", seq: 2 });
+  expect(chat.messages).toHaveLength(2);
+  const restored = createAgentChat();
+  applyAgentEvent(restored, event);
+  expect(restored.messages[0].text).toBe("hello");
+  appendUserMessage(restored, "failed", "send-3");
+  expect(removeUserMessage(restored, "failed", "send-3")).toBe(true);
+  expect(restored.messages).toHaveLength(1);
+});
 
 /** A complete text turn: start → deltas → complete → turn_complete. */
 function textTurnEvents(text) {

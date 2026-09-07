@@ -3,6 +3,26 @@ import Testing
 
 @testable import SgianMac
 
+@Test func userPromptsSurviveReplayWithoutDuplicatingOptimisticMessages() throws {
+    let event = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"kind":"user_message","text":"hello","message_id":"send-1","seq":1}"#.utf8))
+    var chat = AgentChatState()
+    chat.appendUserMessage("hello", messageID: "send-1")
+    chat.apply(event)
+    chat.replay([event])
+    chat.removeLastUserMessage(matching: "hello", messageID: "send-1")
+    #expect(chat.messages.count == 1)
+    #expect(chat.messages[0].isPending == false)
+    var reopened = AgentChatState()
+    reopened.replay([event])
+    #expect(reopened.messages.first?.text == "hello")
+    let other = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"kind":"user_message","text":"hello","message_id":"send-2","seq":2}"#.utf8))
+    reopened.apply(other)
+    #expect(reopened.messages.count == 2)
+    reopened.appendUserMessage("failed", messageID: "send-3")
+    reopened.removeLastUserMessage(matching: "failed", messageID: "send-3")
+    #expect(reopened.messages.count == 2)
+}
+
 @Test func terminalLinksOnlyOpenWebURLs() {
     #expect(TerminalLinkPolicy.externalURL("https://example.com/docs") != nil)
     #expect(TerminalLinkPolicy.externalURL("http://localhost:8080/") != nil)

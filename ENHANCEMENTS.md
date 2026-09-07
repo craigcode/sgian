@@ -7,7 +7,8 @@ Linux, and Windows platform pass. Completed capabilities are documented in the
 ## 1. Windows acceptance and hardening (release blocker)
 
 The codebase now has a native Windows build, per-user named-pipe transport,
-Windows agent panes, and an NSIS installer. The current branch also:
+Windows agent panes, and a native WinUI3/MSIX client. The Tauri NSIS
+installer remains a compatibility validation target. The current branch also:
 
 - creates ConPTY with the same default flags as node-pty/VS Code instead of
   portable-pty's undocumented resize/input flags;
@@ -33,18 +34,21 @@ the failures:
 
 ## 2. Release engineering
 
-- **Exercise a release candidate.** Run the tag-gated macOS, Linux, and Windows
-  workflows from a release-candidate tag, install every produced package, and
-  verify updater manifests and checksums before the first public release.
-- **Provision the updater feed.** `updates.sgian.dev` is the committed production
-  endpoint but is not hosted yet. Serve the signed feed before shipping any
-  build that relies on automatic updates, and monitor the domain/certificate so
-  already-installed builds do not lose their update path.
-- **Windows code signing.** The NSIS installer is currently unsigned. Add an
-  Authenticode certificate and CI signing step so SmartScreen does not present
-  the installer as an unknown publisher.
-- **Release operations.** Document version bumping, tag creation, rollback, feed
-  promotion, and certificate/key rotation in a short maintainer runbook.
+Native macOS (SwiftUI/AppKit/SwiftTerm) and Windows (WinUI3/WebView2 terminal)
+are the shipping clients. Linux continues to use Tauri. See the
+[native release runbook](docs/native-release.md) for the candidate workflow,
+signing configuration, installation/update acceptance, and recovery.
+
+- Provision the `native-release` signing environment and stable Sparkle public
+  key. No production signing credentials are stored in this repository.
+- Run the manual candidate workflow from protected main. It builds a notarized
+  universal macOS DMG, signed Windows MSIX/App Installer, and signed Linux
+  packages, and assembles a draft only after all platform artifacts validate.
+- Install each candidate on clean machines and exercise an installed-version
+  update. Complete the native acceptance checklist before publishing the draft.
+- Ensure published GitHub release downloads are accessible to customers. This
+  private repository's unauthenticated update URLs require a public release
+  channel before external distribution.
 
 ## 3. Agent and orchestration improvements
 

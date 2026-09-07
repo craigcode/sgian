@@ -21,10 +21,12 @@ var tests = new (string Name, Action Body)[]
 {
     ("Named-pipe endpoint parsing", PipeEndpointParsing),
     ("Agent stream reduction and replay dedupe", AgentStreamReduction),
+    ("Prompt persistence and correlated optimistic echoes", UserPromptReplay),
     ("Permission lifecycle", PermissionLifecycle),
     ("Workspace defaults", WorkspaceDefaults),
     ("Bounded IPC messages", BoundedMessages),
     ("Terminal bridge rejects foreign documents", TerminalBridgeOrigins),
+    ("Native layout restoration and pane reconciliation", NativeLayouts),
 };
 
 var failures = new List<string>();
@@ -49,6 +51,48 @@ if (failures.Count > 0)
 
 Console.WriteLine($"Sgian.Protocol: {tests.Length} checks passed");
 return 0;
+
+static void UserPromptReplay()
+{
+    var item = Json("""{"kind":"user_message","text":"hello","message_id":"send-1","seq":1}""");
+    var chat = new AgentChatState();
+    chat.AppendUserMessage("hello", "send-1");
+    chat.Apply(item);
+    chat.Replay(new[] { item });
+    chat.RemoveLastUserMessage("hello", "send-1");
+    Equal(1, chat.Messages.Count);
+    Equal(false, chat.Messages[0].IsPending);
+    var restored = new AgentChatState();
+    restored.Replay(new[] { item });
+    Equal("hello", restored.Messages[0].Text);
+    restored.Apply(Json("""{"kind":"user_message","text":"hello","message_id":"send-2","seq":2}"""));
+    Equal(2, restored.Messages.Count);
+    restored.AppendUserMessage("failed", "send-3");
+    restored.RemoveLastUserMessage("failed", "send-3");
+    Equal(2, restored.Messages.Count);
+}
+
+static void NativeLayouts()
+{
+    using var document = JsonDocument.Parse("""
+        {"type":"split","id":"split-1","direction":"column","ratio":0.3,
+         "first":{"type":"leaf","id":"one"},"second":{"type":"leaf","id":"two"}}
+        """);
+    var tree = PaneLayout.Parse(document.RootElement) ?? throw new Exception("Layout did not decode");
+    Equal("one,two", string.Join(",", tree.PaneIds));
+    Equal(0.7, tree.Resize("split-1", 0.7).Ratio);
+    var repaired = PaneLayout.Reconcile(tree, ["two", "three"])!;
+    Equal("two,three", string.Join(",", repaired.PaneIds));
+    Equal("two", repaired.Remove("three")!.Id);
+    Equal(true, PaneLayout.Reconcile(tree, []) is null);
+    var inserted = tree.Insert("three", "one", "row");
+    Equal("one,three,two", string.Join(",", inserted.PaneIds));
+    Equal("row", inserted.First!.Direction);
+    var duplicate = JsonSerializer.SerializeToElement(PaneLayout.Join(PaneLayout.Leaf("one"), PaneLayout.Leaf("one"), "row"));
+    Equal(true, PaneLayout.Parse(duplicate) is null);
+    Equal(0.5, PaneLayout.Clamp(double.NaN));
+    Equal(0.82, tree.Resize("split-1", 100).Ratio);
+}
 
 static void PipeEndpointParsing()
 {

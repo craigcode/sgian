@@ -42,3 +42,4 @@
 **/sgian.key
 # Retain the old key name in the denylist during the Sgian2 → Sgian transition.
 **/sgian2.key
+__pycache__/

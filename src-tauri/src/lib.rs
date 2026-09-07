@@ -2257,6 +2257,8 @@ enum DaemonRequest {
     SendAgentMessage {
         pane_id: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// (T2) Answer a pending `permission_request` agent event. `request_id`
     /// matches the event's; `allow: false` denies with `message` as feedback
@@ -4866,6 +4868,7 @@ struct AgentSession {
     input: SyncSender<Vec<u8>>,
     killer: AgentChildKiller,
     shared: Arc<Mutex<AgentShared>>,
+    events: Arc<Mutex<AgentEventLog>>,
 }
 
 #[cfg(any(unix, windows))]
@@ -5533,7 +5536,7 @@ struct AgentReaderCtx {
     shared: Arc<Mutex<AgentShared>>,
     liveness: Arc<Mutex<HashMap<String, PaneLiveness>>>,
     router: OutputRouter,
-    agents_dir: PathBuf,
+    events: Arc<Mutex<AgentEventLog>>,
     reaped: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
 }
@@ -5548,19 +5551,33 @@ struct AgentReaderCtx {
 #[cfg(any(unix, windows))]
 fn append_and_emit_agent_event(
     router: &OutputRouter,
-    log: &mut Option<AgentLogWriter>,
+    events: &Mutex<AgentEventLog>,
     pane_id: &str,
-    next_seq: &mut u64,
-    mut event: Value,
+    event: Value,
 ) {
-    *next_seq += 1;
-    event["seq"] = json!(*next_seq);
-    if let Some(log) = log.as_mut() {
-        if let Ok(line) = serde_json::to_string(&event) {
-            log.append_line(&line);
-        }
+    if let Ok(mut events) = events.lock() {
+        events.emit(router, pane_id, event);
     }
-    router.emit_agent_event(pane_id, event);
+}
+
+#[cfg(any(unix, windows))]
+struct AgentEventLog {
+    log: Option<AgentLogWriter>,
+    next_seq: u64,
+}
+
+#[cfg(any(unix, windows))]
+impl AgentEventLog {
+    fn emit(&mut self, router: &OutputRouter, pane_id: &str, mut event: Value) {
+        self.next_seq += 1;
+        event["seq"] = json!(self.next_seq);
+        if let Some(log) = self.log.as_mut() {
+            if let Ok(line) = serde_json::to_string(&event) {
+                log.append_line(&line);
+            }
+        }
+        router.emit_agent_event(pane_id, event);
+    }
 }
 
 /// (T2) Non-blocking "has the CLI exited?" through the shared child handle
@@ -5587,13 +5604,12 @@ fn agent_child_exited(child: &Arc<Mutex<std::process::Child>>) -> bool {
 fn agent_handle_permission_request(
     backend: AgentBackendKind,
     router: &OutputRouter,
-    log: &mut Option<AgentLogWriter>,
+    events: &Mutex<AgentEventLog>,
     pane_id: &str,
     input: &SyncSender<Vec<u8>>,
     shared: &Arc<Mutex<AgentShared>>,
     child: &Arc<Mutex<std::process::Child>>,
     reaped: &AtomicBool,
-    next_seq: &mut u64,
     event: Value,
 ) {
     let request_id = event
@@ -5608,7 +5624,7 @@ fn agent_handle_permission_request(
     if let Ok(mut shared) = shared.lock() {
         shared.pending.insert(request_id.clone(), sender);
     }
-    append_and_emit_agent_event(router, log, pane_id, next_seq, event);
+    append_and_emit_agent_event(router, events, pane_id, event);
 
     let deadline = Instant::now() + AGENT_APPROVAL_TIMEOUT;
     let decision = loop {
@@ -5658,9 +5674,8 @@ fn agent_handle_permission_request(
     // is cancelled by the replayed `permission_resolved`.
     append_and_emit_agent_event(
         router,
-        log,
+        events,
         pane_id,
-        next_seq,
         json!({
             "kind": "permission_resolved",
             "request_id": request_id,
@@ -5709,6 +5724,7 @@ fn agent_handle_permission_request(
             }
             json!({
                 "jsonrpc": "2.0",
+                "factoryApiVersion": "1.0.0",
                 "type": "response",
                 "id": request_id,
                 "result": result,
@@ -5739,7 +5755,7 @@ fn agent_reader_main(ctx: AgentReaderCtx) {
         shared,
         liveness,
         router,
-        agents_dir,
+        events,
         reaped,
         dirty,
     } = ctx;
@@ -5757,10 +5773,6 @@ fn agent_reader_main(ctx: AgentReaderCtx) {
             .unwrap_or(false)
     };
 
-    let mut log = AgentLogWriter::open(&agents_dir, &pane_id);
-    // Every normalized event carries the pane's monotonic seq; continue the
-    // sequence where the persisted log left off (respawn/daemon restart).
-    let mut next_seq = agent_log_last_seq(&agents_dir, &pane_id);
     let mut reader = BufReader::new(stdout);
     let mut buffer = Vec::new();
     loop {
@@ -5785,9 +5797,8 @@ fn agent_reader_main(ctx: AgentReaderCtx) {
             );
             append_and_emit_agent_event(
                 &router,
-                &mut log,
+                &events,
                 &pane_id,
-                &mut next_seq,
                 json!({"kind": "error", "message": "oversized agent output line dropped"}),
             );
             continue;
@@ -5816,6 +5827,7 @@ fn agent_reader_main(ctx: AgentReaderCtx) {
             if let Some(request_id) = raw.get("id").and_then(Value::as_str) {
                 let response = json!({
                     "jsonrpc": "2.0",
+                    "factoryApiVersion": "1.0.0",
                     "type": "response",
                     "id": request_id,
                     "result": {"cancelled": true, "answers": []},
@@ -5857,22 +5869,14 @@ fn agent_reader_main(ctx: AgentReaderCtx) {
                 }
                 "permission_request" => {
                     agent_handle_permission_request(
-                        backend,
-                        &router,
-                        &mut log,
-                        &pane_id,
-                        &input,
-                        &shared,
-                        &child,
-                        &reaped,
-                        &mut next_seq,
+                        backend, &router, &events, &pane_id, &input, &shared, &child, &reaped,
                         event,
                     );
                     continue;
                 }
                 _ => {}
             }
-            append_and_emit_agent_event(&router, &mut log, &pane_id, &mut next_seq, event);
+            append_and_emit_agent_event(&router, &events, &pane_id, event);
         }
     }
 
@@ -5909,9 +5913,8 @@ fn agent_reader_main(ctx: AgentReaderCtx) {
     if claimed {
         append_and_emit_agent_event(
             &router,
-            &mut log,
+            &events,
             &pane_id,
-            &mut next_seq,
             json!({"kind": "process_exit", "exit_code": exit_code}),
         );
         // (T1) M2: a dead agent must not keep a working/needs-input badge.
@@ -5927,6 +5930,7 @@ type AgentSessionHandles = (
     AgentBackendKind,
     SyncSender<Vec<u8>>,
     Arc<Mutex<AgentShared>>,
+    Arc<Mutex<AgentEventLog>>,
 );
 
 #[cfg(any(unix, windows))]
@@ -5987,6 +5991,7 @@ impl TerminalStore {
             let request = if let Some(session_id) = &resume_session_id {
                 json!({
                     "jsonrpc": "2.0",
+                    "factoryApiVersion": "1.0.0",
                     "type": "request",
                     "id": format!("sgian-load-{pane_id}"),
                     "method": "droid.load_session",
@@ -6005,6 +6010,7 @@ impl TerminalStore {
                 }
                 json!({
                     "jsonrpc": "2.0",
+                    "factoryApiVersion": "1.0.0",
                     "type": "request",
                     "id": format!("sgian-init-{pane_id}"),
                     "method": "droid.initialize_session",
@@ -6066,6 +6072,10 @@ impl TerminalStore {
         // the unix killer signals by pid and never touches this mutex).
         let child = Arc::new(Mutex::new(child));
         let shared = Arc::new(Mutex::new(AgentShared::default()));
+        let events = Arc::new(Mutex::new(AgentEventLog {
+            log: AgentLogWriter::open(&self.agents_dir, pane_id),
+            next_seq: agent_log_last_seq(&self.agents_dir, pane_id),
+        }));
         let input = spawn_input_writer(Box::new(stdin));
         if let Some(line) = initial_input {
             if let Err(error) = queue_agent_stdin(&input, pane_id, &line) {
@@ -6111,7 +6121,7 @@ impl TerminalStore {
             shared: Arc::clone(&shared),
             liveness: Arc::clone(&self.liveness),
             router: self.router.clone(),
-            agents_dir: self.agents_dir.clone(),
+            events: Arc::clone(&events),
             reaped: Arc::clone(&reaped),
             dirty: Arc::clone(&self.agent_dirty),
         };
@@ -6136,6 +6146,7 @@ impl TerminalStore {
                 input,
                 killer,
                 shared,
+                events,
             },
         );
     }
@@ -6148,6 +6159,7 @@ impl TerminalStore {
                 session.backend,
                 session.input.clone(),
                 Arc::clone(&session.shared),
+                Arc::clone(&session.events),
             )
         })
     }
@@ -7107,9 +7119,11 @@ impl DaemonServer {
                 backend,
                 model,
             } => self.handle_create_agent_pane(title, AgentPaneSpec::normalized(backend, model)?),
-            DaemonRequest::SendAgentMessage { pane_id, text } => {
-                self.handle_send_agent_message(&pane_id, &text)
-            }
+            DaemonRequest::SendAgentMessage {
+                pane_id,
+                text,
+                message_id,
+            } => self.handle_send_agent_message(&pane_id, &text, message_id.as_deref()),
             DaemonRequest::AgentApproval {
                 pane_id,
                 request_id,
@@ -8198,7 +8212,12 @@ impl DaemonServer {
     /// restored pane under restore_on_demand — simply resumes its CLI session
     /// on first message, instead of erroring like a dead PTY).
     #[cfg(any(unix, windows))]
-    fn handle_send_agent_message(&self, pane_id: &str, text: &str) -> Result<Value, String> {
+    fn handle_send_agent_message(
+        &self,
+        pane_id: &str,
+        text: &str,
+        message_id: Option<&str>,
+    ) -> Result<Value, String> {
         self.ensure_agent_pane(pane_id)?;
         if text.trim().is_empty() {
             return Err("agent message cannot be empty".to_string());
@@ -8208,8 +8227,11 @@ impl DaemonServer {
                 "agent message exceeds maximum size ({AGENT_MESSAGE_MAX_BYTES} bytes)"
             ));
         }
+        if message_id.is_some_and(|id| id.is_empty() || id.len() > 128) {
+            return Err("agent message id must contain 1 to 128 bytes".to_string());
+        }
         self.ensure_agent_session(pane_id)?;
-        let (backend, input, shared) = {
+        let (backend, input, shared, events) = {
             let terminals = self.lock_terminals()?;
             if !terminals.is_live(pane_id) {
                 return Err(format!("agent session not found: {pane_id}"));
@@ -8234,6 +8256,7 @@ impl DaemonServer {
             }),
             AgentBackendKind::Droid => json!({
                 "jsonrpc": "2.0",
+                "factoryApiVersion": "1.0.0",
                 "type": "request",
                 "id": format!("sgian-message-{seq}"),
                 "method": "droid.add_user_message",
@@ -8242,15 +8265,34 @@ impl DaemonServer {
         };
         let line = serde_json::to_string(&payload)
             .map_err(|error| format!("failed to encode agent message: {error}"))?;
+        // Hold the event lock across enqueue + append so even a fast CLI
+        // cannot publish its reply ahead of the accepted prompt. Failed
+        // enqueues are never written to conversation history.
+        let mut events = events.lock().map_err(|_| {
+            agent_end_turn(&shared);
+            "agent event log lock poisoned".to_string()
+        })?;
         if let Err(error) = queue_agent_stdin(&input, pane_id, &line) {
             agent_end_turn(&shared);
             return Err(error);
         }
+        events.emit(
+            &self.router,
+            pane_id,
+            json!({
+                "kind": "user_message", "text": text, "message_id": message_id,
+            }),
+        );
         Ok(json!(CommandOk { ok: true }))
     }
 
     #[cfg(not(any(unix, windows)))]
-    fn handle_send_agent_message(&self, _pane_id: &str, _text: &str) -> Result<Value, String> {
+    fn handle_send_agent_message(
+        &self,
+        _pane_id: &str,
+        _text: &str,
+        _message_id: Option<&str>,
+    ) -> Result<Value, String> {
         Err(AGENT_UNSUPPORTED.to_string())
     }
 
@@ -8275,7 +8317,7 @@ impl DaemonServer {
         }
         let sender = {
             let terminals = self.lock_terminals()?;
-            let (_, _, shared) = terminals
+            let (_, _, shared, _) = terminals
                 .agent_session_handles(pane_id)
                 .ok_or_else(|| format!("agent session not found: {pane_id}"))?;
             let mut shared = shared
@@ -8319,7 +8361,7 @@ impl DaemonServer {
     #[cfg(any(unix, windows))]
     fn handle_interrupt_agent(&self, pane_id: &str) -> Result<Value, String> {
         self.ensure_agent_pane(pane_id)?;
-        let (backend, input, shared) = {
+        let (backend, input, shared, _) = {
             let terminals = self.lock_terminals()?;
             if !terminals.is_live(pane_id) {
                 return Err(format!("agent session ended: {pane_id}"));
@@ -8337,6 +8379,7 @@ impl DaemonServer {
             }),
             AgentBackendKind::Droid => json!({
                 "jsonrpc": "2.0",
+                "factoryApiVersion": "1.0.0",
                 "type": "request",
                 "id": format!("sgian-interrupt-{seq}"),
                 "method": "droid.interrupt_session",
@@ -8698,11 +8741,14 @@ fn create_agent_pane(
 fn send_agent_message(
     pane_id: String,
     text: String,
+    message_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<CommandOk, String> {
-    state
-        .client()?
-        .request(DaemonRequest::SendAgentMessage { pane_id, text })
+    state.client()?.request(DaemonRequest::SendAgentMessage {
+        pane_id,
+        text,
+        message_id,
+    })
 }
 
 /// (T2) Answer a pending permission_request event (allow, or deny with
@@ -12301,6 +12347,7 @@ fn control_send_input(client: &DaemonClient, args: &[String]) -> Result<(), Stri
     if status.pane.kind == PaneKind::Agent {
         let text = args[1..].join(" ");
         client.request::<CommandOk>(DaemonRequest::SendAgentMessage {
+            message_id: None,
             pane_id: status.pane.id,
             text,
         })?;
@@ -29252,6 +29299,8 @@ exit 0
     /// Minimal long-lived Factory Droid JSON-RPC driver. It intentionally
     /// emits an idle notification immediately after initialization so the
     /// integration test also pins suppression of startup-idle turn events.
+    /// The real CLI also requires factoryApiVersion on every RPC envelope,
+    /// including responses; accepting plain JSON-RPC hid launch failures.
     #[cfg(unix)]
     const FAKE_DROID_SH: &str = r#"#!/bin/sh
 LOG="__FAKE_DROID_LOG__"
@@ -29260,6 +29309,10 @@ printf '%s\n' '{"jsonrpc":"2.0","type":"response","id":"init","result":{"session
 printf '%s\n' '{"jsonrpc":"2.0","type":"notification","method":"droid.session_notification","params":{"notification":{"type":"droid_working_state_changed","newState":"idle"}}}'
 while IFS= read -r line; do
   printf 'stdin %s\n' "$line" >> "$LOG"
+  case "$line" in
+    *'"factoryApiVersion":"1.0.0"'*) ;;
+    *) printf '%s\n' '{"jsonrpc":"2.0","type":"response","id":null,"error":{"code":-32600,"message":"Invalid JSON-RPC message: missing factoryApiVersion"}}'; exit 1 ;;
+  esac
   case "$line" in
     *'"method":"droid.initialize_session"'*)
       ;;
@@ -29430,6 +29483,7 @@ exit 0
         // A user message streams: message_start → deltas → complete → result.
         let ok: CommandOk = client
             .request(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "hello there".to_string(),
             })
@@ -29499,6 +29553,7 @@ exit 0
         assert_eq!(session["model"], json!("custom:Fireworks-Qwen-0"));
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "review this".to_string(),
             })
@@ -29583,6 +29638,7 @@ exit 0
         // --- ALLOW path: the CLI blocks until the AgentApproval arrives. ---
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "ask-permission please".to_string(),
             })
@@ -29599,6 +29655,7 @@ exit 0
         // a concurrent message is REJECTED, not queued.
         let busy = client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "meanwhile".to_string(),
             })
@@ -29641,6 +29698,7 @@ exit 0
         // --- DENY path: the feedback message reaches the CLI. ---
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "ask-permission again".to_string(),
             })
@@ -29679,6 +29737,7 @@ exit 0
         // A "hang" turn starts streaming but never completes on its own.
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "hang on".to_string(),
             })
@@ -29700,6 +29759,7 @@ exit 0
         // The pane takes a fresh message afterwards (turn flag cleared, CLI alive).
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "hello again".to_string(),
             })
@@ -29725,6 +29785,7 @@ exit 0
         // (normalized) and PaneEnded (the shared ended flow), in that order.
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "die now".to_string(),
             })
@@ -29755,6 +29816,7 @@ exit 0
         // session) instead of erroring like a dead PTY.
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "are you back".to_string(),
             })
@@ -29781,6 +29843,7 @@ exit 0
         read_agent_event(&mut reader, &pane.id, "session");
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "remember this".to_string(),
             })
@@ -29856,6 +29919,7 @@ exit 0
         read_agent_event(&mut reader, &pane.id, "session");
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "before restart".to_string(),
             })
@@ -29877,6 +29941,7 @@ exit 0
         // appending across the restart — both turns are in the replay).
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "after restart".to_string(),
             })
@@ -29921,6 +29986,7 @@ exit 0
         // pane-1 is the default SHELL pane; agent requests reject it.
         for request in [
             DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: "pane-1".to_string(),
                 text: "hi".to_string(),
             },
@@ -29944,6 +30010,7 @@ exit 0
         // Unknown panes are reported as such.
         let err = server
             .handle(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: "pane-99".to_string(),
                 text: "hi".to_string(),
             })
@@ -29957,6 +30024,7 @@ exit 0
         let pane_id = pane["id"].as_str().expect("pane id").to_string();
         let err = server
             .handle(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane_id.clone(),
                 text: "   ".to_string(),
             })
@@ -29964,6 +30032,7 @@ exit 0
         assert!(err.contains("cannot be empty"), "{err}");
         let err = server
             .handle(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane_id.clone(),
                 text: "x".repeat(AGENT_MESSAGE_MAX_BYTES + 1),
             })
@@ -29979,6 +30048,7 @@ exit 0
         let fake = install_fake_claude();
         let (daemon, _cwd) = spawn_agent_test_daemon(&fake);
         let client = daemon.client();
+        let mut reader = subscribe_events(&client);
         let pane: Pane = client
             .request(DaemonRequest::CreateAgentPane { title: None })
             .expect("create agent pane");
@@ -29987,7 +30057,13 @@ exit 0
         // receives a stream-json user line, not PTY bytes).
         control_send_input(&client, &[pane.id.clone(), "hello from ctl".to_string()])
             .expect("send to agent pane");
-        wait_for(|| driver_log_contents(&fake).contains("hello from ctl"));
+        let prompt = read_agent_event(&mut reader, &pane.id, "user_message");
+        assert_eq!(prompt["text"], "hello from ctl");
+        // Send before the CLI has initialized, then await its response using
+        // the same bounded event timeout as the other process fixtures.
+        // macOS can hold a new executable at launch for more than five seconds.
+        read_agent_event(&mut reader, &pane.id, "turn_complete");
+        assert!(driver_log_contents(&fake).contains("hello from ctl"));
         assert!(
             driver_log_contents(&fake).contains(r#""type":"user"#),
             "agent pane send must be a stream-json user message"
@@ -30022,6 +30098,7 @@ exit 0
         assert_eq!(session["seq"], json!(1));
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: Some("restart-prompt-1".to_string()),
                 pane_id: pane.id.clone(),
                 text: "hello there".to_string(),
             })
@@ -30075,6 +30152,20 @@ exit 0
             replay.iter().all(|event| event["seq"].is_u64()),
             "replay events carry seq: {replay:?}"
         );
+        let prompt_index = replay
+            .iter()
+            .position(|event| event["kind"] == "user_message")
+            .expect("accepted user prompt survives daemon restart");
+        assert_eq!(replay[prompt_index]["text"], "hello there");
+        assert_eq!(replay[prompt_index]["message_id"], "restart-prompt-1");
+        let answer_index = replay
+            .iter()
+            .position(|event| event["kind"] == "text_delta")
+            .expect("assistant reply survives daemon restart");
+        assert!(
+            prompt_index < answer_index,
+            "prompt is persisted before the reply"
+        );
         let max_replay_seq = replay
             .iter()
             .filter_map(|event| event["seq"].as_u64())
@@ -30082,6 +30173,7 @@ exit 0
             .expect("replay seqs");
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "after restart".to_string(),
             })
@@ -30132,6 +30224,7 @@ exit 0
         read_agent_event(&mut reader, &pane.id, "session");
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "hang please".to_string(),
             })
@@ -30154,6 +30247,7 @@ exit 0
         let mut reader = subscribe_events(&client);
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "after death".to_string(),
             })
@@ -30181,6 +30275,7 @@ exit 0
         // out the approval timeout as a zombie.
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "ask-then-die please".to_string(),
             })
@@ -30197,6 +30292,7 @@ exit 0
         // …and a fresh send auto-respawns it.
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "back again".to_string(),
             })
@@ -30238,6 +30334,7 @@ exit 0
         // the reader auto-denies and reports it.
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "ask-permission please".to_string(),
             })
@@ -30257,6 +30354,7 @@ exit 0
         // …and the pane takes a fresh message afterwards.
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "hello again".to_string(),
             })
@@ -30279,6 +30377,7 @@ exit 0
         read_agent_event(&mut reader, &pane.id, "session");
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "ask-permission please".to_string(),
             })
@@ -30320,6 +30419,7 @@ exit 0
         // session id; "reinit-hang" models that, then hangs the turn open.
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "reinit-hang please".to_string(),
             })
@@ -30335,6 +30435,7 @@ exit 0
         // still rejected while the turn hangs open.
         let busy = client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "meanwhile".to_string(),
             })
@@ -30373,6 +30474,7 @@ exit 0
         // Only the send-path clear recovers the pane.
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "hang-noresult please".to_string(),
             })
@@ -30381,6 +30483,7 @@ exit 0
         assert_eq!(delta["text"], json!("working"));
         let busy = client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "still busy".to_string(),
             })
@@ -30401,6 +30504,7 @@ exit 0
         // rejected forever (no turn_complete ever arrives).
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "hello again".to_string(),
             })
@@ -30426,6 +30530,7 @@ exit 0
         // must OMIT updatedInput rather than echo `null`.
         client
             .request::<CommandOk>(DaemonRequest::SendAgentMessage {
+                message_id: None,
                 pane_id: pane.id.clone(),
                 text: "ask-noinput please".to_string(),
             })

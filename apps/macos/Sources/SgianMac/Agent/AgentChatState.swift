@@ -18,6 +18,8 @@ struct ChatMessage: Identifiable, Equatable {
     var toolUseID: String?
     var isError: Bool
     var isOpen: Bool
+    var clientMessageID: String?
+    var isPending = false
 
     init(
         id: UUID = UUID(),
@@ -88,6 +90,18 @@ struct AgentChatState: Equatable {
         }
 
         switch kind {
+        case "user_message":
+            guard let text = object["text"]?.stringValue else { break }
+            let messageID = object["message_id"]?.stringValue
+            if let messageID, let index = messages.firstIndex(where: { $0.kind == .user && $0.clientMessageID == messageID }) {
+                messages[index].isPending = false
+            } else {
+                var message = ChatMessage(kind: .user, text: text)
+                message.clientMessageID = messageID
+                messages.append(message)
+            }
+            busy = true
+
         case "session":
             sessionID = object["session_id"]?.stringValue ?? sessionID
             model = object["model"]?.stringValue ?? model
@@ -175,14 +189,19 @@ struct AgentChatState: Equatable {
         capMessages()
     }
 
-    mutating func appendUserMessage(_ text: String) {
-        messages.append(ChatMessage(kind: .user, text: text))
+    mutating func appendUserMessage(_ text: String, messageID: String? = nil) {
+        var message = ChatMessage(kind: .user, text: text)
+        message.clientMessageID = messageID
+        message.isPending = messageID != nil
+        messages.append(message)
         busy = true
         capMessages()
     }
 
-    mutating func removeLastUserMessage(matching text: String) {
-        guard let index = messages.lastIndex(where: { $0.kind == .user && $0.text == text }) else { return }
+    mutating func removeLastUserMessage(matching text: String, messageID: String? = nil) {
+        guard let index = messages.lastIndex(where: {
+            $0.kind == .user && (messageID == nil ? $0.text == text : $0.clientMessageID == messageID && $0.isPending)
+        }) else { return }
         messages.remove(at: index)
         busy = false
     }

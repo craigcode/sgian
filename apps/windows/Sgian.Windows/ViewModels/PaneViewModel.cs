@@ -75,7 +75,7 @@ public sealed class PaneViewModel : ObservableObject
             }
             if (!IsAgent)
             {
-                return "Terminal";
+                return Attention is null ? "Terminal" : $"Terminal · {Attention.Replace('_', ' ')}";
             }
             var identity = AgentSpec is null
                 ? "Agent"

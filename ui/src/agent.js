@@ -4,9 +4,9 @@
 // one chat state per pane and folds normalized `agent-event` payloads (see the
 // T2 contract: session / message_start / text_delta / message_complete /
 // tool_use / tool_result / permission_request / permission_resolved /
-// turn_complete / error / process_exit) into it. User messages are appended
-// LOCALLY by the composer (appendUserMessage) — the daemon never echoes them
-// back as events.
+// turn_complete / error / process_exit) into it. The composer appends user
+// messages optimistically; persisted user_message events reconcile by id and
+// restore both sides of the conversation after reconnecting.
 //
 // Every daemon event carries a per-pane `seq` (monotonic from 1); the reducer
 // tracks `lastSeq` and drops re-delivered events (seq <= lastSeq) so a replay
@@ -128,6 +128,17 @@ export function applyAgentEvent(chat, event) {
 /** The per-kind fold behind applyAgentEvent (seq gate + message cap above). */
 function foldAgentEvent(chat, event) {
   switch (event.kind) {
+    case "user_message": {
+      if (typeof event.text !== "string") return chat;
+      const pending = event.message_id && chat.messages.find(
+        (message) => message.type === "user" && message.clientMessageId === event.message_id,
+      );
+      if (pending) pending.pending = false;
+      else chat.messages.push({ type: "user", text: event.text, clientMessageId: event.message_id });
+      chat.busy = true;
+      return chat;
+    }
+
     case "session": {
       if (typeof event.session_id === "string") chat.sessionId = event.session_id;
       if (typeof event.model === "string") chat.model = event.model;
@@ -307,9 +318,11 @@ export function replayAgentEvents(chat, events) {
  * now expected). Called by the composer BEFORE the send_agent_message invoke
  * resolves so the UI disables immediately.
  */
-export function appendUserMessage(chat, text) {
+export function appendUserMessage(chat, text, messageId) {
   if (!chat) return chat;
-  chat.messages.push({ type: "user", text: String(text) });
+  const message = { type: "user", text: String(text) };
+  if (messageId) Object.assign(message, { clientMessageId: messageId, pending: true });
+  chat.messages.push(message);
   capChatMessages(chat);
   chat.busy = true;
   return chat;
@@ -321,11 +334,11 @@ export function appendUserMessage(chat, text) {
  * the draft is restored to the composer, so no text is lost (M2). Returns
  * true when a bubble was removed.
  */
-export function removeUserMessage(chat, text) {
+export function removeUserMessage(chat, text, messageId) {
   if (!chat) return false;
   for (let i = chat.messages.length - 1; i >= 0; i -= 1) {
     const m = chat.messages[i];
-    if (m.type === "user" && m.text === String(text)) {
+    if (m.type === "user" && (messageId ? m.clientMessageId === messageId && m.pending : m.text === String(text))) {
       chat.messages.splice(i, 1);
       return true;
     }

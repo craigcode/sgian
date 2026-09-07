@@ -24,10 +24,13 @@ struct SidebarView: View {
                 }
             }
             .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
 
             Divider()
             workspaceFooter
         }
+        .background(.white)
+        .environment(\.colorScheme, .light)
         .navigationTitle("Sgian")
         .toolbar {
             ToolbarItem(placement: .navigation) {
@@ -56,7 +59,7 @@ struct SidebarView: View {
         PaneRow(
             pane: pane,
             runtime: model.paneStates[pane.id] ?? .live,
-            attention: model.agentStates[pane.id]?.attention,
+            attention: model.attention(for: pane.id),
             spec: model.agentSpecs[pane.id]
         )
         .tag(pane.id)
@@ -67,7 +70,7 @@ struct SidebarView: View {
             }
             Button("Restart") { model.restart(pane.id) }
             Divider()
-            Button("Close Pane", role: .destructive) { model.close(pane.id) }
+            Button("Close Pane", role: .destructive) { model.requestClose(pane) }
         }
     }
 
