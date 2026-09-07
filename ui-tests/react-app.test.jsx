@@ -409,6 +409,7 @@ describe("React application instances", () => {
       expect(invoke).toHaveBeenCalledWith("send_agent_message", {
         paneId: "pane-agent",
         text: "still works",
+        messageId: expect.any(String),
       }),
     );
     await controller.restartPane("pane-shell");

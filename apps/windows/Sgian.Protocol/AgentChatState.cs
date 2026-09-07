@@ -22,6 +22,8 @@ public sealed class ChatMessage
     public string? ToolUseId { get; init; }
     public bool IsError { get; set; }
     public bool IsOpen { get; set; }
+    public string? ClientMessageId { get; set; }
+    public bool IsPending { get; set; }
 
     public string Label => Kind switch
     {
@@ -73,18 +75,18 @@ public sealed class AgentChatState
 
     public void Apply(JsonElement item) => Apply(item, notify: true);
 
-    public void AppendUserMessage(string text)
+    public void AppendUserMessage(string text, string? messageId = null)
     {
-        Messages.Add(new ChatMessage { Kind = ChatMessageKind.User, Text = text });
+        Messages.Add(new ChatMessage { Kind = ChatMessageKind.User, Text = text, ClientMessageId = messageId, IsPending = messageId is not null });
         Busy = true;
         CapMessages();
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
-    public void RemoveLastUserMessage(string text)
+    public void RemoveLastUserMessage(string text, string? messageId = null)
     {
         var index = Messages.FindLastIndex(message =>
-            message.Kind == ChatMessageKind.User && message.Text == text);
+            message.Kind == ChatMessageKind.User && (messageId is null ? message.Text == text : message.ClientMessageId == messageId && message.IsPending));
         if (index >= 0)
         {
             Messages.RemoveAt(index);
@@ -120,6 +122,18 @@ public sealed class AgentChatState
 
         switch (kindValue.GetString())
         {
+            case "user_message":
+            {
+                var prompt = Text(item, "text");
+                if (prompt is null) break;
+                var messageId = Text(item, "message_id");
+                var pending = messageId is null ? null : Messages.Find(message =>
+                    message.Kind == ChatMessageKind.User && message.ClientMessageId == messageId);
+                if (pending is not null) pending.IsPending = false;
+                else Messages.Add(new ChatMessage { Kind = ChatMessageKind.User, Text = prompt, ClientMessageId = messageId });
+                Busy = true;
+                break;
+            }
             case "session":
                 SessionId = Text(item, "session_id") ?? SessionId;
                 Model = Text(item, "model") ?? Model;

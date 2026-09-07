@@ -21,6 +21,7 @@ var tests = new (string Name, Action Body)[]
 {
     ("Named-pipe endpoint parsing", PipeEndpointParsing),
     ("Agent stream reduction and replay dedupe", AgentStreamReduction),
+    ("Prompt persistence and correlated optimistic echoes", UserPromptReplay),
     ("Permission lifecycle", PermissionLifecycle),
     ("Workspace defaults", WorkspaceDefaults),
     ("Bounded IPC messages", BoundedMessages),
@@ -50,6 +51,26 @@ if (failures.Count > 0)
 
 Console.WriteLine($"Sgian.Protocol: {tests.Length} checks passed");
 return 0;
+
+static void UserPromptReplay()
+{
+    var item = Json("""{"kind":"user_message","text":"hello","message_id":"send-1","seq":1}""");
+    var chat = new AgentChatState();
+    chat.AppendUserMessage("hello", "send-1");
+    chat.Apply(item);
+    chat.Replay(new[] { item });
+    chat.RemoveLastUserMessage("hello", "send-1");
+    Equal(1, chat.Messages.Count);
+    Equal(false, chat.Messages[0].IsPending);
+    var restored = new AgentChatState();
+    restored.Replay(new[] { item });
+    Equal("hello", restored.Messages[0].Text);
+    restored.Apply(Json("""{"kind":"user_message","text":"hello","message_id":"send-2","seq":2}"""));
+    Equal(2, restored.Messages.Count);
+    restored.AppendUserMessage("failed", "send-3");
+    restored.RemoveLastUserMessage("failed", "send-3");
+    Equal(2, restored.Messages.Count);
+}
 
 static void NativeLayouts()
 {

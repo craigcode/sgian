@@ -340,17 +340,17 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     const chat = getOrCreateChat(paneId);
     if (chat.busy) return;
     state.chatDrafts.set(paneId, "");
-    appendUserMessage(chat, text);
+    const messageId = crypto.randomUUID();
+    appendUserMessage(chat, text, messageId);
     notify();
     invokeWithTimeout(
       "send_agent_message",
-      { paneId, text },
+      { paneId, text, messageId },
       SEND_AGENT_MESSAGE_TIMEOUT_MS,
     ).catch((error) => {
       if (!state.panes.has(paneId) || !paneIsAgent(paneId)) return;
       const live = getOrCreateChat(paneId);
-      if (!isInvokeTimeout(error)) {
-        removeUserMessage(live, text);
+      if (!isInvokeTimeout(error) && removeUserMessage(live, text, messageId)) {
         if (!state.chatDrafts.get(paneId)) state.chatDrafts.set(paneId, text);
         live.busy = false;
       }

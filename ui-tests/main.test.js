@@ -267,6 +267,12 @@ async function stubInvoke(command, args = {}) {
       return backendConfig;
     case "send_agent_message":
       if (sendAgentMessageMode === "fail") throw new Error("daemon dead");
+      if (sendAgentMessageMode === "ack-then-fail") {
+        listeners["agent-event"]({ payload: { pane_id: args.paneId, event: {
+          kind: "user_message", text: args.text, message_id: args.messageId,
+        } } });
+        throw new Error("response connection lost");
+      }
       if (sendAgentMessageMode === "hang") return new Promise(() => {});
       return { ok: true };
     case "agent_approval":
@@ -1242,6 +1248,7 @@ describe("(T2) agent chat panes", () => {
     expect(commandsInvoked("send_agent_message")[0].args).toEqual({
       paneId: "pane-c",
       text: "hello agent",
+      messageId: expect.any(String),
     });
     await waitFor(
       () =>
@@ -1728,6 +1735,23 @@ describe("(T2) review fixes", () => {
     }
   });
 
+  it("keeps an accepted prompt and busy state when the response connection fails", async () => {
+    sendAgentMessageMode = "ack-then-fail";
+    try {
+      const input = chatRoot("pane-c").querySelector(".chat-input");
+      const chat = app.__test.state.chats.get("pane-c");
+      input.value = "accepted before disconnect";
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      await waitFor(() => chat.messages.at(-1)?.type === "error", "response error shown");
+      expect(chat.messages.filter((message) => message.type === "user" && message.text === "accepted before disconnect")).toHaveLength(1);
+      expect(chat.busy).toBe(true);
+      expect(input.value).toBe("");
+    } finally {
+      listeners["agent-event"]({ payload: { pane_id: "pane-c", event: { kind: "turn_complete" } } });
+      sendAgentMessageMode = "ok";
+    }
+  });
+
   it("gives send_agent_message a 60s timeout and does not force-clear busy on timeout (M2)", async () => {
     vi.useFakeTimers();
     try {
@@ -1742,6 +1766,7 @@ describe("(T2) review fixes", () => {
       expect(commandsInvoked("send_agent_message").at(-1).args).toEqual({
         paneId: "pane-c",
         text: "slow send",
+        messageId: expect.any(String),
       });
       expect(input.value).toBe(""); // cleared optimistically by the composer
       expect(chat.busy).toBe(true);

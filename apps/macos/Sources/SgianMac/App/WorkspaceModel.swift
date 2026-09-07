@@ -236,8 +236,9 @@ final class WorkspaceModel: ObservableObject {
     func sendAgentMessage(paneID: String, text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, chats[paneID]?.busy != true else { return }
+        let messageID = UUID().uuidString
         var chat = chats[paneID] ?? AgentChatState()
-        chat.appendUserMessage(trimmed)
+        chat.appendUserMessage(trimmed, messageID: messageID)
         chats[paneID] = chat
         perform { client in
             do {
@@ -245,11 +246,12 @@ final class WorkspaceModel: ObservableObject {
                     "command": .string("send_agent_message"),
                     "pane_id": .string(paneID),
                     "text": .string(trimmed),
+                    "message_id": .string(messageID),
                 ], as: CommandOK.self)
             } catch {
                 guard self.client === client else { return }
                 var failed = self.chats[paneID] ?? AgentChatState()
-                failed.removeLastUserMessage(matching: trimmed)
+                failed.removeLastUserMessage(matching: trimmed, messageID: messageID)
                 self.chats[paneID] = failed
                 throw error
             }
@@ -450,10 +452,10 @@ final class WorkspaceModel: ObservableObject {
                 surface.loadInitialScrollback(snapshot.scrollback[pane.id] ?? "")
                 if snapshot.paneStates[pane.id] != .ended, let client { ensureTerminal(pane.id, client: client) }
             } else {
-                // User prompts are rendered locally because the daemon does
-                // not echo them. Fold replay into an existing chat so a close,
-                // reconnect, or other snapshot refresh cannot erase them;
-                // per-event sequence numbers discard the overlapping tail.
+                // Fold replay into existing state to preserve pending local
+                // prompts and compatibility with older daemons. Sequence
+                // numbers discard overlapping events; message ids reconcile
+                // accepted prompts with their optimistic local bubbles.
                 var chat = chats[pane.id] ?? AgentChatState()
                 chat.replay(snapshot.agentEvents[pane.id, default: []])
                 if snapshot.paneStates[pane.id] == .ended { chat.markPaneEnded() }

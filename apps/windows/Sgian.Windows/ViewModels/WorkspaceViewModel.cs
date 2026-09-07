@@ -279,10 +279,11 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         if (_client is null || string.IsNullOrWhiteSpace(text)) return;
         var chat = ChatFor(pane.Id);
         var body = text.Trim();
-        chat.AppendUserMessage(body);
+        var messageId = Guid.NewGuid().ToString();
+        chat.AppendUserMessage(body, messageId);
         var result = await RunRequestAsync(() => _client.RequestAsync<CommandOk>(Request(
-            ("command", "send_agent_message"), ("pane_id", pane.Id), ("text", body))));
-        if (result is null) chat.RemoveLastUserMessage(body);
+            ("command", "send_agent_message"), ("pane_id", pane.Id), ("text", body), ("message_id", messageId))));
+        if (result is null) chat.RemoveLastUserMessage(body, messageId);
     }
 
     public async Task InterruptAgentAsync(PaneViewModel pane)
