@@ -49,7 +49,7 @@ public sealed partial class MainWindow : Window
         ViewModel.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName is nameof(ViewModel.Status) or nameof(ViewModel.ErrorMessage) or
-                nameof(ViewModel.WorkspacePath)) RefreshChrome();
+                nameof(ViewModel.WorkspacePath) or nameof(ViewModel.LeaseNotice)) RefreshChrome();
         };
         Closed += MainWindow_Closed;
         AddShortcut(VirtualKey.D, VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift, () => ViewModel.CreateShellAsync("row"));
@@ -59,6 +59,8 @@ public sealed partial class MainWindow : Window
         AddShortcut(VirtualKey.P, VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift, ShowCommandsAsync);
         AddShortcut(VirtualKey.Tab, VirtualKeyModifiers.Control, () => ViewModel.FocusNextAsync(1));
         AddShortcut(VirtualKey.Tab, VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift, () => ViewModel.FocusNextAsync(-1));
+        AddShortcut(VirtualKey.T, VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift, TakeLeaseAsync);
+        AddShortcut(VirtualKey.L, VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift, ReleaseLeaseAsync);
 
         var appWindow = GetAppWindow();
         appWindow.Resize(new SizeInt32(1180, 760));
@@ -97,7 +99,61 @@ public sealed partial class MainWindow : Window
         RestartButton.Visibility = pane?.State == "ended"
             ? Visibility.Visible
             : Visibility.Collapsed;
+        LeaseButton.Visibility = pane is null ? Visibility.Collapsed : Visibility.Visible;
+        LeaseButton.Content = pane?.LeaseIsMine == true ? "Release keyboard" : "Take keyboard";
         ShowLayout();
+    }
+
+    // Keyboard lease (docs/design/keyboard-lease-and-ledger.md §6 M2).
+
+    private async Task TakeLeaseAsync()
+    {
+        if (ViewModel.SelectedPane is not { } pane) return;
+        var outcome = await ViewModel.TakeLeaseAsync(pane);
+        if (outcome != WorkspaceViewModel.LeaseOutcome.NeedsForce) { Refresh(); return; }
+        var why = await PromptLeaseTextAsync(
+            $"Take the keyboard for {pane.Title} from {pane.LeaseHolder ?? "its holder"}",
+            "Why are you taking it over? (required, recorded in the pane's ledger)",
+            "Take keyboard");
+        if (why is not null) await ViewModel.TakeLeaseAsync(pane, force: true, why: why);
+        Refresh();
+    }
+
+    private async Task ReleaseLeaseAsync()
+    {
+        if (ViewModel.SelectedPane is not { } pane) return;
+        var note = await PromptLeaseTextAsync(
+            $"Hand back the keyboard for {pane.Title}",
+            "Hand-back note (required): what you did and what the agent should do next. It is recorded in the pane's ledger.",
+            "Release keyboard");
+        if (note is not null) await ViewModel.ReleaseLeaseAsync(pane, note);
+        Refresh();
+    }
+
+    /// <summary>A required-text prompt: the primary button stays disabled until the field is non-blank.</summary>
+    private async Task<string?> PromptLeaseTextAsync(string title, string prompt, string primary)
+    {
+        var input = new TextBox { AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, MinHeight = 90 };
+        var label = new TextBlock { Text = prompt, TextWrapping = TextWrapping.Wrap };
+        var content = new StackPanel { Spacing = 10, MinWidth = 420 };
+        content.Children.Add(label);
+        content.Children.Add(input);
+        var dialog = new ContentDialog
+        {
+            XamlRoot = Root.XamlRoot, Title = title, Content = content,
+            PrimaryButtonText = primary, CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary, IsPrimaryButtonEnabled = false,
+        };
+        input.TextChanged += (_, _) => dialog.IsPrimaryButtonEnabled = !string.IsNullOrWhiteSpace(input.Text);
+        var result = await dialog.ShowAsync();
+        var text = input.Text.Trim();
+        return result == ContentDialogResult.Primary && text.Length > 0 ? text : null;
+    }
+
+    private async void Lease_Click(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel.SelectedPane?.LeaseIsMine == true) await ReleaseLeaseAsync();
+        else await TakeLeaseAsync();
     }
 
     private void RefreshChrome()
@@ -107,6 +163,8 @@ public sealed partial class MainWindow : Window
         ToolTipService.SetToolTip(WorkspaceLabel, ViewModel.WorkspacePath);
         ErrorBar.Message = ViewModel.ErrorMessage ?? "";
         ErrorBar.IsOpen = !string.IsNullOrWhiteSpace(ViewModel.ErrorMessage);
+        LeaseBar.Message = ViewModel.LeaseNotice ?? "";
+        LeaseBar.IsOpen = !string.IsNullOrWhiteSpace(ViewModel.LeaseNotice);
     }
 
     private void ClearViews()
@@ -262,6 +320,8 @@ public sealed partial class MainWindow : Window
             ("New Factory Droid agent", () => ViewModel.CreateAgentAsync("droid")),
             ("Zoom / Show all panes", () => { ViewModel.ToggleZoom(); return Task.CompletedTask; }),
             ("Reconnect", () => ViewModel.StartAsync()),
+            ("Take keyboard for active pane", TakeLeaseAsync),
+            ("Release keyboard (with hand-back note)…", ReleaseLeaseAsync),
             ("Check for updates", () => NativeUpdates.CheckAsync(Root.XamlRoot)),
         };
         actions.AddRange(ViewModel.Panes.Select(pane => ($"Focus: {pane.Title} [{pane.Id}]", (Func<Task>)(() => ViewModel.SelectAsync(pane)))));

@@ -108,6 +108,40 @@ export function handleAgentState(state, payload, callbacks) {
 }
 
 /**
+ * Normalize a lease payload (a `lease-state` event, a bootstrap `leases`
+ * entry, or a take/release response) into `{ holder, sinceMs }`, or null when
+ * the pane is not held.
+ */
+export function normalizeLeaseInfo(entry) {
+  if (!entry || typeof entry.holder !== "string" || !entry.holder) return null;
+  const sinceMs = Number.isFinite(entry.since_ms) ? entry.since_ms : null;
+  return { holder: entry.holder, sinceMs };
+}
+
+export function leaseEquals(a, b) {
+  if (!a || !b) return a === b;
+  return a.holder === b.holder && a.sinceMs === b.sinceMs;
+}
+
+/**
+ * Handle a `lease-state` event (docs/design/keyboard-lease-and-ledger.md):
+ * `taken` records the holder, `released`/`revoked` clear it. Same
+ * unknown-pane guard as the other handlers.
+ */
+export function handleLeaseState(state, payload, callbacks) {
+  const paneId = payload.pane_id || payload.paneId;
+  if (!paneId) return;
+  if (!state.panes.has(paneId)) return;
+  if (!state.leases) state.leases = new Map();
+  const next = payload.transition === "taken" ? normalizeLeaseInfo(payload) : null;
+  const existing = state.leases.get(paneId) ?? null;
+  if (leaseEquals(existing, next)) return;
+  if (next) state.leases.set(paneId, next);
+  else state.leases.delete(paneId);
+  callbacks.render();
+}
+
+/**
  * Handle an `agent-event` (T2): fold one normalized agent event into the
  * pane's chat state and schedule a (rAF-throttled) chat re-render. Same
  * unknown-pane guard as the other handlers: a trailing event for a deleted

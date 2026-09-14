@@ -128,6 +128,8 @@ A single binary runs in three modes:
 - `--lf` / `--raw` literal LF flag for precise input control.
 - `ctl lease take|release|status` to claim, hand back (with a note), or show a
   pane's keyboard lease; `ctl send --as HOLDER` attributes input to a holder.
+  In the clients: `Ctrl/Cmd+Shift+T` takes the active pane's keyboard,
+  `Ctrl/Cmd+Shift+L` releases it with a note.
 - `ctl ledger [PANE] [--verify]` to print or verify a pane's hash-chained
   lease ledger; a closed pane's ledger stays readable by id.
 - `ctl logs` to tail daemon logs.

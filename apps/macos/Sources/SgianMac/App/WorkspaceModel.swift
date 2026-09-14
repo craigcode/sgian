@@ -8,6 +8,14 @@ final class WorkspaceModel: ObservableObject {
     @Published var selectedPaneID: String?
     @Published private(set) var paneStates: [String: PaneRuntimeState] = [:]
     @Published private(set) var agentStates: [String: AgentPaneInfo] = [:]
+    /// Keyboard leases for HELD panes (docs/design/keyboard-lease-and-ledger.md).
+    @Published private(set) var leases: [String: LeaseInfo] = [:]
+    /// A transient "read-only: held by …" notice for one pane after a refused keystroke.
+    @Published private(set) var leaseNotice: LeaseNotice?
+    @Published var leaseDialog: LeaseDialog?
+    /// The label this client writes and takes leases as: the same `user@host`
+    /// the `ctl` default uses, so the operator is one principal across surfaces.
+    let holder: String = WorkspaceModel.defaultHolder()
     @Published private(set) var agentSpecs: [String: AgentPaneSpec] = [:]
     @Published private(set) var chats: [String: AgentChatState] = [:]
     @Published private(set) var terminals: [String: TerminalSurface] = [:]
@@ -39,6 +47,10 @@ final class WorkspaceModel: ObservableObject {
     private var inputDrains: [String: Task<Void, Never>] = [:]
     private var ensuringTerminals: Set<String> = []
     private var layoutSaveTask: Task<Void, Never>?
+    private var leaseNoticeTask: Task<Void, Never>?
+    /// False once the daemon rejected `send_input_as` (pre-lease daemon); input
+    /// then falls back to the unattributed `write_to_pane` for this connection.
+    private var daemonSupportsLeases = true
 
     init() {
         let defaults = UserDefaults.standard
@@ -432,6 +444,7 @@ final class WorkspaceModel: ObservableObject {
         panes = snapshot.panes
         paneStates = snapshot.paneStates
         agentStates = snapshot.agentStates
+        leases = snapshot.leases
         agentSpecs = snapshot.agentSpecs
         layout = PaneLayout.reconcile(PaneLayout.parse(snapshot.layout), paneIDs: snapshot.panes.map(\.id))
 
@@ -503,6 +516,9 @@ final class WorkspaceModel: ObservableObject {
             let attention = event["attention"]?.stringValue.flatMap(AgentAttention.init(rawValue:))
             agentStates[paneID] = AgentPaneInfo(agent: event["agent"]?.stringValue, attention: attention)
 
+        case "lease_state":
+            LeaseInfo.apply(event: .object(event.payload), to: &leases)
+
         case "agent_event":
             guard let paneID = event["pane_id"]?.stringValue,
                   let payload = event["payload"]
@@ -573,16 +589,19 @@ final class WorkspaceModel: ObservableObject {
                 guard let client, let chunk = pendingInput[paneID], !chunk.isEmpty else { return }
                 pendingInput[paneID] = ""
                 do {
-                    let _: CommandOK = try await client.request([
-                        "command": .string("write_to_pane"),
-                        "pane_id": .string(paneID),
-                        "data": .string(chunk),
-                    ], as: CommandOK.self)
+                    try await sendInput(chunk, to: paneID, client: client)
                 } catch {
                     guard generation == inputGeneration else { return }
+                    let message = error.localizedDescription
+                    // A lease refusal is per keystroke and expected: a transient
+                    // notice on the pane, not the modal error alert.
+                    if message.contains("pane keyboard is") {
+                        showLeaseNotice(paneID: paneID, refusal: message)
+                        continue
+                    }
                     // The server may have accepted input before its response failed.
                     // Never replay ambiguous input into a live shell.
-                    errorMessage = "Terminal input could not be confirmed. Check the terminal before retrying. \(error.localizedDescription)"
+                    errorMessage = "Terminal input could not be confirmed. Check the terminal before retrying. \(message)"
                     return
                 }
             }
@@ -615,10 +634,123 @@ final class WorkspaceModel: ObservableObject {
         if pane.kind == .agent { chats[pane.id] = chats[pane.id] ?? AgentChatState() }
     }
 
+    // MARK: Keyboard lease (docs/design/keyboard-lease-and-ledger.md)
+
+    nonisolated static func defaultHolder() -> String {
+        let environment = ProcessInfo.processInfo.environment
+        if let configured = environment["SGIAN_HOLDER"], LeaseText.isValidHolder(configured) {
+            return configured
+        }
+        let user = environment["USER"].flatMap { $0.isEmpty ? nil : $0 } ?? NSUserName()
+        let host = ProcessInfo.processInfo.hostName.split(separator: ".").first.map(String.init) ?? "local"
+        let label = "\(user)@\(host)"
+        return LeaseText.isValidHolder(label) ? label : "operator"
+    }
+
+    func lease(for paneID: String) -> LeaseInfo? { leases[paneID] }
+
+    func isOwnLease(_ lease: LeaseInfo?) -> Bool { lease?.holder == holder }
+
+    /// Attributed input; falls back to the unattributed write against a daemon
+    /// that predates the lease capability (its serde error names the variant).
+    private func sendInput(_ chunk: String, to paneID: String, client: DaemonIPCClient) async throws {
+        if daemonSupportsLeases {
+            do {
+                let _: CommandOK = try await client.request([
+                    "command": .string("send_input_as"),
+                    "pane_id": .string(paneID),
+                    "input": .string(chunk),
+                    "holder": .string(holder),
+                ], as: CommandOK.self)
+                return
+            } catch {
+                guard error.localizedDescription.contains("unknown variant") else { throw error }
+                daemonSupportsLeases = false
+            }
+        }
+        let _: CommandOK = try await client.request([
+            "command": .string("write_to_pane"),
+            "pane_id": .string(paneID),
+            "data": .string(chunk),
+        ], as: CommandOK.self)
+    }
+
+    private func showLeaseNotice(paneID: String, refusal: String) {
+        leaseNotice = LeaseNotice(paneID: paneID, message: LeaseText.noticeText(for: refusal))
+        leaseNoticeTask?.cancel()
+        leaseNoticeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            self?.leaseNotice = nil
+        }
+    }
+
+    /// Take the selected (or given) pane's keyboard. Held by someone else, the
+    /// daemon refuses without force and the refusal opens the take dialog.
+    func takeLease(_ paneID: String? = nil, force: Bool = false, why: String? = nil) {
+        guard let paneID = paneID ?? selectedPaneID, panes.contains(where: { $0.id == paneID }) else { return }
+        perform(reportErrors: false) { client in
+            do {
+                var fields: [String: JSONValue] = [
+                    "command": .string("take_lease"),
+                    "pane_id": .string(paneID),
+                    "holder": .string(self.holder),
+                    "force": .bool(force),
+                ]
+                if let why { fields["why"] = .string(why) }
+                let info = try await client.request(fields, as: LeaseInfo.self)
+                self.applyLease(info, to: paneID)
+                self.leaseDialog = nil
+            } catch {
+                guard self.client === client else { return }
+                let message = error.localizedDescription
+                if !force, message.contains("--force") {
+                    self.leaseDialog = LeaseDialog(mode: .take(heldBy: self.leases[paneID]?.holder), paneID: paneID)
+                } else if self.leaseDialog != nil {
+                    self.leaseDialog?.error = message
+                } else {
+                    self.present(error)
+                }
+            }
+        }
+    }
+
+    func releaseLease(_ paneID: String, note: String) {
+        perform(reportErrors: false) { client in
+            do {
+                let info = try await client.request([
+                    "command": .string("release_lease"),
+                    "pane_id": .string(paneID),
+                    "holder": .string(self.holder),
+                    "note": .string(note),
+                ], as: LeaseInfo.self)
+                self.applyLease(info, to: paneID)
+                self.leaseDialog = nil
+            } catch {
+                guard self.client === client else { return }
+                if self.leaseDialog != nil {
+                    self.leaseDialog?.error = error.localizedDescription
+                } else {
+                    self.present(error)
+                }
+            }
+        }
+    }
+
+    func openReleaseDialog(_ paneID: String? = nil) {
+        guard let paneID = paneID ?? selectedPaneID, panes.contains(where: { $0.id == paneID }) else { return }
+        leaseDialog = LeaseDialog(mode: .release, paneID: paneID)
+    }
+
+    private func applyLease(_ info: LeaseInfo, to paneID: String) {
+        if info.holder != nil { leases[paneID] = info } else { leases.removeValue(forKey: paneID) }
+    }
+
     private func remove(_ paneID: String) {
         panes.removeAll { $0.id == paneID }
         paneStates.removeValue(forKey: paneID)
         agentStates.removeValue(forKey: paneID)
+        leases.removeValue(forKey: paneID)
         agentSpecs.removeValue(forKey: paneID)
         terminals.removeValue(forKey: paneID)
         chats.removeValue(forKey: paneID)
@@ -716,5 +848,41 @@ final class WorkspaceModel: ObservableObject {
             fputs("native UI smoke failed: \(error.localizedDescription)\n", stderr)
         }
         NSApplication.shared.terminate(nil)
+    }
+}
+
+
+struct LeaseNotice: Equatable {
+    let paneID: String
+    let message: String
+}
+
+struct LeaseDialog: Identifiable, Equatable {
+    enum Mode: Equatable {
+        case take(heldBy: String?)
+        case release
+    }
+
+    let mode: Mode
+    let paneID: String
+    var error: String?
+    var id: String { "\(paneID)-\(mode)" }
+}
+
+/// Pure helpers shared by the model and its tests.
+enum LeaseText {
+    /// Mirrors the daemon's holder rule: 1–64 bytes of printable ASCII, no whitespace.
+    static func isValidHolder(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 64 && value.unicodeScalars.allSatisfy { $0.isASCII && $0.value > 0x20 && $0.value < 0x7f }
+    }
+
+    static func noticeText(for refusal: String) -> String {
+        if let range = refusal.range(of: "held by ") {
+            let rest = refusal[range.upperBound...]
+            let name = rest.prefix { !$0.isWhitespace && $0 != "(" && $0 != ";" }
+            if !name.isEmpty { return "Read-only: keyboard held by \(name). ⇧⌘T to take it." }
+        }
+        if refusal.contains("unheld") { return "Read-only: take the keyboard (⇧⌘T) to type." }
+        return refusal
     }
 }

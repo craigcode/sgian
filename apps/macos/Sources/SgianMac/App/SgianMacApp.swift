@@ -48,6 +48,11 @@ struct SgianMacApp: App {
                 Button("Clear Scrollback") { model.clearSelectedTerminal() }
                     .keyboardShortcut("k", modifiers: .command)
                 Divider()
+                Button("Take Keyboard") { model.takeLease() }
+                    .keyboardShortcut("t", modifiers: [.command, .shift])
+                Button("Release Keyboard…") { model.openReleaseDialog() }
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
+                Divider()
                 Button("Close Pane") {
                     model.requestClose()
                 }

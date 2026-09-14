@@ -100,6 +100,18 @@ export function buildPaletteCommands(controller) {
       keywords: ["overview", "workspace", "panes", "session"],
       run: () => controller.openOverview(),
     },
+    {
+      id: "lease-take",
+      label: "Take keyboard for active pane",
+      keywords: ["lease", "keyboard", "take", "hold", "takeover"],
+      run: () => void controller.takeLease(state.activePaneId),
+    },
+    {
+      id: "lease-release",
+      label: "Release keyboard (with hand-back note)",
+      keywords: ["lease", "keyboard", "release", "note", "hand back"],
+      run: () => controller.openReleaseDialog(state.activePaneId),
+    },
   ];
 
   if (typeof controller.focusNextAttentionPane === "function") {

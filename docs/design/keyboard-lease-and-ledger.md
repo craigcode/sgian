@@ -194,11 +194,14 @@ requests, event, snapshot field, persistence, ledger writer and verifier,
 tests. Demo: two `ctl` holders contend for one pane; `ctl ledger --verify`
 passes; flip one byte and it names the line.
 
-**M2 — clients.** All three clients send their holder label with every
-write and show the lease in the pane header: hollow cursor and a one-line
-"held by H" toast when a keystroke is refused; take on first keystroke with a
-confirm; release opens the note field; empty note cannot submit. Window title
-carries "needs input" so it shows in the Dock and taskbar.
+**M2 — clients (shipped 2026-09-14).** All three clients send their holder
+label with every write and show the lease in the pane header; a refused
+keystroke shows a one-line "held by H" notice; take opens a why prompt only
+when someone else holds the pane; release opens the note field and an empty
+note cannot submit. Shortcuts are `Ctrl/Cmd+Shift+T` (take) and
+`Ctrl/Cmd+Shift+L` (release): the draft's `Ctrl-Shift-R` is already rename.
+Deferred from the draft: the hollow read-only cursor, take-on-first-keystroke,
+and the "needs input" window title.
 
 **M3 — official agent signals before heuristics.** Claude Code's
 `claude agents --json` (`state`, `status`, `waitingFor`) and the Notification

@@ -106,6 +106,11 @@ public sealed record WorkspaceSnapshot
     [JsonPropertyName("agent_specs")]
     public IReadOnlyDictionary<string, AgentPaneSpec> AgentSpecs { get; init; }
         = new Dictionary<string, AgentPaneSpec>();
+
+    /// <summary>Held keyboard leases only; absent from pre-lease daemons.</summary>
+    [JsonPropertyName("leases")]
+    public IReadOnlyDictionary<string, LeaseInfo> Leases { get; init; }
+        = new Dictionary<string, LeaseInfo>();
 }
 
 public sealed record CommandOk

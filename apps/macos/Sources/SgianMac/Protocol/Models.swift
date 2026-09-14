@@ -46,6 +46,44 @@ struct AgentPaneInfo: Codable, Equatable, Sendable {
     var attention: AgentAttention?
 }
 
+/// A pane's keyboard lease (docs/design/keyboard-lease-and-ledger.md).
+/// `holder == nil` means unheld.
+struct LeaseInfo: Codable, Equatable, Sendable {
+    var holder: String?
+    var sinceMs: UInt64?
+
+    enum CodingKeys: String, CodingKey {
+        case holder
+        case sinceMs = "since_ms"
+    }
+
+    init(holder: String?, sinceMs: UInt64? = nil) {
+        self.holder = holder
+        self.sinceMs = sinceMs
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        holder = try container.decodeIfPresent(String.self, forKey: .holder)
+        sinceMs = try container.decodeIfPresent(UInt64.self, forKey: .sinceMs)
+    }
+
+    /// Fold one `lease_state` event into the held-pane map: `taken` records the
+    /// holder, `released`/`revoked` clear it. Returns false for a malformed event.
+    @discardableResult
+    static func apply(event: JSONValue, to leases: inout [String: LeaseInfo]) -> Bool {
+        guard let paneID = event["pane_id"]?.stringValue,
+              let transition = event["transition"]?.stringValue
+        else { return false }
+        if transition == "taken", let holder = event["holder"]?.stringValue, !holder.isEmpty {
+            leases[paneID] = LeaseInfo(holder: holder, sinceMs: event["since_ms"]?.numberValue.map { UInt64($0) })
+        } else {
+            leases.removeValue(forKey: paneID)
+        }
+        return true
+    }
+}
+
 struct PaneSize: Codable, Equatable, Sendable {
     var cols: Int
     var rows: Int
@@ -62,9 +100,11 @@ struct WorkspaceSnapshot: Codable, Sendable {
     var agentStates: [String: AgentPaneInfo]
     var agentEvents: [String: [JSONValue]]
     var agentSpecs: [String: AgentPaneSpec]
+    /// Held keyboard leases only; absent from pre-lease daemons.
+    var leases: [String: LeaseInfo]
 
     enum CodingKeys: String, CodingKey {
-        case panes, cwd, layout, scrollback, sizes
+        case panes, cwd, layout, scrollback, sizes, leases
         case activePaneID = "active_pane_id"
         case paneStates = "pane_states"
         case agentStates = "agent_states"
@@ -84,6 +124,7 @@ struct WorkspaceSnapshot: Codable, Sendable {
         agentStates = try container.decodeIfPresent([String: AgentPaneInfo].self, forKey: .agentStates) ?? [:]
         agentEvents = try container.decodeIfPresent([String: [JSONValue]].self, forKey: .agentEvents) ?? [:]
         agentSpecs = try container.decodeIfPresent([String: AgentPaneSpec].self, forKey: .agentSpecs) ?? [:]
+        leases = try container.decodeIfPresent([String: LeaseInfo].self, forKey: .leases) ?? [:]
     }
 }
 

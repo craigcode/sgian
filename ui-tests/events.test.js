@@ -9,6 +9,9 @@ import {
   handlePaneRenamed,
   handleAgentState,
   handleAgentEvent,
+  handleLeaseState,
+  normalizeLeaseInfo,
+  leaseEquals,
   normalizeAgentState,
   agentStateEquals,
   setPaneRuntimeState,
@@ -22,6 +25,7 @@ function makeState(panes = [], opts = {}) {
     panes: new Map(panes.map((p) => [p.id, p])),
     paneStates: new Map(opts.paneStates || []),
     agentStates: new Map(opts.agentStates || []),
+    leases: new Map(opts.leases || []),
     chats: new Map(opts.chats || []),
     activePaneId: opts.activePaneId || panes[0]?.id || null,
     layout: opts.layout || null,
@@ -535,5 +539,61 @@ describe("handlePaneClosed chat cleanup", () => {
     handlePaneClosed(state, { pane_id: "a" }, cb);
     expect(state.chats.has("a")).toBe(false);
     expect(disposed).toEqual(["a"]);
+  });
+});
+
+describe("keyboard lease events", () => {
+  it("normalizes held and unheld lease payloads", () => {
+    expect(normalizeLeaseInfo({ holder: "bob", since_ms: 5 })).toEqual({ holder: "bob", sinceMs: 5 });
+    expect(normalizeLeaseInfo({ holder: "bob" })).toEqual({ holder: "bob", sinceMs: null });
+    expect(normalizeLeaseInfo({ holder: null })).toBeNull();
+    expect(normalizeLeaseInfo(undefined)).toBeNull();
+    expect(leaseEquals({ holder: "a", sinceMs: 1 }, { holder: "a", sinceMs: 1 })).toBe(true);
+    expect(leaseEquals({ holder: "a", sinceMs: 1 }, { holder: "a", sinceMs: 2 })).toBe(false);
+    expect(leaseEquals(null, null)).toBe(true);
+  });
+
+  it("records a taken lease and clears it on release or revoke", () => {
+    const state = makeState([{ id: "pane-1" }]);
+    const callbacks = makeCallbacks();
+    handleLeaseState(
+      state,
+      { pane_id: "pane-1", transition: "taken", holder: "bob", since_ms: 9 },
+      callbacks,
+    );
+    expect(state.leases.get("pane-1")).toEqual({ holder: "bob", sinceMs: 9 });
+    expect(callbacks.calls.render).toBe(1);
+    handleLeaseState(
+      state,
+      { pane_id: "pane-1", transition: "taken", holder: "bob", since_ms: 9 },
+      callbacks,
+    );
+    expect(callbacks.calls.render).toBe(1);
+    handleLeaseState(
+      state,
+      { pane_id: "pane-1", transition: "released", holder: null, note: "done" },
+      callbacks,
+    );
+    expect(state.leases.has("pane-1")).toBe(false);
+    expect(callbacks.calls.render).toBe(2);
+    handleLeaseState(
+      state,
+      { pane_id: "pane-1", transition: "taken", holder: "amy", since_ms: 10 },
+      callbacks,
+    );
+    handleLeaseState(state, { pane_id: "pane-1", transition: "revoked", holder: null }, callbacks);
+    expect(state.leases.has("pane-1")).toBe(false);
+  });
+
+  it("ignores lease events for unknown panes", () => {
+    const state = makeState([{ id: "pane-1" }]);
+    const callbacks = makeCallbacks();
+    handleLeaseState(
+      state,
+      { pane_id: "pane-9", transition: "taken", holder: "bob", since_ms: 1 },
+      callbacks,
+    );
+    expect(state.leases.size).toBe(0);
+    expect(callbacks.calls.render).toBe(0);
   });
 });

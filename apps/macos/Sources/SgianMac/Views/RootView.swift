@@ -15,6 +15,7 @@ struct RootView: View {
         .toolbar { toolbar }
         .task { model.start() }
         .sheet(isPresented: $model.showingCommands) { NativeCommandPalette(model: model) }
+        .sheet(item: $model.leaseDialog) { dialog in LeaseDialogView(model: model, dialog: dialog) }
         .confirmationDialog("Close pane?", isPresented: Binding(
             get: { model.panePendingClose != nil },
             set: { if !$0 { model.panePendingClose = nil } }
@@ -99,6 +100,14 @@ struct PaneHeader: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if let lease = model.lease(for: pane.id), let holder = lease.holder {
+                let mine = model.isOwnLease(lease)
+                Label(mine ? "you" : holder, systemImage: "keyboard")
+                    .font(.caption)
+                    .foregroundStyle(mine ? Color.green : Color.orange)
+                    .help(mine ? "You hold this pane's keyboard" : "Keyboard held by \(holder)")
+                    .accessibilityIdentifier("lease-badge")
+            }
             Spacer()
             Button { model.select(pane.id); model.toggleZoom() } label: {
                 Image(systemName: model.zoomed ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
@@ -159,5 +168,65 @@ private struct EmptyWorkspaceView: View {
         case let .failed(message): message
         case .disconnected: "A native workspace for terminals and coding agents."
         }
+    }
+}
+
+
+/// Keyboard lease dialog (docs/design/keyboard-lease-and-ledger.md §6 M2):
+/// `.release` asks for the mandatory hand-back note, `.take` for the reason
+/// when someone else holds the pane. An empty field cannot submit.
+struct LeaseDialogView: View {
+    @ObservedObject var model: WorkspaceModel
+    let dialog: LeaseDialog
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    private var isRelease: Bool { dialog.mode == .release }
+    private var paneName: String { model.panes.first { $0.id == dialog.paneID }?.title ?? dialog.paneID }
+    private var trimmed: String { text.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title).font(.headline)
+            Text(prompt).font(.callout).foregroundStyle(.secondary)
+            TextEditor(text: $text)
+                .font(.body)
+                .frame(minHeight: isRelease ? 96 : 56)
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.3)))
+                .focused($focused)
+                .accessibilityIdentifier("lease-text")
+            if let error = model.leaseDialog?.error {
+                Text(error).font(.caption).foregroundStyle(.orange)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { model.leaseDialog = nil }.keyboardShortcut(.cancelAction)
+                Button(isRelease ? "Release Keyboard" : "Take Keyboard", action: submit)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(trimmed.isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+        .onAppear { focused = true }
+    }
+
+    private var title: String {
+        switch dialog.mode {
+        case .release: "Hand back the keyboard for \(paneName)"
+        case let .take(heldBy): "Take the keyboard for \(paneName) from \(heldBy ?? "its holder")"
+        }
+    }
+
+    private var prompt: String {
+        isRelease
+            ? "Hand-back note (required): what you did and what the agent should do next. It is recorded in the pane's ledger."
+            : "Why are you taking it over? (required, recorded in the ledger)"
+    }
+
+    private func submit() {
+        guard !trimmed.isEmpty else { return }
+        if isRelease { model.releaseLease(dialog.paneID, note: trimmed) }
+        else { model.takeLease(dialog.paneID, force: true, why: trimmed) }
     }
 }

@@ -55,6 +55,8 @@ class FakeResizeObserver {
 function createHarness({
   panes = [{ id: "pane-a", title: "term-a", kind: "shell", created_at_ms: 1 }],
   activePaneId = panes[0]?.id ?? null,
+  leases = {},
+  writeError = null,
 } = {}) {
   const listeners = new Map();
   const unlisten = vi.fn();
@@ -72,8 +74,15 @@ function createHarness({
         ),
         agent_states: {},
         agent_events: {},
+        leases,
       };
     }
+    if (command === "client_holder") return "me@test";
+    if (command === "write_to_pane" && writeError) throw new Error(writeError);
+    if (command === "take_lease") {
+      return { pane_id: "pane-a", holder: "me@test", since_ms: 1 };
+    }
+    if (command === "release_lease") return { pane_id: "pane-a", holder: null };
     if (command === "get_config") return { font_size: 13 };
     if (command === "ui_smoke_enabled") return false;
     if (command === "create_pane") {
@@ -414,5 +423,110 @@ describe("React application instances", () => {
     );
     await controller.restartPane("pane-shell");
     expect(controller.state.bootStatus).toBe("terminal engine unavailable");
+  });
+});
+
+describe("keyboard lease UI", () => {
+  it("shows the holder badge from the bootstrap snapshot and clears it on release", async () => {
+    const { controller, listeners } = createHarness({
+      leases: { "pane-a": { holder: "bob", since_ms: 1 } },
+    });
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    const badge = view.container.querySelector('.lease-badge[data-holder="bob"]');
+    expect(badge).toBeTruthy();
+    expect(badge.textContent).toContain("bob");
+
+    listeners.get("lease-state")({
+      payload: { pane_id: "pane-a", transition: "released", holder: null, note: "done" },
+    });
+    await waitFor(() => expect(view.container.querySelector(".lease-badge")).toBeNull());
+    view.unmount();
+  });
+
+  it("labels the client's own lease as you", async () => {
+    const { controller, listeners } = createHarness();
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    await waitFor(() => expect(controller.state.holder).toBe("me@test"));
+    listeners.get("lease-state")({
+      payload: { pane_id: "pane-a", transition: "taken", holder: "me@test", since_ms: 2 },
+    });
+    await waitFor(() =>
+      expect(view.container.querySelector(".lease-badge-mine")?.textContent).toContain("you"),
+    );
+    view.unmount();
+  });
+
+  it("turns a refused keystroke into a toast, not terminal output", async () => {
+    const { controller } = createHarness({
+      writeError: "pane keyboard is held by bob (pane-a)",
+    });
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    const terminal = FakeTerminal.instances.find((instance) => !instance.disposed);
+    terminal.onDataCallback("x");
+    await waitFor(() => expect(view.container.querySelector(".lease-toast")).toBeTruthy());
+    expect(view.container.querySelector(".lease-toast").textContent).toContain("held by bob");
+    expect(controller.state.terminalBuffers.get("pane-a") || "").not.toContain("failed to write");
+    view.unmount();
+  });
+
+  it("requires a note to release and sends it to the backend", async () => {
+    const user = userEvent.setup();
+    const { controller, invoke } = createHarness();
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    controller.openReleaseDialog("pane-a");
+    await waitFor(() => expect(view.getByRole("dialog")).toBeTruthy());
+    const submit = view.getByRole("button", { name: "Release keyboard" });
+    expect(submit.disabled).toBe(true);
+    await user.type(view.getByLabelText(/Hand-back note/), "answered the prompt");
+    expect(submit.disabled).toBe(false);
+    await user.click(submit);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("release_lease", {
+        paneId: "pane-a",
+        note: "answered the prompt",
+      }),
+    );
+    await waitFor(() => expect(controller.state.leaseDialog).toBeNull());
+    view.unmount();
+  });
+
+  it("opens the take dialog when the daemon asks for --force", async () => {
+    const user = userEvent.setup();
+    const { controller, invoke } = createHarness({
+      leases: { "pane-a": { holder: "bob", since_ms: 1 } },
+    });
+    invoke.mockImplementationOnce(async () => ({
+      panes: [{ id: "pane-a", title: "term-a", kind: "shell", created_at_ms: 1 }],
+      pane_states: { "pane-a": "live" },
+      active_pane_id: "pane-a",
+      cwd: "/workspace/fresh",
+      layout: null,
+      scrollback: { "pane-a": "" },
+      agent_states: {},
+      agent_events: {},
+      leases: { "pane-a": { holder: "bob", since_ms: 1 } },
+    }));
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    invoke.mockImplementationOnce(async () => {
+      throw new Error("pane keyboard is held by bob; use --force --why REASON to revoke it");
+    });
+    await controller.takeLease("pane-a");
+    await waitFor(() => expect(view.getByRole("dialog")).toBeTruthy());
+    expect(view.getByRole("dialog").textContent).toContain("from bob");
+    await user.type(view.getByLabelText(/Why are you taking/), "bob is away");
+    await user.click(view.getByRole("button", { name: "Take keyboard" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("take_lease", {
+        paneId: "pane-a",
+        force: true,
+        why: "bob is away",
+      }),
+    );
+    view.unmount();
   });
 });

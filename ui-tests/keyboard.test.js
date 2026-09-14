@@ -272,3 +272,15 @@ describe("resolveKeyAction", () => {
     ).toEqual({ type: "split", direction: "row" });
   });
 });
+
+describe("keyboard lease chords", () => {
+  it("maps mod+Shift+T to lease-take and mod+Shift+L to lease-release", () => {
+    expect(resolveKeyAction(makeEvent({ ctrlKey: true, shiftKey: true, key: "T" }))).toEqual({
+      type: "lease-take",
+    });
+    expect(resolveKeyAction(makeEvent({ metaKey: true, shiftKey: true, key: "l" }))).toEqual({
+      type: "lease-release",
+    });
+    expect(resolveKeyAction(makeEvent({ ctrlKey: true, key: "t" }))).toBeNull();
+  });
+});

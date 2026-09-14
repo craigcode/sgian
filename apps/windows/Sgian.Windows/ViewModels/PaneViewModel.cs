@@ -7,6 +7,8 @@ public sealed class PaneViewModel : ObservableObject
     private string _title;
     private string _state = "live";
     private string? _attention;
+    private string? _leaseHolder;
+    private bool _leaseIsMine;
     private AgentPaneSpec? _agentSpec;
 
     public PaneViewModel(Pane pane)
@@ -53,6 +55,37 @@ public sealed class PaneViewModel : ObservableObject
         }
     }
 
+    /// <summary>Who holds this pane's keyboard, or null when unheld.</summary>
+    public string? LeaseHolder
+    {
+        get => _leaseHolder;
+        set
+        {
+            if (Set(ref _leaseHolder, value))
+            {
+                Raise(nameof(Subtitle));
+                Raise(nameof(LeaseLabel));
+            }
+        }
+    }
+
+    public bool LeaseIsMine
+    {
+        get => _leaseIsMine;
+        set
+        {
+            if (Set(ref _leaseIsMine, value))
+            {
+                Raise(nameof(Subtitle));
+                Raise(nameof(LeaseLabel));
+            }
+        }
+    }
+
+    /// <summary>"⌨ you" / "⌨ holder", or empty when the pane is unheld.</summary>
+    public string LeaseLabel =>
+        LeaseHolder is null ? "" : $"\u2328 {(LeaseIsMine ? "you" : LeaseHolder)}";
+
     public AgentPaneSpec? AgentSpec
     {
         get => _agentSpec;
@@ -69,19 +102,20 @@ public sealed class PaneViewModel : ObservableObject
     {
         get
         {
+            var lease = LeaseHolder is null ? "" : $" · {LeaseLabel}";
             if (State == "ended")
             {
-                return "Ended";
+                return "Ended" + lease;
             }
             if (!IsAgent)
             {
-                return Attention is null ? "Terminal" : $"Terminal · {Attention.Replace('_', ' ')}";
+                return (Attention is null ? "Terminal" : $"Terminal · {Attention.Replace('_', ' ')}") + lease;
             }
             var identity = AgentSpec is null
                 ? "Agent"
                 : string.Join(" · ", new[] { AgentSpec.Backend, AgentSpec.Model }
                     .Where(value => !string.IsNullOrWhiteSpace(value)));
-            return Attention is null ? identity : $"{identity} · {Attention.Replace('_', ' ')}";
+            return (Attention is null ? identity : $"{identity} · {Attention.Replace('_', ' ')}") + lease;
         }
     }
 }

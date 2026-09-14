@@ -81,11 +81,20 @@ Shipped (M1, 2026-09-13):
 - **ctl surface**: `lease`, `lease take`, `lease release -m`, `ledger`,
   `send --as`.
 
+Shipped (M2, 2026-09-14):
+
+- **Clients.** All three clients write as `user@host` (the `ctl` default, so
+  the operator is one principal across surfaces) via `send_input_as`, with a
+  fallback to `write_to_pane` against a pre-lease daemon. The pane header
+  shows the holder (`you` when it is this client), a refused keystroke shows a
+  transient read-only notice instead of an error, `Ctrl/Cmd+Shift+T` takes
+  (opening a why prompt when someone else holds it) and `Ctrl/Cmd+Shift+L`
+  releases with a mandatory note. Tauri: vitest; macOS: `swift test` plus the
+  live daemon round trip; Windows: compiled and exercised only by the Windows
+  CI job (no .NET toolchain on the development Mac).
+
 Open, in order:
 
-- **M2 clients.** All three clients send a holder label, render the holder in
-  the pane header, refuse-with-toast on held panes, and open the note field
-  on release.
 - **M3 official agent signals.** Prefer `claude agents --json` and the
   Notification hook over screen classification; ledger `attention.changed`;
   `ctl agent --watch --json`; relay to Kranz's hook-status lane.

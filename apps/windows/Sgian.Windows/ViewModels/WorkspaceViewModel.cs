@@ -21,6 +21,15 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     private double _terminalFontSize;
     private Guid _generation;
     private CancellationTokenSource? _layoutSaveCancellation;
+    private string? _leaseNotice;
+    private CancellationTokenSource? _leaseNoticeCancellation;
+    /// <summary>
+    /// False once the daemon rejected <c>send_input_as</c> (a pre-lease daemon);
+    /// input then falls back to the unattributed <c>write_to_pane</c>.
+    /// </summary>
+    private bool _daemonSupportsLeases = true;
+    /// <summary>The holder label this client writes and takes leases as (docs/design/keyboard-lease-and-ledger.md).</summary>
+    public string Holder { get; } = LeaseState.DefaultHolder();
     public PaneLayout? Layout { get; private set; }
     public bool Zoomed { get; private set; }
     public string PermissionMode { get; private set; } = "manual";
@@ -60,6 +69,13 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     {
         get => _status;
         private set => Set(ref _status, value);
+    }
+
+    /// <summary>A transient "read-only: held by …" notice after a refused keystroke.</summary>
+    public string? LeaseNotice
+    {
+        get => _leaseNotice;
+        private set => Set(ref _leaseNotice, value);
     }
 
     public string? ErrorMessage
@@ -262,8 +278,113 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     public async Task WriteTerminalAsync(string paneId, string data)
     {
         if (_client is null || data.Length == 0) return;
-        await RunRequestAsync(() => _client.RequestAsync<CommandOk>(Request(
-            ("command", "write_to_pane"), ("pane_id", paneId), ("data", data))));
+        var generation = _generation;
+        try
+        {
+            await SendInputAsync(paneId, data);
+        }
+        catch (Exception error) when (generation == _generation)
+        {
+            // A lease refusal is per keystroke and expected: a transient notice,
+            // not the error bar (docs/design/keyboard-lease-and-ledger.md §6 M2).
+            if (LeaseState.IsRefusal(error.Message)) ShowLeaseNotice(LeaseState.NoticeText(error.Message));
+            else ErrorMessage = error.Message;
+        }
+    }
+
+    /// <summary>Attributed input, falling back to the unattributed write against a pre-lease daemon.</summary>
+    private async Task SendInputAsync(string paneId, string data)
+    {
+        if (_client is null) return;
+        if (_daemonSupportsLeases)
+        {
+            try
+            {
+                await _client.RequestAsync<CommandOk>(Request(
+                    ("command", "send_input_as"), ("pane_id", paneId), ("input", data), ("holder", Holder)));
+                return;
+            }
+            catch (Exception error) when (LeaseState.IsUnsupported(error.Message))
+            {
+                _daemonSupportsLeases = false;
+            }
+        }
+        await _client.RequestAsync<CommandOk>(Request(
+            ("command", "write_to_pane"), ("pane_id", paneId), ("data", data)));
+    }
+
+    private void ShowLeaseNotice(string message)
+    {
+        LeaseNotice = message;
+        _leaseNoticeCancellation?.Cancel();
+        var cancellation = new CancellationTokenSource();
+        _leaseNoticeCancellation = cancellation;
+        _ = ClearLeaseNoticeLaterAsync(cancellation.Token);
+    }
+
+    private async Task ClearLeaseNoticeLaterAsync(CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(3), token);
+            LeaseNotice = null;
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    public enum LeaseOutcome { Applied, NeedsForce, Failed }
+
+    /// <summary>
+    /// Take a pane's keyboard. Unheld or already ours, the daemon answers at once;
+    /// held by someone else, it refuses without force and the caller asks for a why.
+    /// </summary>
+    public async Task<LeaseOutcome> TakeLeaseAsync(PaneViewModel pane, bool force = false, string? why = null)
+    {
+        if (_client is null) return LeaseOutcome.Failed;
+        var generation = _generation;
+        try
+        {
+            var request = Request(("command", "take_lease"), ("pane_id", pane.Id), ("holder", Holder), ("force", force));
+            if (why is not null) request["why"] = why;
+            var info = await _client.RequestAsync<LeaseInfo>(request);
+            if (generation != _generation) return LeaseOutcome.Failed;
+            ApplyLease(pane, info);
+            return LeaseOutcome.Applied;
+        }
+        catch (Exception error)
+        {
+            if (generation != _generation) return LeaseOutcome.Failed;
+            if (!force && LeaseState.NeedsForce(error.Message)) return LeaseOutcome.NeedsForce;
+            ErrorMessage = error.Message;
+            return LeaseOutcome.Failed;
+        }
+    }
+
+    public async Task<bool> ReleaseLeaseAsync(PaneViewModel pane, string note)
+    {
+        if (_client is null) return false;
+        var generation = _generation;
+        try
+        {
+            var info = await _client.RequestAsync<LeaseInfo>(Request(
+                ("command", "release_lease"), ("pane_id", pane.Id), ("holder", Holder), ("note", note)));
+            if (generation != _generation) return false;
+            ApplyLease(pane, info);
+            return true;
+        }
+        catch (Exception error)
+        {
+            if (generation == _generation) ErrorMessage = error.Message;
+            return false;
+        }
+    }
+
+    private void ApplyLease(PaneViewModel pane, LeaseInfo? info)
+    {
+        pane.LeaseHolder = info?.IsHeld == true ? info.Holder : null;
+        pane.LeaseIsMine = pane.LeaseHolder is not null && pane.LeaseHolder == Holder;
     }
 
     public async Task ResizeTerminalAsync(string paneId, ushort columns, ushort rows)
@@ -399,6 +520,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                 ? info.Attention
                 : null;
             item.AgentSpec = snapshot.AgentSpecs.TryGetValue(pane.Id, out var spec) ? spec : null;
+            ApplyLease(item, snapshot.Leases.TryGetValue(pane.Id, out var lease) ? lease : null);
             if (pane.Kind == "agent")
             {
                 var chat = ChatFor(pane.Id);
@@ -467,6 +589,16 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             case "agent_state":
                 var statePane = Panes.FirstOrDefault(pane => pane.Id == item.String("pane_id"));
                 if (statePane is not null) statePane.Attention = item.String("attention");
+                break;
+            case "lease_state":
+                var leaseMap = new Dictionary<string, LeaseInfo>(StringComparer.Ordinal);
+                var leasePaneId = LeaseState.Apply(item.Payload, leaseMap);
+                var leasePane = leasePaneId is null ? null : Panes.FirstOrDefault(pane => pane.Id == leasePaneId);
+                if (leasePane is not null)
+                {
+                    ApplyLease(leasePane, leaseMap.GetValueOrDefault(leasePaneId!));
+                    WorkspaceChanged?.Invoke(this, EventArgs.Empty);
+                }
                 break;
             case "agent_event":
                 var agentId = item.String("pane_id");

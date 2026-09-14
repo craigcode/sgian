@@ -225,3 +225,34 @@ func daemonRoundTrip() async throws {
     )
     #expect(stopped.ok)
 }
+
+
+@Test func workspaceSnapshotDecodesHeldLeasesAndToleratesTheirAbsence() throws {
+    let with = try JSONDecoder().decode(WorkspaceSnapshot.self, from: Data(#"{"panes":[],"cwd":"/w","leases":{"pane-1":{"holder":"bob","since_ms":42}}}"#.utf8))
+    #expect(with.leases["pane-1"] == LeaseInfo(holder: "bob", sinceMs: 42))
+    let without = try JSONDecoder().decode(WorkspaceSnapshot.self, from: Data(#"{"panes":[],"cwd":"/w"}"#.utf8))
+    #expect(without.leases.isEmpty)
+}
+
+@Test func leaseStateEventsFoldIntoTheHeldPaneMap() throws {
+    var leases: [String: LeaseInfo] = [:]
+    let taken = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"lease_state","pane_id":"pane-1","transition":"taken","holder":"amy","since_ms":7}"#.utf8))
+    #expect(LeaseInfo.apply(event: taken, to: &leases))
+    #expect(leases["pane-1"] == LeaseInfo(holder: "amy", sinceMs: 7))
+    let released = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"lease_state","pane_id":"pane-1","transition":"released","holder":null,"note":"done"}"#.utf8))
+    #expect(LeaseInfo.apply(event: released, to: &leases))
+    #expect(leases.isEmpty)
+    let malformed = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"lease_state"}"#.utf8))
+    #expect(LeaseInfo.apply(event: malformed, to: &leases) == false)
+}
+
+@Test func leaseTextHelpersMatchTheDaemonRules() {
+    #expect(LeaseText.isValidHolder("craig@mbp"))
+    #expect(!LeaseText.isValidHolder("two words"))
+    #expect(!LeaseText.isValidHolder(""))
+    #expect(!LeaseText.isValidHolder(String(repeating: "x", count: 65)))
+    #expect(LeaseText.noticeText(for: "pane keyboard is held by bob (pane-2)") == "Read-only: keyboard held by bob. ⇧⌘T to take it.")
+    #expect(LeaseText.noticeText(for: "pane keyboard is unheld and lease_policy is required; take it first (pane-2)").contains("take the keyboard"))
+    let holder = WorkspaceModel.defaultHolder()
+    #expect(LeaseText.isValidHolder(holder))
+}

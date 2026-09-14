@@ -29,6 +29,9 @@ import {
   handlePaneRenamed,
   handleAgentState,
   handleAgentEvent,
+  handleLeaseState,
+  normalizeLeaseInfo,
+  leaseEquals,
 } from "./events.js";
 import {
   createAgentChat,
@@ -65,6 +68,7 @@ import {
 import { getTauriInvoke, getTauriListen, withTimeout } from "./tauri.js";
 import { capBufferedOutput, createTerminalController } from "./terminal-controller.js";
 
+const LEASE_TOAST_MS = 3000;
 const BOOTSTRAP_TIMEOUT_MS = 15_000;
 const SEND_AGENT_MESSAGE_TIMEOUT_MS = 60_000;
 const RESYNC_INTERVAL_MS = 30_000;
@@ -87,6 +91,13 @@ function initialState() {
     panes: new Map([[pane.id, pane]]),
     paneStates: new Map([[pane.id, "live"]]),
     agentStates: new Map(),
+    // Keyboard leases (docs/design/keyboard-lease-and-ledger.md): pane_id →
+    // { holder, sinceMs } for HELD panes only. `holder` is this client's own
+    // label (from the backend) so the badge can say "you".
+    leases: new Map(),
+    holder: null,
+    leaseToast: null,
+    leaseDialog: null,
     agentSpecs: new Map(),
     newAgentBackend: "claude",
     newAgentModel: "",
@@ -142,6 +153,7 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
   let resyncTimer = null;
   let resyncInFlight = false;
   let reconcileTimer = null;
+  let leaseToastTimer = null;
   let pendingLocalCreates = 0;
   let layoutPersistFailures = 0;
   const activeSync = { inFlight: false, pending: null };
@@ -204,6 +216,13 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     }
     if (command === "write_to_pane") terminals.append(args.paneId, args.data);
     if (command === "get_config") return null;
+    if (command === "client_holder") return "you";
+    if (command === "take_lease") {
+      return { pane_id: args.paneId, holder: "you", since_ms: Date.now() };
+    }
+    if (command === "release_lease" || command === "lease_status") {
+      return { pane_id: args.paneId, holder: null };
+    }
     const accepted = new Set([
       "send_agent_message",
       "agent_approval",
@@ -479,6 +498,16 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
       changed = true;
     }
 
+    const snapshotLeases = snapshot.leases || {};
+    for (const paneId of snapshotIds) {
+      const next = normalizeLeaseInfo(snapshotLeases[paneId]);
+      const existing = state.leases.get(paneId) ?? null;
+      if (leaseEquals(existing, next)) continue;
+      if (next) state.leases.set(paneId, next);
+      else state.leases.delete(paneId);
+      changed = true;
+    }
+
     const snapshotAgentSpecs = snapshot.agent_specs || {};
     for (const paneId of snapshotIds) {
       const pane = state.panes.get(paneId);
@@ -630,6 +659,7 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
       : "terminal engine unavailable";
     state.booted = true;
     await loadAppearanceConfig();
+    void loadClientHolder();
     notify();
     void persistWorkspaceLayout();
     for (const pane of snapshot.panes || []) {
@@ -900,6 +930,7 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     state.panes.delete(paneId);
     state.paneStates.delete(paneId);
     state.agentStates.delete(paneId);
+    state.leases.delete(paneId);
     state.agentSpecs.delete(paneId);
     state.lastActivityMs.delete(paneId);
     state.layout = pruneLeaf(state.layout, paneId);
@@ -967,6 +998,114 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
   function touchLastActivity(paneId) {
     if (!paneId || !state.panes.has(paneId)) return;
     state.lastActivityMs.set(paneId, Date.now());
+  }
+
+  // ----- Keyboard lease (docs/design/keyboard-lease-and-ledger.md) -----
+
+  async function loadClientHolder() {
+    try {
+      const holder = await invokeWithTimeout("client_holder", {});
+      if (typeof holder === "string" && holder) {
+        state.holder = holder;
+        notify();
+      }
+    } catch {
+      // The badge falls back to the raw holder label; nothing else depends on it.
+    }
+  }
+
+  function leaseToastText(message) {
+    const held = /held by ([^\s(]+)/.exec(message);
+    if (held) return `Read-only: keyboard held by ${held[1]}. Ctrl/Cmd+Shift+T to take it.`;
+    if (message.includes("unheld")) {
+      return "Read-only: take the keyboard (Ctrl/Cmd+Shift+T) to type.";
+    }
+    return message;
+  }
+
+  function showLeaseToast(paneId, message) {
+    state.leaseToast = { paneId, message: leaseToastText(message) };
+    notify();
+    if (leaseToastTimer) window.clearTimeout(leaseToastTimer);
+    leaseToastTimer = window.setTimeout(() => {
+      leaseToastTimer = null;
+      state.leaseToast = null;
+      notify();
+    }, LEASE_TOAST_MS);
+  }
+
+  function applyLeaseInfo(paneId, info) {
+    const next = normalizeLeaseInfo(info);
+    if (next) state.leases.set(paneId, next);
+    else state.leases.delete(paneId);
+  }
+
+  function leaseFor(paneId) {
+    return state.leases.get(paneId) ?? null;
+  }
+
+  /**
+   * Take the active (or given) pane's keyboard. Unheld or already ours: the
+   * daemon answers immediately. Held by someone else: the daemon refuses
+   * without --force, and the refusal opens the take dialog asking for a why.
+   */
+  async function takeLease(paneId = state.activePaneId, { force = false, why = null } = {}) {
+    if (!paneId || !state.panes.has(paneId)) return;
+    try {
+      const info = await invokeWithTimeout("take_lease", { paneId, force, why });
+      applyLeaseInfo(paneId, info);
+      state.leaseDialog = null;
+      notify();
+      focusActiveSurface();
+    } catch (error) {
+      const message = formatError(error);
+      if (!force && message.includes("--force")) {
+        state.leaseDialog = {
+          mode: "take",
+          paneId,
+          heldBy: leaseFor(paneId)?.holder ?? null,
+          error: null,
+        };
+        notify();
+        return;
+      }
+      if (state.leaseDialog) {
+        state.leaseDialog = { ...state.leaseDialog, error: message };
+        notify();
+      } else {
+        showLeaseToast(paneId, message);
+      }
+    }
+  }
+
+  async function releaseLease(paneId, note) {
+    if (!paneId) return;
+    try {
+      const info = await invokeWithTimeout("release_lease", { paneId, note });
+      applyLeaseInfo(paneId, info);
+      state.leaseDialog = null;
+      notify();
+      focusActiveSurface();
+    } catch (error) {
+      state.leaseDialog = {
+        ...(state.leaseDialog || { mode: "release", paneId }),
+        error: formatError(error),
+      };
+      notify();
+    }
+  }
+
+  function openReleaseDialog(paneId = state.activePaneId) {
+    if (!paneId || !state.panes.has(paneId)) return;
+    state.leaseDialog = { mode: "release", paneId, error: null };
+    notify();
+  }
+
+  function closeLeaseDialog() {
+    if (!state.leaseDialog) return;
+    state.leaseDialog = null;
+    notify();
+    focusActiveSurface();
   }
 
   function attentionPaneIds() {
@@ -1039,13 +1178,20 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     try {
       await invokeWithTimeout("write_to_pane", { paneId, data });
     } catch (error) {
-      if (formatError(error).includes("session ended")) {
+      const message = formatError(error);
+      if (message.includes("session ended")) {
         setPaneRuntimeState(state, paneId, "ended");
         notify();
       }
+      // A lease refusal is a per-keystroke event: a toast, never a line in
+      // the terminal (docs/design/keyboard-lease-and-ledger.md §6 M2).
+      if (message.includes("pane keyboard is")) {
+        showLeaseToast(paneId, message);
+        return;
+      }
       terminals.append(
         paneId,
-        `\r\n[sgian] failed to write to terminal: ${formatError(error)}\r\n`,
+        `\r\n[sgian] failed to write to terminal: ${message}\r\n`,
       );
     }
   }
@@ -1271,6 +1417,9 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     await listen("agent-state", (event) => {
       handleAgentState(state, event.payload || {}, callbacks);
     });
+    await listen("lease-state", (event) => {
+      handleLeaseState(state, event.payload || {}, callbacks);
+    });
     await listen("agent-event", (event) => {
       const payload = event.payload || {};
       const paneId = payload.pane_id || payload.paneId;
@@ -1302,12 +1451,13 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
   }
 
   function handleGlobalKey(event) {
-    if (state.paletteOpen || state.overviewOpen) {
+    if (state.paletteOpen || state.overviewOpen || state.leaseDialog) {
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
         if (state.paletteOpen) closePalette();
-        else closeOverview();
+        else if (state.overviewOpen) closeOverview();
+        else closeLeaseDialog();
       }
       return;
     }
@@ -1344,6 +1494,12 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
         break;
       case "rename":
         beginRename(state.activePaneId);
+        break;
+      case "lease-take":
+        void takeLease(state.activePaneId);
+        break;
+      case "lease-release":
+        openReleaseDialog(state.activePaneId);
         break;
       case "focus-index":
         focusPaneByIndex(action.index);
@@ -1419,6 +1575,8 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     stopPeriodicResync();
     if (reconcileTimer) window.clearTimeout(reconcileTimer);
     reconcileTimer = null;
+    if (leaseToastTimer) window.clearTimeout(leaseToastTimer);
+    leaseToastTimer = null;
     for (const unlisten of unlisteners.splice(0)) unlisten();
     for (const frame of chatRenderFrames.values()) window.cancelAnimationFrame(frame);
     chatRenderFrames.clear();
@@ -1465,6 +1623,11 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     openOverview,
     closeOverview,
     focusNextAttentionPane,
+    takeLease,
+    releaseLease,
+    openReleaseDialog,
+    closeLeaseDialog,
+    leaseFor,
     updateSetting,
     saveSettings,
     loadSettingsConfig,

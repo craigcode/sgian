@@ -9525,15 +9525,71 @@ fn restart_pane_terminal(pane_id: String, state: State<'_, AppState>) -> Result<
         .request(DaemonRequest::RestartPaneTerminal { pane_id })
 }
 
+/// GUI keystrokes are attributed to this machine's operator (the same
+/// `user@host` label `ctl` defaults to), so a pane held by someone else
+/// refuses them and a pane the operator took accepts them
+/// (docs/design/keyboard-lease-and-ledger.md §6 M2). A daemon predating the
+/// lease capability rejects the variant with a serde "unknown variant"
+/// error; fall back to the unattributed write so the GUI keeps working
+/// against it.
 #[tauri::command]
 fn write_to_pane(
     pane_id: String,
     data: String,
     state: State<'_, AppState>,
 ) -> Result<CommandOk, String> {
+    let client = state.client()?;
+    match client.request(DaemonRequest::SendInputAs {
+        pane_id: pane_id.clone(),
+        input: data.clone(),
+        holder: default_holder(),
+    }) {
+        Err(error) if error.contains("unknown variant") => {
+            client.request(DaemonRequest::WriteToPane { pane_id, data })
+        }
+        result => result,
+    }
+}
+
+/// The holder label this client writes and takes leases as.
+#[tauri::command]
+fn client_holder() -> String {
+    default_holder()
+}
+
+#[tauri::command]
+fn take_lease(
+    pane_id: String,
+    force: bool,
+    why: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<LeaseInfo, String> {
+    state.client()?.request(DaemonRequest::TakeLease {
+        pane_id,
+        holder: default_holder(),
+        force,
+        why,
+    })
+}
+
+#[tauri::command]
+fn release_lease(
+    pane_id: String,
+    note: String,
+    state: State<'_, AppState>,
+) -> Result<LeaseInfo, String> {
+    state.client()?.request(DaemonRequest::ReleaseLease {
+        pane_id,
+        holder: default_holder(),
+        note,
+    })
+}
+
+#[tauri::command]
+fn lease_status(pane_id: String, state: State<'_, AppState>) -> Result<LeaseInfo, String> {
     state
         .client()?
-        .request(DaemonRequest::WriteToPane { pane_id, data })
+        .request(DaemonRequest::LeaseStatus { pane_id })
 }
 
 #[tauri::command]
@@ -16260,6 +16316,10 @@ pub fn run() {
             send_agent_message,
             agent_approval,
             interrupt_agent,
+            client_holder,
+            take_lease,
+            release_lease,
+            lease_status,
             install_update,
             ui_smoke_enabled,
             complete_ui_smoke
