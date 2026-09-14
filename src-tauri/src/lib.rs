@@ -2893,6 +2893,14 @@ impl KillOnCloseJob {
     }
 }
 
+// SAFETY: a job object handle is a kernel object reference with no thread
+// affinity; it is only ever used to close the job, from whichever thread
+// drops the owning session.
+#[cfg(windows)]
+unsafe impl Send for KillOnCloseJob {}
+#[cfg(windows)]
+unsafe impl Sync for KillOnCloseJob {}
+
 #[cfg(windows)]
 impl Drop for KillOnCloseJob {
     fn drop(&mut self) {
@@ -4362,11 +4370,42 @@ struct PreparedSpawn {
 /// run WITHOUT the TerminalStore lock (M7: a slow spawn used to stall input,
 /// resize, and liveness for every pane). On a partial failure after
 /// `spawn_command` succeeded, the child is killed + reaped (review-low).
+/// Whether an `openpty` failure is worth a brief retry: the kernel's pty pool
+/// momentarily exhausted (macOS ENXIO "Device not configured", EAGAIN on
+/// either platform) rather than a configuration error.
+fn is_transient_pty_error(message: &str) -> bool {
+    message.contains("Device not configured")
+        || message.contains("Resource temporarily unavailable")
+        || message.contains("os error 6)")
+        || message.contains("os error 11)")
+        || message.contains("os error 35)")
+}
+
+/// `openpty` with a short bounded retry on transient pool exhaustion (seen
+/// under parallel test load on CI runners); anything else fails immediately.
+fn open_pty_with_retry(
+    pty_system: &dyn portable_pty::PtySystem,
+    size: PtySize,
+) -> Result<portable_pty::PtyPair, String> {
+    let mut attempt: u32 = 0;
+    loop {
+        match pty_system.openpty(size) {
+            Ok(pair) => return Ok(pair),
+            Err(error) => {
+                let message = error.to_string();
+                attempt += 1;
+                if !is_transient_pty_error(&message) || attempt >= 8 {
+                    return Err(format!("failed to open pty: {message}"));
+                }
+                thread::sleep(Duration::from_millis(25 * u64::from(attempt)));
+            }
+        }
+    }
+}
+
 fn execute_spawn(plan: &SpawnPlan) -> Result<PreparedSpawn, String> {
     let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(plan.size)
-        .map_err(|error| format!("failed to open pty: {error}"))?;
+    let pair = open_pty_with_retry(pty_system.as_ref(), plan.size)?;
 
     let mut command = CommandBuilder::new(&plan.shell);
     for arg in &plan.args {
@@ -12031,10 +12070,15 @@ fn read_ipc_line<R: BufRead>(reader: &mut R) -> Result<String, String> {
 }
 
 fn write_json_line<T: Serialize>(stream: &mut TransportStream, value: &T) -> Result<(), String> {
-    serde_json::to_writer(&mut *stream, value)
-        .map_err(|error| format!("failed to encode ipc: {error}"))?;
+    // ONE write of line+'\n': a peer that reads the first bytes, decides the
+    // message is a protocol error and closes (the v2 bad-magic path) must not
+    // turn the trailing newline into a spurious EPIPE for a message that was
+    // fully delivered. Also one syscall instead of two per message.
+    let mut bytes =
+        serde_json::to_vec(value).map_err(|error| format!("failed to encode ipc: {error}"))?;
+    bytes.push(b'\n');
     stream
-        .write_all(b"\n")
+        .write_all(&bytes)
         .map_err(|error| format!("failed to write ipc: {error}"))?;
     stream
         .flush()
@@ -35187,6 +35231,20 @@ exit 0
         }
         daemon.shutdown();
         assert!(gone, "the grandchild sleep must die with its pane");
+    }
+
+    #[test]
+    fn transient_pty_errors_are_classified() {
+        assert!(is_transient_pty_error(
+            "failed to openpty: Os { code: 6, kind: Uncategorized, message: \"Device not configured\" }"
+        ));
+        assert!(is_transient_pty_error(
+            "Resource temporarily unavailable (os error 35)"
+        ));
+        assert!(!is_transient_pty_error("Permission denied (os error 13)"));
+        assert!(!is_transient_pty_error(
+            "No such file or directory (os error 2)"
+        ));
     }
 
     #[test]
