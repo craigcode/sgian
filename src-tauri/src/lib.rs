@@ -1727,6 +1727,12 @@ struct Config {
     /// An unrecognized value is rejected by `validate`.
     #[serde(default)]
     lease_policy: Option<String>,
+    /// (M3b) How often the daemon polls `claude agents --json` to read Claude
+    /// Code's own session state for shell panes (milliseconds). Unset =
+    /// 2000; `0` disables the probe. While a probe result is fresh it
+    /// outranks the screen heuristic. Unix only.
+    #[serde(default)]
+    agent_probe_interval_ms: Option<u64>,
     /// (T2) Permission mode for agent-pane `claude` processes, passed to
     /// `--permission-mode`. Defaults to `manual`: every tool use that needs
     /// approval arrives as a `permission_request` agent event and blocks until
@@ -1812,6 +1818,9 @@ impl Config {
             idle_shutdown_secs: other.idle_shutdown_secs.or(self.idle_shutdown_secs),
             restore_policy: other.restore_policy.or(self.restore_policy),
             lease_policy: other.lease_policy.or(self.lease_policy),
+            agent_probe_interval_ms: other
+                .agent_probe_interval_ms
+                .or(self.agent_probe_interval_ms),
             agent_permission_mode: other.agent_permission_mode.or(self.agent_permission_mode),
             agent_claude_bin: other.agent_claude_bin.or(self.agent_claude_bin),
             agent_droid_bin: other.agent_droid_bin.or(self.agent_droid_bin),
@@ -1860,6 +1869,14 @@ impl Config {
             .as_deref()
             .and_then(LeasePolicy::parse)
             .unwrap_or(LeasePolicy::Open)
+    }
+
+    /// (M3b) The official agent probe cadence; `None` when disabled.
+    fn agent_probe_interval(&self) -> Option<Duration> {
+        match self.agent_probe_interval_ms.unwrap_or(2000) {
+            0 => None,
+            millis => Some(Duration::from_millis(millis.max(250))),
+        }
     }
 
     fn restore_policy_effective(&self) -> String {
@@ -2786,6 +2803,10 @@ struct PaneLiveness {
     command: Option<String>,
     cwd: Option<String>,
     exit_code: Option<i32>,
+    /// The shell pane's child pid, so the official agent probe can map a
+    /// `claude agents --json` session to its pane through the process tree
+    /// (M3b). `None` for agent panes and restored-not-yet-spawned panes.
+    pid: Option<u32>,
 }
 
 /// Per-pane spawn/exit metadata surfaced to snapshot/find (and the reaper's
@@ -3030,6 +3051,9 @@ struct AgentPaneState {
     /// must not be re-classified back to a working/needs-input badge from
     /// its preserved final screen (M2).
     ended: bool,
+    /// (M3b) Until when an official `claude agents --json` reading outranks
+    /// the screen heuristic for this pane. `None` = never had one.
+    official_until: Option<Instant>,
 }
 
 impl AgentPaneState {
@@ -3547,6 +3571,13 @@ impl OutputRouter {
             return;
         };
         let entry = tracker.panes.entry(pane_id.to_string()).or_default();
+        // (M3b) A fresh official reading outranks the screen heuristic.
+        if entry
+            .official_until
+            .is_some_and(|until| until > Instant::now())
+        {
+            return;
+        }
         let new_agent = if entry.manual {
             entry.agent.clone()
         } else {
@@ -3599,6 +3630,97 @@ impl OutputRouter {
             pane_id: pane_id.to_string(),
             agent: new_agent,
             attention: new_attention,
+        });
+    }
+
+    /// (M3b) An official reading from `claude agents --json` for a pane whose
+    /// process tree contains that session. It outranks screen classification
+    /// until `ttl` elapses without a refresh, then the heuristic resumes.
+    /// Transitions are ledgered with evidence `claude-agents`.
+    /// Returns true when this is the pane's first official reading (the
+    /// caller logs the acquisition once).
+    fn apply_official_attention(
+        &self,
+        pane_id: &str,
+        agent: &str,
+        attention: AgentAttention,
+        ttl: Duration,
+    ) -> bool {
+        let Ok(mut tracker) = self.agents.lock() else {
+            return false;
+        };
+        let entry = tracker.panes.entry(pane_id.to_string()).or_default();
+        if entry.ended {
+            return false;
+        }
+        // First reading, or the first after a lapse: worth one log line.
+        let newly_official = entry
+            .official_until
+            .is_none_or(|until| until <= Instant::now());
+        entry.official_until = Some(Instant::now() + ttl);
+        let new_agent = Some(agent.to_string());
+        let new_attention = Some(attention);
+        if entry.agent == new_agent && entry.attention == new_attention {
+            return newly_official;
+        }
+        let previous_attention = entry.attention;
+        entry.agent = new_agent.clone();
+        entry.attention = new_attention;
+        drop(tracker);
+        self.ledger_note(
+            pane_id,
+            "attention.changed",
+            json!({
+                "agent": new_agent,
+                "from": previous_attention,
+                "to": new_attention,
+                "evidence": "claude-agents",
+            }),
+        );
+        self.broadcast(&DaemonEvent::AgentState {
+            pane_id: pane_id.to_string(),
+            agent: new_agent,
+            attention: new_attention,
+        });
+        newly_official
+    }
+
+    /// (M3b) The official session a pane was mapped to is gone from the
+    /// listing (two probes in a row): drop the official reading and, unless
+    /// the pane is manually marked, clear its agent badge — the screen
+    /// heuristic would otherwise keep a stale "claude · idle" over the
+    /// shell prompt that replaced the agent.
+    fn clear_official_attention(&self, pane_id: &str) {
+        let Ok(mut tracker) = self.agents.lock() else {
+            return;
+        };
+        let Some(entry) = tracker.panes.get_mut(pane_id) else {
+            return;
+        };
+        if entry.official_until.is_none() {
+            return;
+        }
+        entry.official_until = None;
+        if entry.manual || (entry.agent.is_none() && entry.attention.is_none()) {
+            return;
+        }
+        let previous_agent = entry.agent.take();
+        let previous_attention = entry.attention.take();
+        drop(tracker);
+        self.ledger_note(
+            pane_id,
+            "attention.changed",
+            json!({
+                "agent": previous_agent,
+                "from": previous_attention,
+                "to": Value::Null,
+                "evidence": "claude-agents: session gone",
+            }),
+        );
+        self.broadcast(&DaemonEvent::AgentState {
+            pane_id: pane_id.to_string(),
+            agent: None,
+            attention: None,
         });
     }
 
@@ -4198,6 +4320,7 @@ impl TerminalStore {
                     command: None,
                     cwd: None,
                     exit_code: None,
+                    pid: None,
                 });
             }
         }
@@ -4288,6 +4411,7 @@ impl TerminalStore {
 
         self.next_generation += 1;
         let generation = self.next_generation;
+        let child_pid = child.process_id();
         if let Ok(mut liveness) = self.liveness.lock() {
             liveness.insert(
                 pane_id.to_string(),
@@ -4297,6 +4421,7 @@ impl TerminalStore {
                     command: Some(command_str),
                     cwd: Some(cwd_str),
                     exit_code: None,
+                    pid: child_pid,
                 },
             );
         }
@@ -4524,6 +4649,21 @@ impl TerminalStore {
             .get(pane_id)
             .ok_or_else(|| format!("terminal session not found: {pane_id}"))?;
         queue_pane_input(&session.input, pane_id, data)
+    }
+
+    /// (M3b) Live shell panes with a recorded child pid, for the official
+    /// agent probe's process-tree mapping.
+    fn live_pane_pids(&self) -> Vec<(String, u32)> {
+        self.liveness
+            .lock()
+            .map(|liveness| {
+                liveness
+                    .iter()
+                    .filter(|(_, entry)| !entry.ended)
+                    .filter_map(|(pane_id, entry)| entry.pid.map(|pid| (pane_id.clone(), pid)))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn live_pane_ids(&self) -> Vec<String> {
@@ -6178,6 +6318,9 @@ impl TerminalStore {
                     command: Some(command_str),
                     cwd: Some(cwd_str),
                     exit_code: None,
+                    // Agent panes report attention from their own event
+                    // stream; the process-tree probe is for shell panes.
+                    pid: None,
                 },
             );
         }
@@ -7100,6 +7243,140 @@ fn read_ledger_tail(path: &Path, limit: usize) -> Vec<Value> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Official agent probe (M3b): `claude agents --json` mapped to panes through
+// the process tree. Pure parts here; the loop lives on DaemonServer.
+// ---------------------------------------------------------------------------
+
+/// One entry of `claude agents --json`. Only the fields the probe reads;
+/// unknown fields are ignored so newer CLIs keep parsing.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+struct AgentProbeEntry {
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default, rename = "waitingFor")]
+    waiting_for: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// Map Claude Code's vocabulary (`status`: busy/waiting/idle; `waitingFor`
+/// when it needs a person; `state`: working/blocked/done/failed/stopped) onto
+/// the pane attention states. `None` = nothing to say.
+fn attention_from_probe(entry: &AgentProbeEntry) -> Option<AgentAttention> {
+    if entry
+        .waiting_for
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Some(AgentAttention::NeedsInput);
+    }
+    match entry.status.as_deref().map(str::trim) {
+        Some("waiting") | Some("blocked") => Some(AgentAttention::NeedsInput),
+        Some("busy") | Some("working") | Some("running") => Some(AgentAttention::Working),
+        Some("idle") => Some(AgentAttention::Idle),
+        _ => match entry.state.as_deref().map(str::trim) {
+            Some("blocked") => Some(AgentAttention::NeedsInput),
+            Some("working") => Some(AgentAttention::Working),
+            Some("done") | Some("failed") | Some("stopped") => Some(AgentAttention::Idle),
+            _ => None,
+        },
+    }
+}
+
+/// Parse `ps -axo pid=,ppid=` output into child → parent.
+fn parse_parent_map(text: &str) -> HashMap<u32, u32> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            Some((pid, ppid))
+        })
+        .collect()
+}
+
+/// Attribute each probe entry to the pane whose child process is its ancestor
+/// (or itself). When several sessions land in one pane the loudest wins:
+/// needs-input over working over idle.
+fn map_probe_entries(
+    entries: &[AgentProbeEntry],
+    parent_of: &HashMap<u32, u32>,
+    pane_pids: &[(String, u32)],
+) -> HashMap<String, AgentAttention> {
+    fn rank(attention: AgentAttention) -> u8 {
+        match attention {
+            AgentAttention::NeedsInput => 2,
+            AgentAttention::Working => 1,
+            AgentAttention::Idle => 0,
+        }
+    }
+    let pane_by_pid: HashMap<u32, &str> = pane_pids
+        .iter()
+        .map(|(pane_id, pid)| (*pid, pane_id.as_str()))
+        .collect();
+    let mut mapped: HashMap<String, AgentAttention> = HashMap::new();
+    for entry in entries {
+        let (Some(mut pid), Some(attention)) = (entry.pid, attention_from_probe(entry)) else {
+            continue;
+        };
+        let mut pane = None;
+        for _ in 0..64 {
+            if let Some(found) = pane_by_pid.get(&pid) {
+                pane = Some((*found).to_string());
+                break;
+            }
+            match parent_of.get(&pid) {
+                Some(parent) if *parent != pid && *parent > 1 => pid = *parent,
+                _ => break,
+            }
+        }
+        let Some(pane) = pane else {
+            continue;
+        };
+        let keep = mapped
+            .get(&pane)
+            .is_none_or(|current| rank(attention) > rank(*current));
+        if keep {
+            mapped.insert(pane, attention);
+        }
+    }
+    mapped
+}
+
+/// Bookkeeping between probe rounds: `previous` holds panes with an official
+/// reading and how many rounds in a row they have been missing from the
+/// listing. Returns the panes whose reading should now be cleared (missing
+/// twice, or no longer live).
+fn reconcile_probe_rounds(
+    previous: &mut HashMap<String, u8>,
+    mapped: &HashMap<String, AgentAttention>,
+    live_panes: &[String],
+) -> Vec<String> {
+    let mut clear = Vec::new();
+    for pane_id in mapped.keys() {
+        previous.insert(pane_id.clone(), 0);
+    }
+    previous.retain(|pane_id, misses| {
+        if mapped.contains_key(pane_id) {
+            return true;
+        }
+        if !live_panes.iter().any(|live| live == pane_id) {
+            clear.push(pane_id.clone());
+            return false;
+        }
+        *misses = misses.saturating_add(1);
+        if *misses >= 2 {
+            clear.push(pane_id.clone());
+            return false;
+        }
+        true
+    });
+    clear
+}
+
 struct DaemonServer {
     registry: Mutex<PaneRegistry>,
     terminals: Mutex<TerminalStore>,
@@ -7151,6 +7428,12 @@ struct DaemonServer {
     /// daemon fell back to a fresh workspace; this flag surfaces a warning in
     /// `run_daemon_with_config` after the tracing dispatcher is active.
     workspace_was_corrupt: bool,
+    /// (M3b) The official agent probe warns once about a failing `claude`
+    /// invocation and then only logs at debug level.
+    probe_warned: AtomicBool,
+    /// (M3b) Panes with an official reading → consecutive rounds missing from
+    /// the listing (see `reconcile_probe_rounds`). Leaf lock.
+    probe_mapped: Mutex<HashMap<String, u8>>,
 }
 
 /// Removes a pane's in-flight spawn marker and wakes any ensure/restart
@@ -7368,7 +7651,109 @@ impl DaemonServer {
             persist_lock: Mutex::new(()),
             spawn_cvar: Condvar::new(),
             workspace_was_corrupt: was_corrupt,
+            probe_warned: AtomicBool::new(false),
+            probe_mapped: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// (M3b) One round of the official agent probe: run `claude agents --json`,
+    /// attribute each session to a live shell pane through the process tree,
+    /// and feed the result to the router as an official reading that outlives
+    /// two probe intervals. Skipped entirely when no shell pane is live.
+    #[cfg(unix)]
+    fn run_agent_probe(&self, interval: Duration) {
+        let pane_pids = match self.lock_terminals() {
+            Ok(terminals) => terminals.live_pane_pids(),
+            Err(_) => return,
+        };
+        if pane_pids.is_empty() {
+            return;
+        }
+        let config = self.effective_config();
+        let AgentBinPlan::Direct(bin) =
+            resolve_provider_bin(&config.agent_config(), AgentBackendKind::Claude)
+        else {
+            return;
+        };
+        let output = match Command::new(&bin)
+            .args(["agents", "--json"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => output.stdout,
+            Ok(output) => {
+                self.note_probe_failure(&format!("`{bin} agents --json` exited {}", output.status));
+                return;
+            }
+            Err(error) => {
+                self.note_probe_failure(&format!("cannot run `{bin} agents --json`: {error}"));
+                return;
+            }
+        };
+        let entries: Vec<AgentProbeEntry> = match serde_json::from_slice(&output) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.note_probe_failure(&format!("unreadable `agents --json` output: {error}"));
+                return;
+            }
+        };
+        let parents = match Command::new("ps")
+            .args(["-axo", "pid=,ppid="])
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(output) => parse_parent_map(&String::from_utf8_lossy(&output.stdout)),
+            Err(error) => {
+                self.note_probe_failure(&format!("cannot run ps: {error}"));
+                return;
+            }
+        };
+        let ttl = interval.saturating_mul(2) + Duration::from_millis(500);
+        let mapped = map_probe_entries(&entries, &parents, &pane_pids);
+        for (pane_id, attention) in &mapped {
+            if self
+                .router
+                .apply_official_attention(pane_id, "claude", *attention, ttl)
+            {
+                tracing::info!(
+                    workspace_key = %self.workspace_key,
+                    pane_id = %pane_id,
+                    event = "agent_probe_mapped",
+                    "Claude Code session mapped to pane; its own state now drives the badge"
+                );
+            }
+        }
+        let live: Vec<String> = pane_pids
+            .iter()
+            .map(|(pane_id, _)| pane_id.clone())
+            .collect();
+        let cleared = match self.probe_mapped.lock() {
+            Ok(mut previous) => reconcile_probe_rounds(&mut previous, &mapped, &live),
+            Err(_) => Vec::new(),
+        };
+        for pane_id in cleared {
+            self.router.clear_official_attention(&pane_id);
+        }
+    }
+
+    #[cfg(unix)]
+    fn note_probe_failure(&self, message: &str) {
+        if !self.probe_warned.swap(true, Ordering::SeqCst) {
+            tracing::warn!(
+                workspace_key = %self.workspace_key,
+                event = "agent_probe_failed",
+                error = %message,
+                "official agent probe failed; falling back to screen classification"
+            );
+        } else {
+            tracing::debug!(
+                workspace_key = %self.workspace_key,
+                event = "agent_probe_failed",
+                error = %message,
+                "official agent probe failed"
+            );
+        }
     }
 
     /// Dispatch a request with no peer connection attached. Production paths
@@ -10316,6 +10701,26 @@ fn run_daemon_with_config_and_warnings(
     // Activate structured logging for the daemon's main thread. The guard lives
     // for the entire run so all tracing calls in the accept loop are captured.
     let _log_guard = tracing::dispatcher::set_default(&server.log_dispatch);
+
+    // (M3b) The official agent probe runs on its own thread so a slow
+    // `claude agents --json` never touches the accept loop; it re-reads the
+    // interval each round so a config reload takes effect without a restart.
+    #[cfg(unix)]
+    {
+        let probe_server = Arc::clone(&server);
+        thread::spawn(move || {
+            let _guard = tracing::dispatcher::set_default(&probe_server.log_dispatch);
+            while !probe_server.shutdown.load(Ordering::SeqCst) {
+                match probe_server.effective_config().agent_probe_interval() {
+                    Some(interval) => {
+                        probe_server.run_agent_probe(interval);
+                        thread::sleep(interval);
+                    }
+                    None => thread::sleep(Duration::from_secs(1)),
+                }
+            }
+        });
+    }
 
     install_shutdown_signal_handlers();
     tracing::info!(
@@ -21725,6 +22130,7 @@ mod tests {
             idle_shutdown_secs: Some(30),
             restore_policy: Some("restore_on_demand".to_string()),
             lease_policy: None,
+            agent_probe_interval_ms: None,
             agent_permission_mode: Some("manual".to_string()),
             agent_claude_bin: Some("/opt/claude/bin/claude".to_string()),
             agent_droid_bin: Some("/opt/factory/bin/droid".to_string()),
@@ -23522,7 +23928,12 @@ mod tests {
             Self::spawn_with_cwd(config, PathBuf::from("/tmp/sgian-itest"))
         }
 
-        fn spawn_with_cwd(config: Config, cwd: PathBuf) -> Self {
+        fn spawn_with_cwd(mut config: Config, cwd: PathBuf) -> Self {
+            // (M3b) Never run the real `claude agents --json` from a test
+            // daemon unless the test opts in explicitly.
+            if config.agent_probe_interval_ms.is_none() {
+                config.agent_probe_interval_ms = Some(0);
+            }
             // Reset the process-global shutdown flag: run_daemon's loop checks it,
             // and a prior integration test (or signal) may have left it set. The
             // per-server `shutdown` AtomicBool drives the actual exit; this static
@@ -33647,6 +34058,225 @@ exit 0
         assert_eq!(format_watch_event(&output, false), None);
         assert_eq!(watch_event_pane(&output), None);
         assert_eq!(watch_event_pane(&ended), Some("pane-1"));
+    }
+
+    #[test]
+    fn probe_attention_mapping_and_parent_walk() {
+        let entry = |status: &str, waiting: Option<&str>, state: Option<&str>| AgentProbeEntry {
+            pid: Some(1),
+            status: Some(status.to_string()),
+            waiting_for: waiting.map(str::to_string),
+            state: state.map(str::to_string),
+        };
+        assert_eq!(
+            attention_from_probe(&entry("busy", None, None)),
+            Some(AgentAttention::Working)
+        );
+        assert_eq!(
+            attention_from_probe(&entry("idle", None, None)),
+            Some(AgentAttention::Idle)
+        );
+        assert_eq!(
+            attention_from_probe(&entry("busy", Some("permission prompt"), None)),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(
+            attention_from_probe(&entry("waiting", None, None)),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(
+            attention_from_probe(&entry("", None, Some("blocked"))),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(attention_from_probe(&entry("weird", None, None)), None);
+        let parsed: Vec<AgentProbeEntry> = serde_json::from_str(
+            r#"[{"pid":300,"cwd":"/w","kind":"interactive","sessionId":"s","name":"n","status":"busy","extra":1}]"#,
+        )
+        .expect("tolerant parse");
+        assert_eq!(parsed[0].pid, Some(300));
+        assert_eq!(parsed[0].status.as_deref(), Some("busy"));
+
+        let parents = parse_parent_map("  300   200\n200 100\n999 1\nbad line\n");
+        assert_eq!(parents.get(&300), Some(&200));
+        assert_eq!(parents.len(), 3);
+        let pane_pids = vec![
+            ("pane-1".to_string(), 100u32),
+            ("pane-2".to_string(), 500u32),
+        ];
+        let entries = vec![
+            AgentProbeEntry {
+                pid: Some(300),
+                status: Some("busy".to_string()),
+                ..AgentProbeEntry::default()
+            },
+            AgentProbeEntry {
+                pid: Some(999),
+                status: Some("busy".to_string()),
+                ..AgentProbeEntry::default()
+            },
+            AgentProbeEntry {
+                pid: Some(500),
+                status: Some("idle".to_string()),
+                ..AgentProbeEntry::default()
+            },
+        ];
+        let mapped = map_probe_entries(&entries, &parents, &pane_pids);
+        assert_eq!(mapped.get("pane-1"), Some(&AgentAttention::Working));
+        assert_eq!(mapped.get("pane-2"), Some(&AgentAttention::Idle));
+        assert_eq!(mapped.len(), 2, "an unrelated session maps nowhere");
+        // Two sessions in one pane: the louder state wins.
+        let two = vec![
+            AgentProbeEntry {
+                pid: Some(300),
+                status: Some("idle".to_string()),
+                ..AgentProbeEntry::default()
+            },
+            AgentProbeEntry {
+                pid: Some(200),
+                status: Some("busy".to_string()),
+                waiting_for: Some("input needed".to_string()),
+                ..AgentProbeEntry::default()
+            },
+        ];
+        assert_eq!(
+            map_probe_entries(&two, &parents, &pane_pids).get("pane-1"),
+            Some(&AgentAttention::NeedsInput)
+        );
+    }
+
+    #[test]
+    fn official_attention_outranks_the_screen_until_it_expires() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let router = OutputRouter::new(dir.path().join("scrollback"));
+        let ledger_dir = dir.path().join(LEDGER_DIR);
+        fs::create_dir_all(&ledger_dir).expect("ledger dir");
+        router.set_ledger(Arc::new(Mutex::new(LedgerSink::new(ledger_dir.clone()))));
+
+        router.apply_official_attention(
+            "pane-9",
+            "claude",
+            AgentAttention::NeedsInput,
+            Duration::from_millis(120),
+        );
+        assert_eq!(
+            router.agent_state("pane-9").attention,
+            Some(AgentAttention::NeedsInput)
+        );
+        // The screen says working, but the official reading is fresh.
+        router.apply_agent_classification("pane-9", CLAUDE_WORKING_SCREEN);
+        assert_eq!(
+            router.agent_state("pane-9").attention,
+            Some(AgentAttention::NeedsInput)
+        );
+        thread::sleep(Duration::from_millis(150));
+        router.apply_agent_classification("pane-9", CLAUDE_WORKING_SCREEN);
+        assert_eq!(
+            router.agent_state("pane-9").attention,
+            Some(AgentAttention::Working),
+            "the heuristic resumes once the official reading expires"
+        );
+        let records = read_ledger_tail(&ledger_path(&ledger_dir, "pane-9"), 0);
+        assert_eq!(records[0]["payload"]["evidence"], json!("claude-agents"));
+        assert_eq!(records[1]["payload"]["evidence"], json!("screen"));
+        // The session vanishing from the listing clears the badge (not manual marks).
+        assert!(router.apply_official_attention(
+            "pane-9",
+            "claude",
+            AgentAttention::Idle,
+            Duration::from_secs(1),
+        ));
+        assert!(!router.apply_official_attention(
+            "pane-9",
+            "claude",
+            AgentAttention::Idle,
+            Duration::from_secs(1),
+        ));
+        router.clear_official_attention("pane-9");
+        assert_eq!(router.agent_state("pane-9").agent, None);
+        let last = read_ledger_tail(&ledger_path(&ledger_dir, "pane-9"), 1).remove(0);
+        assert_eq!(
+            last["payload"]["evidence"],
+            json!("claude-agents: session gone")
+        );
+        router.set_manual_agent("pane-9", Some("claude".to_string()));
+        router.apply_official_attention(
+            "pane-9",
+            "claude",
+            AgentAttention::Working,
+            Duration::from_secs(1),
+        );
+        router.clear_official_attention("pane-9");
+        assert_eq!(
+            router.agent_state("pane-9").agent.as_deref(),
+            Some("claude"),
+            "a manual mark survives the session going away"
+        );
+        router.set_manual_agent("pane-9", None);
+        // An ended pane ignores official readings (a dead process has no state).
+        router.clear_agent_attention("pane-9");
+        router.apply_official_attention(
+            "pane-9",
+            "claude",
+            AgentAttention::Working,
+            Duration::from_secs(1),
+        );
+        assert_eq!(router.agent_state("pane-9").attention, None);
+    }
+
+    #[test]
+    fn reconcile_probe_rounds_clears_after_two_misses_or_close() {
+        let mut previous = HashMap::new();
+        let mut mapped = HashMap::new();
+        mapped.insert("pane-1".to_string(), AgentAttention::Idle);
+        let live = vec!["pane-1".to_string(), "pane-2".to_string()];
+        assert!(reconcile_probe_rounds(&mut previous, &mapped, &live).is_empty());
+        assert_eq!(previous.get("pane-1"), Some(&0));
+        // One miss: keep, count it.
+        let none = HashMap::new();
+        assert!(reconcile_probe_rounds(&mut previous, &none, &live).is_empty());
+        assert_eq!(previous.get("pane-1"), Some(&1));
+        // Reappearing resets the count.
+        assert!(reconcile_probe_rounds(&mut previous, &mapped, &live).is_empty());
+        assert_eq!(previous.get("pane-1"), Some(&0));
+        // Two misses in a row: clear.
+        assert!(reconcile_probe_rounds(&mut previous, &none, &live).is_empty());
+        assert_eq!(
+            reconcile_probe_rounds(&mut previous, &none, &live),
+            vec!["pane-1".to_string()]
+        );
+        assert!(previous.is_empty());
+        // A pane that is no longer live clears immediately.
+        reconcile_probe_rounds(&mut previous, &mapped, &live);
+        assert_eq!(
+            reconcile_probe_rounds(&mut previous, &none, &["pane-2".to_string()]),
+            vec!["pane-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn agent_probe_interval_config() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.agent_probe_interval(),
+            Some(Duration::from_millis(2000))
+        );
+        config.agent_probe_interval_ms = Some(0);
+        assert_eq!(config.agent_probe_interval(), None);
+        config.agent_probe_interval_ms = Some(10);
+        assert_eq!(
+            config.agent_probe_interval(),
+            Some(Duration::from_millis(250)),
+            "a floor keeps the probe from spinning"
+        );
+        let global = Config {
+            agent_probe_interval_ms: Some(5000),
+            ..Config::default()
+        };
+        let workspace = Config {
+            agent_probe_interval_ms: Some(0),
+            ..Config::default()
+        };
+        assert_eq!(global.overlay(workspace).agent_probe_interval(), None);
     }
 
     #[test]

@@ -104,13 +104,23 @@ Shipped (M3a, 2026-09-14):
   pane-end transitions after a baseline line per pane, so CI, notification
   glue, or a mission orchestrator can react to needs-input without polling.
 
+Shipped (M3b, 2026-09-14):
+
+- **Official agent signals.** On Unix the daemon polls `claude agents --json`
+  (every `agent_probe_interval_ms`, default 2000; `0` disables) and maps each
+  session to the shell pane whose child process is its ancestor. While a
+  reading is fresh it outranks screen classification, transitions are
+  ledgered with evidence `claude-agents`, and a session that disappears from
+  the listing for two rounds clears the badge (evidence
+  `claude-agents: session gone`) instead of leaving a stale "claude · idle"
+  over the shell prompt. Manual marks are untouched. Verified live against
+  an interactive Claude Code session inside a pane.
+
 Open, in order:
 
-- **M3b official agent signals.** Poll `claude agents --json` (pid, cwd,
-  status) and map entries to panes through the process tree so the daemon
-  prefers Claude Code's own state to screen scraping while the probe is fresh;
-  Notification-hook ingestion and the relay to Kranz's hook-status lane
-  follow once a pane can be bound to a run.
+- **Notification-hook ingestion** (`agent_needs_input`, `permission_prompt`,
+  `idle_prompt`) for sub-second needs-input without polling, and the relay
+  to Kranz's hook-status lane once a pane can be bound to a run.
 - **M4 Kranz target**, **M5 SSM / ECS Exec target**, **M6 per-client
   identity** (the lease becomes a boundary).
 

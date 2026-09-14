@@ -205,7 +205,8 @@ note cannot submit. Shortcuts are `Ctrl/Cmd+Shift+T` (take) and
 Deferred from the draft: the hollow read-only cursor, take-on-first-keystroke,
 and the "needs input" window title.
 
-**M3 — official agent signals before heuristics.** Claude Code's
+**M3 — official agent signals before heuristics (shipped 2026-09-14;
+Notification-hook ingestion and the Kranz relay remain open).** Claude Code's
 `claude agents --json` (`state`, `status`, `waitingFor`) and the Notification
 hook (`agent_needs_input`, `permission_prompt`, `idle_prompt`) are the
 supported ways to read session state; screen classification becomes the

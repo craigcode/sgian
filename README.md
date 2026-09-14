@@ -98,7 +98,11 @@ A single binary runs in three modes:
 - Bounded log rotation so logs do not grow unbounded.
 - Agent awareness (shell panes): the daemon classifies a pane's screen for known
   agent TUIs (Claude Code) and broadcasts `agent-state` transitions
-  (working / needs input / idle), badged on the pane's tab.
+  (working / needs input / idle), badged on the pane's tab. On Unix it also
+  polls `claude agents --json` (`agent_probe_interval_ms`, default 2000) and
+  maps sessions to panes through the process tree, so Claude Code's own
+  state outranks screen scraping while fresh and a finished session clears
+  the badge.
 - Keyboard lease: one holder per pane. While a pane is held, input from
   anyone else is refused (`lease_policy: "open"`, the default) or every write
   needs the lease (`"required"`). Takeovers, forced revocations, and releases
