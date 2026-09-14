@@ -93,7 +93,15 @@ A single binary runs in three modes:
 - Workspace identity is canonical: `/a/b`, `/a/b/`, and symlinks to the same
   directory share one workspace and one daemon.
 - Env scrubbing: vars in `scrub_env` are removed before spawning PTYs; explicit
-  `env` values take precedence over the scrub list.
+  `env` values take precedence over the scrub list. Claude Code's own
+  child-session markers (`CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`,
+  `CLAUDE_CODE_ENTRYPOINT`) are always dropped, so a daemon started from
+  inside a Claude Code session does not make every pane's `claude` a child
+  session with transcripts off.
+- Closing a pane (or the daemon exiting) terminates the pane's whole process
+  tree, not just its shell: descendants are signalled on Unix (SIGTERM, then
+  SIGKILL after a grace period) and held in a kill-on-close Job Object on
+  Windows.
 - Config file-watch with live reload.
 - Bounded log rotation so logs do not grow unbounded.
 - Agent awareness (shell panes): the daemon classifies a pane's screen for known

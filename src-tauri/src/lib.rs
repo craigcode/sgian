@@ -2161,6 +2161,18 @@ fn load_config(data_dir: &Path) -> (Config, Vec<String>) {
 /// `spawn_pane` applies the same logic via `CommandBuilder::env_remove` /
 /// `env` (verified end-to-end by `env_scrubbing_integration_spawned_pane`).
 /// VAL-SEC-003/004/007.
+/// Claude Code marks its own subprocesses so a nested `claude` knows it is a
+/// child session (transcripts off, not listed by `claude agents`). A daemon
+/// started from inside such a session would otherwise pass those marks to
+/// every pane it ever spawns, since it outlives the session. Pane shells are
+/// the operator's, not Claude's tools, so the marks are always dropped; an
+/// explicit `env` entry still wins.
+const INHERITED_SESSION_MARKERS: [&str; 3] = [
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+];
+
 #[cfg(test)]
 fn compute_spawn_env(
     inherited: &HashMap<String, String>,
@@ -2168,6 +2180,9 @@ fn compute_spawn_env(
     explicit: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut env = inherited.clone();
+    for key in INHERITED_SESSION_MARKERS {
+        env.remove(key);
+    }
     for key in scrub {
         env.remove(key);
     }
@@ -2765,8 +2780,136 @@ impl PaneRegistry {
     }
 }
 
+/// Every descendant of `root` in one `ps` snapshot (root excluded).
+#[cfg(unix)]
+fn process_descendants(root: u32, table: &ProcessTable) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, ppid) in &table.parent {
+        children.entry(*ppid).or_default().push(*pid);
+    }
+    let mut found = Vec::new();
+    let mut queue = vec![root];
+    while let Some(pid) = queue.pop() {
+        if let Some(kids) = children.get(&pid) {
+            for kid in kids {
+                if *kid != root && !found.contains(kid) {
+                    found.push(*kid);
+                    queue.push(*kid);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Terminate everything under a pane's child, not only the shell: an
+/// interactive shell puts each job in its own process group, so killing the
+/// shell alone orphans an agent started from it. Descendants get SIGTERM now
+/// and SIGKILL after a grace period if still alive. Best-effort; pid reuse
+/// inside the grace window is the accepted hazard.
+#[cfg(unix)]
+fn terminate_process_tree(root: u32) {
+    let Ok(output) = Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    let table = parse_process_table(&String::from_utf8_lossy(&output.stdout));
+    let targets = process_descendants(root, &table);
+    if targets.is_empty() {
+        return;
+    }
+    for pid in &targets {
+        // SAFETY: kill(2) with a pid we just read from the process table; a
+        // stale pid is an ESRCH we ignore.
+        unsafe {
+            libc::kill(*pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1500));
+        for pid in targets {
+            // SAFETY: as above; signal 0 only probes existence.
+            unsafe {
+                if libc::kill(pid as libc::pid_t, 0) == 0 {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    });
+}
+
+/// A kill-on-close Job Object holding the pane's child so closing the pane
+/// (or the daemon exiting) terminates the whole tree, ConPTY included.
+#[cfg(windows)]
+struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl KillOnCloseJob {
+    fn attach(pid: u32) -> Option<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+        // SAFETY: plain Win32 calls with valid arguments; every handle we
+        // open is closed on every path below.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() || job == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if set == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if process.is_null() {
+                CloseHandle(job);
+                return None;
+            }
+            let assigned = AssignProcessToJobObject(job, process);
+            CloseHandle(process);
+            if assigned == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Self(job))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        // SAFETY: the handle was created by CreateJobObjectW and is closed once.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 struct TerminalSession {
     _master: Box<dyn MasterPty + Send>,
+    /// The child's pid, for terminating its descendants on close (Unix).
+    pid: Option<u32>,
+    /// Kill-on-close job holding the child tree (Windows). Dropped last.
+    #[cfg(windows)]
+    _job: Option<KillOnCloseJob>,
     /// A killer split off the child via `clone_killer()`. The `child` itself is
     /// owned by the reader thread (which reaps it via `child.wait()`), so the
     /// session keeps only this handle to terminate the process on close/restart.
@@ -2781,6 +2924,10 @@ struct TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            terminate_process_tree(pid);
+        }
         let _ = self.killer.kill();
     }
 }
@@ -4232,6 +4379,9 @@ fn execute_spawn(plan: &SpawnPlan) -> Result<PreparedSpawn, String> {
     // TERM/COLORTERM defaults below) are applied AFTER scrubbing, so an
     // operator-set value takes precedence over the scrub list for the same
     // variable name. VAL-SEC-003/004/007.
+    for key in INHERITED_SESSION_MARKERS {
+        command.env_remove(key);
+    }
     for key in &plan.scrub_env {
         command.env_remove(key);
     }
@@ -4575,6 +4725,9 @@ impl TerminalStore {
             pane_id.to_string(),
             TerminalSession {
                 _master: master,
+                pid: child_pid,
+                #[cfg(windows)]
+                _job: child_pid.and_then(KillOnCloseJob::attach),
                 killer,
                 input: spawn_input_writer(writer),
             },
@@ -4611,6 +4764,10 @@ impl TerminalStore {
     /// and leak SIGHUP-ignoring children past daemon exit (L17).
     fn kill_all_sessions(&mut self) {
         for session in self.sessions.values_mut() {
+            #[cfg(unix)]
+            if let Some(pid) = session.pid {
+                terminate_process_tree(pid);
+            }
             let _ = session.killer.kill();
         }
         // (T2) Same for agent CLIs; each AgentSession's Drop also fires, but a
@@ -5287,6 +5444,9 @@ fn execute_agent_spawn(plan: &AgentSpawnPlan) -> Result<PreparedAgentSpawn, Stri
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         command.creation_flags(CREATE_NO_WINDOW);
+    }
+    for key in INHERITED_SESSION_MARKERS {
+        command.env_remove(key);
     }
     for key in &plan.scrub_env {
         command.env_remove(key);
@@ -8537,6 +8697,9 @@ impl DaemonServer {
         // Automation must honor the same environment policy as shell and agent
         // panes. Clone the policy before spawn so no config lock spans execution.
         let config = self.effective_config();
+        for key in INHERITED_SESSION_MARKERS {
+            command.env_remove(key);
+        }
         for key in &config.scrub_env {
             command.env_remove(key);
         }
@@ -34930,6 +35093,100 @@ exit 0
             json!("kranz.unbound")
         );
         daemon.shutdown();
+    }
+
+    #[test]
+    fn inherited_session_markers_are_dropped_unless_explicit() {
+        let inherited = HashMap::from([
+            ("CLAUDECODE".to_string(), "1".to_string()),
+            ("CLAUDE_CODE_CHILD_SESSION".to_string(), "abc".to_string()),
+            ("PATH".to_string(), "/bin".to_string()),
+        ]);
+        let env = compute_spawn_env(&inherited, &[], &HashMap::new());
+        assert!(!env.contains_key("CLAUDECODE"));
+        assert!(!env.contains_key("CLAUDE_CODE_CHILD_SESSION"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+        let explicit = HashMap::from([("CLAUDECODE".to_string(), "1".to_string())]);
+        let env = compute_spawn_env(&inherited, &[], &explicit);
+        assert_eq!(env.get("CLAUDECODE").map(String::as_str), Some("1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_descendants_walks_the_whole_subtree() {
+        let table = parse_process_table("10 1\n20 10\n30 20\n40 10\n99 1\n");
+        let mut found = process_descendants(10, &table);
+        found.sort_unstable();
+        assert_eq!(found, vec![20, 30, 40]);
+        assert!(process_descendants(99, &table).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_pane_terminates_its_grandchildren() {
+        let daemon = TestDaemon::spawn(Config::default());
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        let marker = daemon.data_dir.path().join("grandchild.pid");
+        // A background job in an interactive shell lands in its own process
+        // group, exactly the case a shell-only kill orphans.
+        client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: format!("sleep 300 &\necho $! > '{}'\n", marker.display()),
+            })
+            .expect("start grandchild");
+        let mut grandchild: Option<u32> = None;
+        for _ in 0..200 {
+            if let Ok(text) = fs::read_to_string(&marker) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    grandchild = Some(pid);
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let grandchild = grandchild.expect("the shell reported the sleep pid");
+        // SAFETY: probing a pid we were just handed.
+        assert_eq!(unsafe { libc::kill(grandchild as libc::pid_t, 0) }, 0);
+
+        let _: Pane = client
+            .request(DaemonRequest::CreatePane {
+                title: None,
+                profile: None,
+            })
+            .expect("a second pane so the first can close");
+        client
+            .request::<Value>(DaemonRequest::ClosePane {
+                pane_id: pane_id.clone(),
+            })
+            .expect("close");
+        let mut gone = false;
+        for _ in 0..200 {
+            // SAFETY: existence probe; ESRCH (or a zombie already reaped by
+            // init) means the grandchild is gone.
+            if unsafe { libc::kill(grandchild as libc::pid_t, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !gone {
+            // SAFETY: cleanup of our own test process.
+            unsafe {
+                libc::kill(grandchild as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        daemon.shutdown();
+        assert!(gone, "the grandchild sleep must die with its pane");
     }
 
     #[test]

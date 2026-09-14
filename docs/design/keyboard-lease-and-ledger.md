@@ -281,6 +281,9 @@ Ranked by leverage against effort. None are committed beyond M1.
 
 - Holder names and notes are operator text: bounded, validated, never
   interpreted.
+- A closed pane takes its whole process tree with it (Unix: descendants from
+  a `ps` snapshot, SIGTERM then SIGKILL; Windows: kill-on-close Job Object),
+  so a takeover cannot leave an agent running blind after the pane is gone.
 - Keystrokes are never recorded; the ledger stores counts and timestamps.
 - Ledger and scrollback files are owner-only (0600 / current-user ACL).
 - The lease is coordination until M6 lands. Say so in the README.
