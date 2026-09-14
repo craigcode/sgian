@@ -131,7 +131,10 @@ A single binary runs in three modes:
   In the clients: `Ctrl/Cmd+Shift+T` takes the active pane's keyboard,
   `Ctrl/Cmd+Shift+L` releases it with a note.
 - `ctl ledger [PANE] [--verify]` to print or verify a pane's hash-chained
-  lease ledger; a closed pane's ledger stays readable by id.
+  ledger (lease handovers, attention transitions, pane exits); a closed
+  pane's ledger stays readable by id.
+- `ctl agent --watch [PANE] --json` to stream agent-state, lease and pane-end
+  transitions to a script instead of polling.
 - `ctl logs` to tail daemon logs.
 - `ctl status --verbose` for detailed daemon state.
 - `ctl write-config` to persist config changes.

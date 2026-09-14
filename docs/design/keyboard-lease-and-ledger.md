@@ -142,8 +142,10 @@ Event vocabulary for M1:
 | `lease.released` | `holder`, `note`, `held_ms`, `writes`, `bytes_typed`, `refused_writes` |
 | `lease.revoked` | `holder`, `by`, `why` |
 
-Later milestones add `attention.changed { from, to, evidence }` and
-`pane.ended { exit_code }`. Keystrokes are never in the ledger; only counts.
+M3 added `attention.changed { agent, from, to, evidence }` and
+`pane.ended { exit_code }`, written by the output router without an fsync
+(they are frequent and are not the product). Keystrokes are never in the
+ledger; only counts.
 Output bytes are never in the ledger; they stay in scrollback.
 
 `ctl ledger <pane> --verify` walks the chain and names the first broken

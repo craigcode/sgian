@@ -93,11 +93,24 @@ Shipped (M2, 2026-09-14):
   live daemon round trip; Windows: compiled and exercised only by the Windows
   CI job (no .NET toolchain on the development Mac).
 
+Shipped (M3a, 2026-09-14):
+
+- **Attention in the ledger.** Every agent-attention transition is appended
+  as `attention.changed { agent, from, to, evidence }` (`screen` today,
+  `process ended` when the pane's process exits) and every pane exit as
+  `pane.ended { exit_code }`, best-effort and unsynced (lease events stay
+  fsynced). A closed pane's ledger is its full session record.
+- **`ctl agent --watch [PANE] [--json]`.** Streams agent-state, lease and
+  pane-end transitions after a baseline line per pane, so CI, notification
+  glue, or a mission orchestrator can react to needs-input without polling.
+
 Open, in order:
 
-- **M3 official agent signals.** Prefer `claude agents --json` and the
-  Notification hook over screen classification; ledger `attention.changed`;
-  `ctl agent --watch --json`; relay to Kranz's hook-status lane.
+- **M3b official agent signals.** Poll `claude agents --json` (pid, cwd,
+  status) and map entries to panes through the process tree so the daemon
+  prefers Claude Code's own state to screen scraping while the probe is fresh;
+  Notification-hook ingestion and the relay to Kranz's hook-status lane
+  follow once a pane can be bound to a run.
 - **M4 Kranz target**, **M5 SSM / ECS Exec target**, **M6 per-client
   identity** (the lease becomes a boundary).
 

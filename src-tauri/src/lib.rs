@@ -3112,6 +3112,10 @@ struct OutputRouter {
     /// except that the per-pane MODEL lock may already be held by the caller
     /// (lock order: model → agents, never reversed).
     agents: Arc<Mutex<AgentTracker>>,
+    /// The workspace ledger (docs/design/keyboard-lease-and-ledger.md), set
+    /// once by `DaemonServer::with_config`; `None` in unit tests that build a
+    /// bare router. Attention transitions and pane ends are noted here.
+    ledger: Arc<std::sync::OnceLock<Arc<Mutex<LedgerSink>>>>,
 }
 
 /// Cached append state for one pane's scrollback file (M11): the open handle
@@ -3134,6 +3138,21 @@ impl OutputRouter {
             models: Arc::new(Mutex::new(HashMap::new())),
             append_handles: Arc::new(Mutex::new(HashMap::new())),
             agents: Arc::new(Mutex::new(AgentTracker::default())),
+            ledger: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    fn set_ledger(&self, sink: Arc<Mutex<LedgerSink>>) {
+        let _ = self.ledger.set(sink);
+    }
+
+    /// Best-effort, non-durable ledger note from the output path. Called with
+    /// no other lock held (the ledger is a leaf lock).
+    fn ledger_note(&self, pane_id: &str, kind: &str, payload: Value) {
+        if let Some(sink) = self.ledger.get() {
+            if let Ok(mut sink) = sink.lock() {
+                let _ = sink.record(pane_id, kind, payload, false);
+            }
         }
     }
 
@@ -3560,9 +3579,22 @@ impl OutputRouter {
         if entry.agent == new_agent && entry.attention == new_attention {
             return;
         }
+        let previous_attention = entry.attention;
         entry.agent = new_agent.clone();
         entry.attention = new_attention;
         drop(tracker);
+        // Every transition is ledgered with its evidence so a wrong guess is
+        // auditable (docs/design/keyboard-lease-and-ledger.md §6 M3).
+        self.ledger_note(
+            pane_id,
+            "attention.changed",
+            json!({
+                "agent": new_agent,
+                "from": previous_attention,
+                "to": new_attention,
+                "evidence": "screen",
+            }),
+        );
         self.broadcast(&DaemonEvent::AgentState {
             pane_id: pane_id.to_string(),
             agent: new_agent,
@@ -3630,17 +3662,25 @@ impl OutputRouter {
     /// signature is still on screen, and a manual mark outlives its process.
     /// Broadcasts the final AgentState transition if the pane had attention.
     fn clear_agent_attention(&self, pane_id: &str) {
-        let agent = self
-            .agents
-            .lock()
-            .ok()
-            .and_then(|mut tracker| {
-                let entry = tracker.panes.get_mut(pane_id)?;
-                entry.ended = true;
-                entry.attention.take().map(|_| entry.agent.clone())
-            })
-            .flatten();
-        if let Some(agent) = agent {
+        let cleared = self.agents.lock().ok().and_then(|mut tracker| {
+            let entry = tracker.panes.get_mut(pane_id)?;
+            entry.ended = true;
+            entry
+                .attention
+                .take()
+                .map(|previous| (entry.agent.clone(), previous))
+        });
+        if let Some((Some(agent), previous)) = cleared {
+            self.ledger_note(
+                pane_id,
+                "attention.changed",
+                json!({
+                    "agent": agent,
+                    "from": previous,
+                    "to": Value::Null,
+                    "evidence": "process ended",
+                }),
+            );
             self.broadcast(&DaemonEvent::AgentState {
                 pane_id: pane_id.to_string(),
                 agent: Some(agent),
@@ -3776,6 +3816,7 @@ impl OutputRouter {
             event = "pane_end",
             "pane ended"
         );
+        self.ledger_note(pane_id, "pane.ended", json!({ "exit_code": exit_code }));
         let event = DaemonEvent::PaneEnded {
             pane_id: pane_id.to_string(),
             exit_code,
@@ -6903,14 +6944,45 @@ fn ledger_head(path: &Path) -> Result<(u64, String), String> {
     }
 }
 
+/// One workspace's ledger writer: the directory plus cached chain heads,
+/// shared by the daemon handlers (lease events, durable) and the output
+/// router (attention transitions and pane ends, best-effort). A LEAF lock:
+/// `record` does file I/O under it and no caller holds another lock then.
+struct LedgerSink {
+    dir: PathBuf,
+    heads: HashMap<String, (u64, String)>,
+}
+
+impl LedgerSink {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            heads: HashMap::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        pane_id: &str,
+        kind: &str,
+        payload: Value,
+        durable: bool,
+    ) -> Result<LedgerRecord, String> {
+        ledger_append(&self.dir, &mut self.heads, pane_id, kind, payload, durable)
+    }
+}
+
 /// Append one record, chaining from the cached head (seeded from disk on
-/// first use). One `write_all` of line+'\n', then fsync.
+/// first use). One `write_all` of line+'\n'; `durable` adds an fsync (lease
+/// events are rare and are the product; attention flaps are frequent and
+/// are not).
 fn ledger_append(
     dir: &Path,
     heads: &mut HashMap<String, (u64, String)>,
     pane_id: &str,
     kind: &str,
     payload: Value,
+    durable: bool,
 ) -> Result<LedgerRecord, String> {
     let path = ledger_path(dir, pane_id);
     let (seq, prev) = match heads.get(pane_id) {
@@ -6939,7 +7011,7 @@ fn ledger_append(
         .open(&path)
         .map_err(|error| format!("failed to open ledger {}: {error}", path.display()))?;
     file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
+        .and_then(|_| if durable { file.sync_all() } else { Ok(()) })
         .map_err(|error| format!("failed to append ledger {}: {error}", path.display()))?;
     heads.insert(pane_id.to_string(), (record.seq, record.h.clone()));
     Ok(record)
@@ -7037,16 +7109,13 @@ struct DaemonServer {
     /// (T2) Per-pane agent conversation logs (`agents/<pane-id>.jsonl`), read
     /// for the bootstrap replay.
     agents_dir: PathBuf,
-    /// Per-pane hash-chained lease ledgers (`ledger/<pane-id>.jsonl`). Kept
-    /// across pane close; see docs/design/keyboard-lease-and-ledger.md.
-    ledger_dir: PathBuf,
+    /// Per-pane hash-chained ledgers (`ledger/<pane-id>.jsonl`), shared with
+    /// the router; kept across pane close. docs/design/keyboard-lease-and-ledger.md.
+    ledger: Arc<Mutex<LedgerSink>>,
     /// Held keyboard leases. A LEAF lock: taken alone, never while holding
     /// registry/terminals, and dropped before either is acquired (persist()
     /// takes it last, after registry → terminals).
     leases: Mutex<HashMap<String, HeldLease>>,
-    /// Cached ledger chain heads (pane_id → (seq, h)), seeded from disk on
-    /// first append. Only ever taken alone.
-    ledger_heads: Mutex<HashMap<String, (u64, String)>>,
     workspace_key: String,
     log_dispatch: tracing::dispatcher::Dispatch,
     /// Keeps the non-blocking log writer alive (flushes on drop). Must be held for
@@ -7117,9 +7186,10 @@ impl DaemonServer {
         let agents_dir = data_dir.join(AGENT_LOG_DIR);
         ensure_private_dir(&agents_dir)?;
         prune_agent_log_temps(&agents_dir);
-        // Lease ledgers are never pruned: a closed pane's ledger is its record.
+        // Ledgers are never pruned: a closed pane's ledger is its record.
         let ledger_dir = data_dir.join(LEDGER_DIR);
         ensure_private_dir(&ledger_dir)?;
+        let ledger = Arc::new(Mutex::new(LedgerSink::new(ledger_dir)));
         let token = load_or_create_token(&data_dir)?;
 
         let persist_path = data_dir.join(WORKSPACE_FILE);
@@ -7195,6 +7265,7 @@ impl DaemonServer {
 
         let router = OutputRouter::new(scrollback_dir.clone());
         router.set_log_context(log_dispatch.clone(), ws_key.clone());
+        router.set_ledger(Arc::clone(&ledger));
         // (T1) Restore persisted manual agent marks before any pane spawns, so
         // the first classification of a marked pane keeps its agent. Filtered
         // against the registry (L6b — mirroring the agents_v2 seed filter
@@ -7274,7 +7345,7 @@ impl DaemonServer {
             persist_path,
             scrollback_dir,
             agents_dir,
-            ledger_dir,
+            ledger,
             // A hand-edited lease for a pane that no longer exists must not be
             // resurrected (same filter as the agent marks above).
             leases: Mutex::new(
@@ -7283,7 +7354,6 @@ impl DaemonServer {
                     .filter(|(pane_id, _)| live_pane_ids.contains(pane_id))
                     .collect(),
             ),
-            ledger_heads: Mutex::new(HashMap::new()),
             workspace_key: ws_key,
             log_dispatch,
             _log_guard: log_guard,
@@ -8241,11 +8311,10 @@ impl DaemonServer {
         kind: &str,
         payload: Value,
     ) -> Result<LedgerRecord, String> {
-        let mut heads = self
-            .ledger_heads
+        self.ledger
             .lock()
-            .map_err(|_| "ledger head lock poisoned".to_string())?;
-        ledger_append(&self.ledger_dir, &mut heads, pane_id, kind, payload)
+            .map_err(|_| "ledger lock poisoned".to_string())?
+            .record(pane_id, kind, payload, true)
     }
 
     fn lease_info(&self, pane_id: &str) -> Result<LeaseInfo, String> {
@@ -15106,6 +15175,12 @@ struct AgentArgs {
     pane_ref: String,
     /// `None`: query. `Some(Some("claude"))`: mark. `Some(None)`: unmark.
     mark: Option<Option<String>>,
+    /// `--watch`: stream agent-state, lease and pane-end transitions
+    /// (docs/design/keyboard-lease-and-ledger.md §6 M3). With no PANE the
+    /// stream covers every pane; with one it ends when that pane closes.
+    watch: bool,
+    /// Whether a PANE was given (a bare `--watch` means every pane).
+    pane_given: bool,
 }
 
 /// (T1) `ctl agent [PANE] [on|off]` — `on`/`off` as the FIRST positional is
@@ -15113,6 +15188,13 @@ struct AgentArgs {
 /// on`); any other first positional is the PANE reference and the optional
 /// second positional is the operation.
 fn parse_agent_args(args: &[String]) -> Result<AgentArgs, String> {
+    let watch = args.iter().any(|arg| arg == "--watch");
+    let args: Vec<String> = args
+        .iter()
+        .filter(|arg| *arg != "--watch")
+        .cloned()
+        .collect();
+    let args = args.as_slice();
     let verb_first = matches!(args.first().map(String::as_str), Some("on" | "off"));
     let (pane_ref, op_index) = if verb_first {
         ("active".to_string(), 0)
@@ -15133,7 +15215,143 @@ fn parse_agent_args(args: &[String]) -> Result<AgentArgs, String> {
     if let Some(extra) = args.get(op_index + 1) {
         return Err(format!("unexpected argument for agent: {extra}"));
     }
-    Ok(AgentArgs { pane_ref, mark })
+    if watch && mark.is_some() {
+        return Err("--watch cannot be combined with on/off".to_string());
+    }
+    let pane_given = !verb_first && !args.is_empty();
+    Ok(AgentArgs {
+        pane_ref,
+        mark,
+        watch,
+        pane_given,
+    })
+}
+
+/// One line for `ctl agent --watch`: the agent-state, lease and pane-end
+/// transitions a script wants to react to; `None` for everything else.
+/// JSON is the daemon's own event shape (`{"event":"agent_state",...}`).
+fn format_watch_event(event: &DaemonEvent, json_output: bool) -> Option<String> {
+    fn enum_name<T: Serialize>(value: &T) -> String {
+        serde_json::to_value(value)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "-".to_string())
+    }
+    let text = match event {
+        DaemonEvent::AgentState {
+            pane_id,
+            agent,
+            attention,
+        } => format!(
+            "{pane_id}\tagent_state\t{}\t{}",
+            agent.as_deref().unwrap_or("-"),
+            attention
+                .map(|value| enum_name(&value))
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        DaemonEvent::LeaseState {
+            pane_id,
+            transition,
+            holder,
+            ..
+        } => format!(
+            "{pane_id}\tlease_{}\t{}",
+            enum_name(transition),
+            holder.as_deref().unwrap_or("-")
+        ),
+        DaemonEvent::PaneEnded { pane_id, exit_code } => format!(
+            "{pane_id}\tpane_ended\t{}",
+            exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        DaemonEvent::PaneClosed { pane_id } => format!("{pane_id}\tpane_closed"),
+        _ => return None,
+    };
+    if json_output {
+        serde_json::to_string(event).ok()
+    } else {
+        Some(text)
+    }
+}
+
+fn watch_event_pane(event: &DaemonEvent) -> Option<&str> {
+    match event {
+        DaemonEvent::AgentState { pane_id, .. }
+        | DaemonEvent::LeaseState { pane_id, .. }
+        | DaemonEvent::PaneEnded { pane_id, .. }
+        | DaemonEvent::PaneClosed { pane_id } => Some(pane_id),
+        _ => None,
+    }
+}
+
+/// `ctl agent --watch [PANE]` — print the current agent state as a baseline,
+/// then stream transitions until killed (or, with a PANE, until it closes).
+fn control_agent_watch(
+    client: &DaemonClient,
+    pane_filter: Option<String>,
+    json_output: bool,
+) -> Result<(), String> {
+    // Subscribe first so a transition between the baseline read and the loop
+    // is queued rather than missed.
+    let mut conn = client.connect()?;
+    conn.write_request(&DaemonRequest::Subscribe)?;
+    conn.await_subscribe_ack()?;
+    conn.set_read_timeout(None);
+
+    let entries: Value = client.request(DaemonRequest::Find {
+        command: None,
+        title: None,
+        cwd: None,
+        state: None,
+    })?;
+    let mut stdout = std::io::stdout();
+    for entry in entries.as_array().into_iter().flatten() {
+        let Some(pane_id) = entry["id"].as_str() else {
+            continue;
+        };
+        if pane_filter
+            .as_deref()
+            .is_some_and(|wanted| wanted != pane_id)
+        {
+            continue;
+        }
+        let baseline = DaemonEvent::AgentState {
+            pane_id: pane_id.to_string(),
+            agent: entry["agent"].as_str().map(str::to_string),
+            attention: serde_json::from_value(entry["attention"].clone()).ok(),
+        };
+        if let Some(line) = format_watch_event(&baseline, json_output) {
+            writeln!(stdout, "{line}")
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+        }
+    }
+    stdout
+        .flush()
+        .map_err(|error| format!("failed to write stdout: {error}"))?;
+
+    loop {
+        let Some(event) = conn.read_event()? else {
+            return Ok(());
+        };
+        let Some(pane_id) = watch_event_pane(&event) else {
+            continue;
+        };
+        if pane_filter
+            .as_deref()
+            .is_some_and(|wanted| wanted != pane_id)
+        {
+            continue;
+        }
+        if let Some(line) = format_watch_event(&event, json_output) {
+            writeln!(stdout, "{line}")
+                .and_then(|_| stdout.flush())
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+        }
+        if pane_filter.is_some() && matches!(event, DaemonEvent::PaneClosed { .. }) {
+            return Ok(());
+        }
+    }
 }
 
 /// (T1) Read a pane's agent state via `find` (which — unlike `snapshot` —
@@ -15167,6 +15385,14 @@ fn control_agent(client: &DaemonClient, args: &[String], json_output: bool) -> R
         return print_control_help();
     }
     let parsed = parse_agent_args(args)?;
+    if parsed.watch {
+        let filter = if parsed.pane_given {
+            Some(resolve_pane_ref(client, &parsed.pane_ref)?)
+        } else {
+            None
+        };
+        return control_agent_watch(client, filter, json_output);
+    }
     let pane_id = resolve_pane_ref(client, &parsed.pane_ref)?;
     let state = match parsed.mark {
         Some(agent) => client.request::<Value>(DaemonRequest::SetPaneAgent {
@@ -16048,6 +16274,9 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   -- ends flag parsing (send a literal "--lf" etc.)
                                   To an agent pane, send posts a chat message
                                   (verbatim; no Enter/CR translation, no --lf).
+  agent --watch [PANE]          Stream agent-state, lease and pane-end transitions
+                                  (one line each; --json prints the daemon events).
+                                  No PANE watches every pane; with one, exits on close.
   lease [PANE]                  Show who holds a pane's keyboard (alias: lease status)
   lease take [PANE] [--as HOLDER] [--force --why REASON]
                                 Claim the keyboard. While held, input from anyone
@@ -32910,6 +33139,7 @@ exit 0
             "pane-1",
             "lease.taken",
             json!({"holder": "alice"}),
+            true,
         )
         .expect("append 1");
         assert_eq!(first.seq, 1);
@@ -32921,6 +33151,7 @@ exit 0
             "pane-1",
             "lease.released",
             json!({"holder": "alice", "note": "done"}),
+            true,
         )
         .expect("append 2");
         assert_eq!(second.seq, 2);
@@ -32933,6 +33164,7 @@ exit 0
             "pane-1",
             "lease.taken",
             json!({"holder": "bob"}),
+            false,
         )
         .expect("append 3");
         assert_eq!(third.seq, 3);
@@ -33306,6 +33538,115 @@ exit 0
             })
             .expect("holder write accepted");
         daemon.shutdown();
+    }
+
+    #[test]
+    fn router_ledgers_attention_transitions_and_pane_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let router = OutputRouter::new(dir.path().join("scrollback"));
+        let ledger_dir = dir.path().join(LEDGER_DIR);
+        fs::create_dir_all(&ledger_dir).expect("ledger dir");
+        router.set_ledger(Arc::new(Mutex::new(LedgerSink::new(ledger_dir.clone()))));
+
+        router.apply_agent_classification("pane-7", CLAUDE_WORKING_SCREEN);
+        router.apply_agent_classification("pane-7", CLAUDE_WORKING_SCREEN);
+        router.apply_agent_classification("pane-7", CLAUDE_IDLE_SCREEN);
+        router.clear_agent_attention("pane-7");
+        router.emit_pane_ended("pane-7", Some(0));
+
+        let path = ledger_path(&ledger_dir, "pane-7");
+        let summary = ledger_verify(&path).expect("router notes chain");
+        assert_eq!(summary.records, 4);
+        let records = read_ledger_tail(&path, 0);
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|record| record["type"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "attention.changed",
+                "attention.changed",
+                "attention.changed",
+                "pane.ended"
+            ]
+        );
+        assert_eq!(records[0]["payload"]["from"], Value::Null);
+        assert_eq!(records[0]["payload"]["to"], json!("working"));
+        assert_eq!(records[0]["payload"]["evidence"], json!("screen"));
+        assert_eq!(records[1]["payload"]["from"], json!("working"));
+        assert_eq!(records[1]["payload"]["to"], json!("idle"));
+        assert_eq!(records[2]["payload"]["to"], Value::Null);
+        assert_eq!(records[2]["payload"]["evidence"], json!("process ended"));
+        assert_eq!(records[3]["payload"]["exit_code"], json!(0));
+        // A bare router (no sink) stays silent rather than failing.
+        let silent = OutputRouter::new(dir.path().join("scrollback2"));
+        silent.apply_agent_classification("pane-8", CLAUDE_WORKING_SCREEN);
+        assert!(!ledger_path(&ledger_dir, "pane-8").exists());
+    }
+
+    #[test]
+    fn parse_agent_args_watch_forms() {
+        let parsed = parse_agent_args(&agent_args(&["--watch"])).expect("bare watch");
+        assert!(parsed.watch);
+        assert!(!parsed.pane_given);
+        assert_eq!(parsed.mark, None);
+        let parsed = parse_agent_args(&agent_args(&["pane-3", "--watch"])).expect("pane watch");
+        assert!(parsed.watch);
+        assert!(parsed.pane_given);
+        assert_eq!(parsed.pane_ref, "pane-3");
+        let parsed = parse_agent_args(&agent_args(&["--watch", "pane-3"])).expect("flag first");
+        assert!(parsed.pane_given);
+        assert_eq!(parsed.pane_ref, "pane-3");
+        let err = parse_agent_args(&agent_args(&["pane-3", "on", "--watch"]))
+            .expect_err("watch excludes marks");
+        assert!(err.contains("--watch"), "{err}");
+        let plain = parse_agent_args(&agent_args(&["pane-3"])).expect("plain");
+        assert!(!plain.watch);
+        assert!(plain.pane_given);
+    }
+
+    #[test]
+    fn format_watch_event_lines_and_json() {
+        let state = DaemonEvent::AgentState {
+            pane_id: "pane-1".to_string(),
+            agent: Some("claude".to_string()),
+            attention: Some(AgentAttention::NeedsInput),
+        };
+        assert_eq!(
+            format_watch_event(&state, false).as_deref(),
+            Some("pane-1\tagent_state\tclaude\tneeds_input")
+        );
+        let json_line = format_watch_event(&state, true).expect("json");
+        let parsed: Value = serde_json::from_str(&json_line).expect("valid json");
+        assert_eq!(parsed["event"], json!("agent_state"));
+        assert_eq!(parsed["attention"], json!("needs_input"));
+        let lease = DaemonEvent::LeaseState {
+            pane_id: "pane-1".to_string(),
+            transition: LeaseTransition::Taken,
+            holder: Some("alice".to_string()),
+            since_ms: Some(1),
+            note: None,
+        };
+        assert_eq!(
+            format_watch_event(&lease, false).as_deref(),
+            Some("pane-1\tlease_taken\talice")
+        );
+        let ended = DaemonEvent::PaneEnded {
+            pane_id: "pane-1".to_string(),
+            exit_code: None,
+        };
+        assert_eq!(
+            format_watch_event(&ended, false).as_deref(),
+            Some("pane-1\tpane_ended\t-")
+        );
+        let output = DaemonEvent::PtyOutput {
+            pane_id: "pane-1".to_string(),
+            data: "x".to_string(),
+        };
+        assert_eq!(format_watch_event(&output, false), None);
+        assert_eq!(watch_event_pane(&output), None);
+        assert_eq!(watch_event_pane(&ended), Some("pane-1"));
     }
 
     #[test]
