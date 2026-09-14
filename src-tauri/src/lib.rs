@@ -1733,6 +1733,11 @@ struct Config {
     /// outranks the screen heuristic. Unix only.
     #[serde(default)]
     agent_probe_interval_ms: Option<u64>,
+    /// (M4) The `kranz` CLI used to read a bound pane's mission state and to
+    /// mirror hand-back notes into its inbox. Unset resolves `SGIAN_KRANZ_BIN`
+    /// and then `kranz` on PATH.
+    #[serde(default)]
+    kranz_bin: Option<String>,
     /// (T2) Permission mode for agent-pane `claude` processes, passed to
     /// `--permission-mode`. Defaults to `manual`: every tool use that needs
     /// approval arrives as a `permission_request` agent event and blocks until
@@ -1821,6 +1826,7 @@ impl Config {
             agent_probe_interval_ms: other
                 .agent_probe_interval_ms
                 .or(self.agent_probe_interval_ms),
+            kranz_bin: other.kranz_bin.or(self.kranz_bin),
             agent_permission_mode: other.agent_permission_mode.or(self.agent_permission_mode),
             agent_claude_bin: other.agent_claude_bin.or(self.agent_claude_bin),
             agent_droid_bin: other.agent_droid_bin.or(self.agent_droid_bin),
@@ -1869,6 +1875,19 @@ impl Config {
             .as_deref()
             .and_then(LeasePolicy::parse)
             .unwrap_or(LeasePolicy::Open)
+    }
+
+    /// (M4) The `kranz` binary: config, then `SGIAN_KRANZ_BIN`, then PATH.
+    fn kranz_bin_effective(&self) -> String {
+        self.kranz_bin
+            .clone()
+            .filter(|bin| !bin.is_empty())
+            .or_else(|| {
+                std::env::var("SGIAN_KRANZ_BIN")
+                    .ok()
+                    .filter(|bin| !bin.is_empty())
+            })
+            .unwrap_or_else(|| "kranz".to_string())
     }
 
     /// (M3b) The official agent probe cadence; `None` when disabled.
@@ -2223,6 +2242,17 @@ enum DaemonRequest {
     LeaseStatus {
         pane_id: String,
     },
+    /// (M4) Bind a pane to a Kranz mission by hand (`repo` defaults to the
+    /// pane's cwd); auto bindings come from a `kranz run` under the pane.
+    KranzBind {
+        pane_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+    },
+    KranzUnbind {
+        pane_id: String,
+    },
+    KranzBindings,
     ResizePaneTerminal {
         pane_id: String,
         cols: u16,
@@ -3646,6 +3676,17 @@ impl OutputRouter {
         attention: AgentAttention,
         ttl: Duration,
     ) -> bool {
+        self.apply_official_attention_with(pane_id, agent, attention, ttl, "claude-agents")
+    }
+
+    fn apply_official_attention_with(
+        &self,
+        pane_id: &str,
+        agent: &str,
+        attention: AgentAttention,
+        ttl: Duration,
+        evidence: &'static str,
+    ) -> bool {
         let Ok(mut tracker) = self.agents.lock() else {
             return false;
         };
@@ -3674,7 +3715,7 @@ impl OutputRouter {
                 "agent": new_agent,
                 "from": previous_attention,
                 "to": new_attention,
-                "evidence": "claude-agents",
+                "evidence": evidence,
             }),
         );
         self.broadcast(&DaemonEvent::AgentState {
@@ -4649,6 +4690,29 @@ impl TerminalStore {
             .get(pane_id)
             .ok_or_else(|| format!("terminal session not found: {pane_id}"))?;
         queue_pane_input(&session.input, pane_id, data)
+    }
+
+    /// (M4) Live panes and their spawn cwd (the default Kranz repo).
+    fn live_pane_cwds(&self) -> HashMap<String, String> {
+        self.liveness
+            .lock()
+            .map(|liveness| {
+                liveness
+                    .iter()
+                    .filter(|(_, entry)| !entry.ended)
+                    .filter_map(|(pane_id, entry)| {
+                        entry.cwd.clone().map(|cwd| (pane_id.clone(), cwd))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn pane_cwd(&self, pane_id: &str) -> Option<String> {
+        self.liveness
+            .lock()
+            .ok()
+            .and_then(|liveness| liveness.get(pane_id).and_then(|entry| entry.cwd.clone()))
     }
 
     /// (M3b) Live shell panes with a recorded child pid, for the official
@@ -7286,16 +7350,123 @@ fn attention_from_probe(entry: &AgentProbeEntry) -> Option<AgentAttention> {
     }
 }
 
-/// Parse `ps -axo pid=,ppid=` output into child → parent.
-fn parse_parent_map(text: &str) -> HashMap<u32, u32> {
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse().ok()?;
-            let ppid = fields.next()?.parse().ok()?;
-            Some((pid, ppid))
+/// One `ps -axo pid=,ppid=,args=` snapshot: child → parent, and each pid's
+/// command line (empty when `ps` was asked for pids only).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ProcessTable {
+    parent: HashMap<u32, u32>,
+    args: HashMap<u32, String>,
+}
+
+fn parse_process_table(text: &str) -> ProcessTable {
+    let mut table = ProcessTable::default();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(ppid)) = (
+            fields.next().and_then(|field| field.parse::<u32>().ok()),
+            fields.next().and_then(|field| field.parse::<u32>().ok()),
+        ) else {
+            continue;
+        };
+        table.parent.insert(pid, ppid);
+        let args = fields.collect::<Vec<_>>().join(" ");
+        if !args.is_empty() {
+            table.args.insert(pid, args);
+        }
+    }
+    table
+}
+
+/// Whether a command line is a Kranz worker loop (`kranz run` / `exec` /
+/// `work`), by its argv[0] basename and first subcommand.
+fn is_kranz_worker_command(args: &str) -> bool {
+    let mut fields = args.split_whitespace();
+    let Some(program) = fields.next() else {
+        return false;
+    };
+    let basename = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    if basename != "kranz" && basename != "kranz.exe" {
+        return false;
+    }
+    // Global flags precede the subcommand; `--repo`/`--mission` take a value.
+    let mut skip_value = false;
+    for field in fields {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if let Some(flag) = field.strip_prefix("--") {
+            skip_value = matches!(flag, "repo" | "mission");
+            continue;
+        }
+        return matches!(field, "run" | "exec" | "work");
+    }
+    false
+}
+
+/// (M4) Panes whose process tree contains a Kranz worker loop: pane → the
+/// worker's pid. A pane with several workers reports the first found.
+fn find_kranz_panes(table: &ProcessTable, pane_pids: &[(String, u32)]) -> HashMap<String, u32> {
+    let pane_by_pid: HashMap<u32, &str> = pane_pids
+        .iter()
+        .map(|(pane_id, pid)| (*pid, pane_id.as_str()))
+        .collect();
+    let mut found: HashMap<String, u32> = HashMap::new();
+    for (pid, args) in &table.args {
+        if !is_kranz_worker_command(args) {
+            continue;
+        }
+        let mut cursor = *pid;
+        for _ in 0..64 {
+            if let Some(pane_id) = pane_by_pid.get(&cursor) {
+                found.entry((*pane_id).to_string()).or_insert(*pid);
+                break;
+            }
+            match table.parent.get(&cursor) {
+                Some(parent) if *parent != cursor && *parent > 1 => cursor = *parent,
+                _ => break,
+            }
+        }
+    }
+    found
+}
+
+/// (M4) Map a Kranz `MissionState` (camelCase JSON, as `kranz status --json`
+/// prints it) onto pane attention: anything pending on a person is
+/// needs-input, an active loop is working, a terminal state is idle.
+fn kranz_attention_from_state(state: &Value) -> Option<AgentAttention> {
+    let non_empty = |key: &str| {
+        state.get(key).is_some_and(|value| match value {
+            Value::Array(items) => !items.is_empty(),
+            Value::Null => false,
+            Value::Object(_) => true,
+            _ => true,
         })
-        .collect()
+    };
+    if non_empty("pendingQuestions")
+        || non_empty("pendingGrantRequest")
+        || non_empty("pendingRevision")
+    {
+        return Some(AgentAttention::NeedsInput);
+    }
+    match state.get("status").and_then(Value::as_str) {
+        Some("planning") | Some("approved") | Some("running") | Some("validating") => {
+            Some(AgentAttention::Working)
+        }
+        Some("paused") | Some("blocked") => Some(AgentAttention::NeedsInput),
+        Some("complete") | Some("failed") | Some("abandoned") => Some(AgentAttention::Idle),
+        _ => None,
+    }
+}
+
+/// (M4) A pane bound to a Kranz mission: hand-back notes are mirrored into
+/// its inbox and its attention comes from `kranz status`. Auto bindings come
+/// from the process tree (a `kranz run` under the pane's shell); manual ones
+/// from `ctl kranz bind` and survive the worker exiting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KranzBinding {
+    pub repo: String,
+    pub manual: bool,
 }
 
 /// Attribute each probe entry to the pane whose child process is its ancestor
@@ -7434,6 +7605,8 @@ struct DaemonServer {
     /// (M3b) Panes with an official reading → consecutive rounds missing from
     /// the listing (see `reconcile_probe_rounds`). Leaf lock.
     probe_mapped: Mutex<HashMap<String, u8>>,
+    /// (M4) Panes bound to a Kranz mission. Leaf lock.
+    kranz_bindings: Mutex<HashMap<String, KranzBinding>>,
 }
 
 /// Removes a pane's in-flight spawn marker and wakes any ensure/restart
@@ -7653,7 +7826,197 @@ impl DaemonServer {
             workspace_was_corrupt: was_corrupt,
             probe_warned: AtomicBool::new(false),
             probe_mapped: Mutex::new(HashMap::new()),
+            kranz_bindings: Mutex::new(HashMap::new()),
         })
+    }
+
+    // ----- Kranz bindings (M4, docs/design/keyboard-lease-and-ledger.md) -----
+
+    fn lock_kranz(&self) -> Result<MutexGuard<'_, HashMap<String, KranzBinding>>, String> {
+        self.kranz_bindings
+            .lock()
+            .map_err(|_| "kranz binding lock poisoned".to_string())
+    }
+
+    fn handle_kranz_bind(&self, pane_id: &str, repo: Option<String>) -> Result<Value, String> {
+        self.ensure_pane_exists(pane_id)?;
+        let repo = match repo {
+            Some(repo) => validate_bounded_text(&repo, "repo", 4096)?,
+            None => self
+                .lock_terminals()?
+                .pane_cwd(pane_id)
+                .ok_or_else(|| format!("pane {pane_id} has no recorded cwd; pass --repo PATH"))?,
+        };
+        let binding = KranzBinding { repo, manual: true };
+        self.lock_kranz()?
+            .insert(pane_id.to_string(), binding.clone());
+        let _ = self.ledger_record(
+            pane_id,
+            "kranz.bound",
+            json!({ "repo": binding.repo, "manual": true }),
+        );
+        Ok(json!({ "pane_id": pane_id, "binding": binding }))
+    }
+
+    fn handle_kranz_unbind(&self, pane_id: &str) -> Result<Value, String> {
+        self.ensure_pane_exists(pane_id)?;
+        let removed = self.lock_kranz()?.remove(pane_id);
+        if let Some(binding) = &removed {
+            let _ = self.ledger_record(
+                pane_id,
+                "kranz.unbound",
+                json!({ "repo": binding.repo, "manual": binding.manual }),
+            );
+        }
+        Ok(json!({ "pane_id": pane_id, "binding": removed }))
+    }
+
+    fn kranz_bindings_snapshot(&self) -> HashMap<String, KranzBinding> {
+        self.lock_kranz()
+            .map(|bindings| bindings.clone())
+            .unwrap_or_default()
+    }
+
+    /// (M4) Reconcile auto bindings with this round's process table: bind
+    /// panes that gained a `kranz run` descendant (repo = the pane's cwd) and
+    /// drop auto bindings whose worker is gone or whose pane is not live.
+    /// Manual bindings are left alone. Returns every current binding.
+    fn reconcile_kranz_bindings(
+        &self,
+        workers: &HashMap<String, u32>,
+        live_cwds: &HashMap<String, String>,
+    ) -> Vec<(String, KranzBinding)> {
+        let Ok(mut bindings) = self.lock_kranz() else {
+            return Vec::new();
+        };
+        let mut newly = Vec::new();
+        for pane_id in workers.keys() {
+            if bindings.contains_key(pane_id) {
+                continue;
+            }
+            let Some(repo) = live_cwds.get(pane_id) else {
+                continue;
+            };
+            bindings.insert(
+                pane_id.clone(),
+                KranzBinding {
+                    repo: repo.clone(),
+                    manual: false,
+                },
+            );
+            newly.push((pane_id.clone(), repo.clone()));
+        }
+        bindings.retain(|pane_id, binding| {
+            binding.manual || (workers.contains_key(pane_id) && live_cwds.contains_key(pane_id))
+        });
+        let current: Vec<(String, KranzBinding)> = bindings
+            .iter()
+            .map(|(pane_id, binding)| (pane_id.clone(), binding.clone()))
+            .collect();
+        drop(bindings);
+        for (pane_id, repo) in newly {
+            tracing::info!(
+                workspace_key = %self.workspace_key,
+                pane_id = %pane_id,
+                repo = %repo,
+                event = "kranz_bound",
+                "Kranz worker found under pane; mission state now drives its badge"
+            );
+            let _ = self.ledger_record(
+                &pane_id,
+                "kranz.bound",
+                json!({ "repo": repo, "manual": false }),
+            );
+        }
+        current
+    }
+
+    /// (M4) Read a bound mission's state through the CLI (`kranz status
+    /// --json`, read-only, no lock) and apply it as an official reading.
+    #[cfg(unix)]
+    fn probe_kranz_binding(&self, pane_id: &str, binding: &KranzBinding, ttl: Duration) {
+        let bin = self.effective_config().kranz_bin_effective();
+        let output = match Command::new(&bin)
+            .args(["--repo", &binding.repo, "status", "--json"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => output.stdout,
+            Ok(output) => {
+                self.note_probe_failure(&format!(
+                    "`{bin} --repo {} status --json` exited {}",
+                    binding.repo, output.status
+                ));
+                return;
+            }
+            Err(error) => {
+                self.note_probe_failure(&format!("cannot run `{bin} status --json`: {error}"));
+                return;
+            }
+        };
+        let state: Value = match serde_json::from_slice(&output) {
+            Ok(state) => state,
+            Err(error) => {
+                self.note_probe_failure(&format!("unreadable `kranz status --json`: {error}"));
+                return;
+            }
+        };
+        if let Some(attention) = kranz_attention_from_state(&state) {
+            self.router.apply_official_attention_with(
+                pane_id,
+                "kranz",
+                attention,
+                ttl,
+                "kranz-status",
+            );
+        }
+    }
+
+    /// (M4) Mirror a hand-back note into the bound mission's inbox via
+    /// `kranz msg`, and ledger the outcome either way. The release itself has
+    /// already succeeded; a failed mirror is recorded, never surfaced as an
+    /// error.
+    fn mirror_release_to_kranz(&self, pane_id: &str, holder: &str, note: &str) {
+        let binding = match self.lock_kranz() {
+            Ok(bindings) => bindings.get(pane_id).cloned(),
+            Err(_) => None,
+        };
+        let Some(binding) = binding else {
+            return;
+        };
+        let bin = self.effective_config().kranz_bin_effective();
+        let text = format!("[sgian] {holder} handed back the keyboard: {note}");
+        let outcome = Command::new(&bin)
+            .args(["--repo", &binding.repo, "msg", &text])
+            .stdin(Stdio::null())
+            .output();
+        let (ok, error) = match outcome {
+            Ok(output) if output.status.success() => (true, None),
+            Ok(output) => (
+                false,
+                Some(format!(
+                    "{bin} msg exited {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+            ),
+            Err(error) => (false, Some(format!("cannot run {bin}: {error}"))),
+        };
+        if let Some(error) = &error {
+            tracing::warn!(
+                workspace_key = %self.workspace_key,
+                pane_id = %pane_id,
+                event = "kranz_mirror_failed",
+                error = %error,
+                "hand-back note was not mirrored to kranz"
+            );
+        }
+        let _ = self.ledger_record(
+            pane_id,
+            "kranz.mirrored",
+            json!({ "repo": binding.repo, "ok": ok, "error": error }),
+        );
     }
 
     /// (M3b) One round of the official agent probe: run `claude agents --json`,
@@ -7698,19 +8061,28 @@ impl DaemonServer {
                 return;
             }
         };
-        let parents = match Command::new("ps")
-            .args(["-axo", "pid=,ppid="])
+        let table = match Command::new("ps")
+            .args(["-axo", "pid=,ppid=,args="])
             .stdin(Stdio::null())
             .output()
         {
-            Ok(output) => parse_parent_map(&String::from_utf8_lossy(&output.stdout)),
+            Ok(output) => parse_process_table(&String::from_utf8_lossy(&output.stdout)),
             Err(error) => {
                 self.note_probe_failure(&format!("cannot run ps: {error}"));
                 return;
             }
         };
         let ttl = interval.saturating_mul(2) + Duration::from_millis(500);
-        let mapped = map_probe_entries(&entries, &parents, &pane_pids);
+        // (M4) Kranz workers under a pane bind it to their mission.
+        let workers = find_kranz_panes(&table, &pane_pids);
+        let live_cwds = self
+            .lock_terminals()
+            .map(|terminals| terminals.live_pane_cwds())
+            .unwrap_or_default();
+        for (pane_id, binding) in self.reconcile_kranz_bindings(&workers, &live_cwds) {
+            self.probe_kranz_binding(&pane_id, &binding, ttl);
+        }
+        let mapped = map_probe_entries(&entries, &table.parent, &pane_pids);
         for (pane_id, attention) in &mapped {
             if self
                 .router
@@ -7968,6 +8340,9 @@ impl DaemonServer {
                 holder,
                 note,
             } => self.handle_release_lease(&pane_id, &holder, &note),
+            DaemonRequest::KranzBind { pane_id, repo } => self.handle_kranz_bind(&pane_id, repo),
+            DaemonRequest::KranzUnbind { pane_id } => self.handle_kranz_unbind(&pane_id),
+            DaemonRequest::KranzBindings => Ok(json!(self.kranz_bindings_snapshot())),
             DaemonRequest::LeaseStatus { pane_id } => {
                 self.ensure_pane_exists(&pane_id)?;
                 self.lease_info(&pane_id).map(|info| json!(info))
@@ -8925,6 +9300,8 @@ impl DaemonServer {
             holder = %holder,
             "keyboard lease released"
         );
+        // (M4) A bound pane's note also reaches the mission's inbox.
+        self.mirror_release_to_kranz(pane_id, &holder, &note);
         self.router.broadcast(&DaemonEvent::LeaseState {
             pane_id: pane_id.to_string(),
             transition: LeaseTransition::Released,
@@ -13179,6 +13556,18 @@ fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             };
             control_lease(&client, parsed, options.json)
         }
+        "kranz" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_kranz_args(&options.args[1..])?;
+            let client = if parsed.verb == KranzVerb::Status {
+                DaemonClient::connect_existing(options.workspace)?
+            } else {
+                DaemonClient::connect_or_spawn(options.workspace)?
+            };
+            control_kranz(&client, parsed, options.json)
+        }
         "ledger" => {
             if has_help_flag(&options.args[1..]) {
                 return print_control_help();
@@ -14103,6 +14492,122 @@ fn control_ledger(
         writeln!(stdout, "{record}").map_err(|error| format!("failed to write stdout: {error}"))?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KranzVerb {
+    Status,
+    Bind,
+    Unbind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KranzArgs {
+    verb: KranzVerb,
+    pane_ref: String,
+    repo: Option<String>,
+}
+
+/// `kranz [status|bind|unbind] [PANE] [--repo PATH]`.
+fn parse_kranz_args(args: &[String]) -> Result<KranzArgs, String> {
+    let mut parsed = KranzArgs {
+        verb: KranzVerb::Status,
+        pane_ref: "active".to_string(),
+        repo: None,
+    };
+    let mut index = 0;
+    match args.first().map(String::as_str) {
+        Some("status") => index = 1,
+        Some("bind") => {
+            parsed.verb = KranzVerb::Bind;
+            index = 1;
+        }
+        Some("unbind") => {
+            parsed.verb = KranzVerb::Unbind;
+            index = 1;
+        }
+        _ => {}
+    }
+    let mut pane_seen = false;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--repo" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--repo requires a PATH".to_string())?;
+                parsed.repo = Some(value.clone());
+                index += 1;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(format!("unexpected argument for kranz: {other}"));
+            }
+            other => {
+                if pane_seen {
+                    return Err(format!("unexpected argument for kranz: {other}"));
+                }
+                parsed.pane_ref = other.to_string();
+                pane_seen = true;
+            }
+        }
+        index += 1;
+    }
+    if parsed.verb != KranzVerb::Bind && parsed.repo.is_some() {
+        return Err("--repo applies to `kranz bind`".to_string());
+    }
+    if parsed.verb == KranzVerb::Status && pane_seen {
+        return Err("kranz status lists every binding; it takes no PANE".to_string());
+    }
+    Ok(parsed)
+}
+
+fn control_kranz(
+    client: &DaemonClient,
+    parsed: KranzArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let result: Value = match parsed.verb {
+        KranzVerb::Status => client.request(DaemonRequest::KranzBindings)?,
+        KranzVerb::Bind => {
+            let pane_id = resolve_pane_ref(client, &parsed.pane_ref)?;
+            client.request(DaemonRequest::KranzBind {
+                pane_id,
+                repo: parsed.repo,
+            })?
+        }
+        KranzVerb::Unbind => {
+            let pane_id = resolve_pane_ref(client, &parsed.pane_ref)?;
+            client.request(DaemonRequest::KranzUnbind { pane_id })?
+        }
+    };
+    if json_output {
+        return write_json_stdout(&result);
+    }
+    let mut stdout = std::io::stdout();
+    match parsed.verb {
+        KranzVerb::Status => {
+            let bindings: HashMap<String, KranzBinding> =
+                serde_json::from_value(result).unwrap_or_default();
+            let mut rows: Vec<_> = bindings.into_iter().collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            for (pane_id, binding) in rows {
+                writeln!(
+                    stdout,
+                    "{pane_id}\t{}\t{}",
+                    if binding.manual { "manual" } else { "auto" },
+                    binding.repo
+                )
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+            }
+            Ok(())
+        }
+        _ => writeln!(
+            stdout,
+            "{}\t{}",
+            result["pane_id"].as_str().unwrap_or("-"),
+            result["binding"]["repo"].as_str().unwrap_or("-")
+        )
+        .map_err(|error| format!("failed to write stdout: {error}")),
+    }
 }
 
 fn control_send_input(client: &DaemonClient, args: &[String]) -> Result<(), String> {
@@ -16690,6 +17195,14 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   $SGIAN_HOLDER or user@host.
   lease release [PANE] -m NOTE [--as HOLDER]
                                 Hand the keyboard back; the note is mandatory.
+  kranz status                  List panes bound to Kranz missions (auto: a
+                                  `kranz run` under the pane; manual: bind)
+  kranz bind [PANE] [--repo PATH]
+                                Bind a pane to the mission at PATH (default: the
+                                  pane's cwd). Hand-back notes are mirrored into
+                                  its inbox with `kranz msg`; `kranz status`
+                                  drives the pane's badge.
+  kranz unbind [PANE]           Remove a binding
   ledger [PANE] [-n N] [--verify]
                                 Print a pane's hash-chained lease ledger (JSONL).
                                   --verify walks the chain and names the first break.
@@ -22131,6 +22644,7 @@ mod tests {
             restore_policy: Some("restore_on_demand".to_string()),
             lease_policy: None,
             agent_probe_interval_ms: None,
+            kranz_bin: None,
             agent_permission_mode: Some("manual".to_string()),
             agent_claude_bin: Some("/opt/claude/bin/claude".to_string()),
             agent_droid_bin: Some("/opt/factory/bin/droid".to_string()),
@@ -34096,7 +34610,7 @@ exit 0
         assert_eq!(parsed[0].pid, Some(300));
         assert_eq!(parsed[0].status.as_deref(), Some("busy"));
 
-        let parents = parse_parent_map("  300   200\n200 100\n999 1\nbad line\n");
+        let parents = parse_process_table("  300   200\n200 100\n999 1\nbad line\n").parent;
         assert_eq!(parents.get(&300), Some(&200));
         assert_eq!(parents.len(), 3);
         let pane_pids = vec![
@@ -34251,6 +34765,171 @@ exit 0
             reconcile_probe_rounds(&mut previous, &none, &["pane-2".to_string()]),
             vec!["pane-1".to_string()]
         );
+    }
+
+    #[test]
+    fn kranz_worker_detection_and_state_mapping() {
+        let table = parse_process_table(
+            "  300   200 /usr/local/bin/kranz --repo /w run\n200 100 -zsh\n400 100 kranz status\n500 1 /x/kranz.exe work\n999 1 kranz\n",
+        );
+        assert_eq!(table.parent.get(&300), Some(&200));
+        assert_eq!(table.args.get(&200).map(String::as_str), Some("-zsh"));
+        assert!(is_kranz_worker_command(
+            "/usr/local/bin/kranz --repo /w run"
+        ));
+        assert!(is_kranz_worker_command("kranz.exe work"));
+        assert!(!is_kranz_worker_command("kranz status"));
+        assert!(!is_kranz_worker_command("/bin/kranzy run"));
+        assert!(!is_kranz_worker_command(""));
+        let pane_pids = vec![
+            ("pane-1".to_string(), 100u32),
+            ("pane-2".to_string(), 500u32),
+        ];
+        let workers = find_kranz_panes(&table, &pane_pids);
+        assert_eq!(workers.get("pane-1"), Some(&300));
+        assert_eq!(workers.get("pane-2"), Some(&500));
+        assert_eq!(workers.len(), 2);
+
+        assert_eq!(
+            kranz_attention_from_state(&json!({"status": "running"})),
+            Some(AgentAttention::Working)
+        );
+        assert_eq!(
+            kranz_attention_from_state(
+                &json!({"status": "running", "pendingQuestions": [{"id": "q1"}]})
+            ),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(
+            kranz_attention_from_state(
+                &json!({"status": "running", "pendingGrantRequest": {"id": "g1"}})
+            ),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(
+            kranz_attention_from_state(&json!({"status": "paused"})),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(
+            kranz_attention_from_state(&json!({"status": "complete", "pendingQuestions": []})),
+            Some(AgentAttention::Idle)
+        );
+        assert_eq!(
+            kranz_attention_from_state(&json!({"status": "weird"})),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_kranz_args_shapes() {
+        let status = parse_kranz_args(&[]).expect("bare");
+        assert_eq!(status.verb, KranzVerb::Status);
+        let bind = parse_kranz_args(&args(&["bind", "pane-2", "--repo", "/repo"])).expect("bind");
+        assert_eq!(bind.verb, KranzVerb::Bind);
+        assert_eq!(bind.pane_ref, "pane-2");
+        assert_eq!(bind.repo.as_deref(), Some("/repo"));
+        let unbind = parse_kranz_args(&args(&["unbind"])).expect("unbind");
+        assert_eq!(unbind.verb, KranzVerb::Unbind);
+        assert_eq!(unbind.pane_ref, "active");
+        assert!(parse_kranz_args(&args(&["status", "pane-1"])).is_err());
+        assert!(parse_kranz_args(&args(&["unbind", "--repo", "/x"])).is_err());
+        assert!(parse_kranz_args(&args(&["bind", "--repo"])).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn released_note_is_mirrored_to_a_bound_kranz_mission() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("kranz-args.txt");
+        let script = dir.path().join("kranz");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                record.display()
+            ),
+        )
+        .expect("write fake kranz");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let daemon = TestDaemon::spawn(Config {
+            kranz_bin: Some(script.to_string_lossy().into_owned()),
+            ..Config::default()
+        });
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        let bound: Value = client
+            .request(DaemonRequest::KranzBind {
+                pane_id: pane_id.clone(),
+                repo: Some("/tmp/mission-repo".to_string()),
+            })
+            .expect("bind");
+        assert_eq!(bound["binding"]["manual"], json!(true));
+        let listed: HashMap<String, KranzBinding> = client
+            .request(DaemonRequest::KranzBindings)
+            .expect("bindings");
+        assert_eq!(listed[&pane_id].repo, "/tmp/mission-repo");
+
+        client
+            .request::<LeaseInfo>(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect("take");
+        client
+            .request::<LeaseInfo>(DaemonRequest::ReleaseLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                note: "answered the grant; carry on".to_string(),
+            })
+            .expect("release");
+        let recorded = fs::read_to_string(&record).expect("fake kranz was invoked");
+        let argv: Vec<&str> = recorded.lines().collect();
+        assert_eq!(argv[0..3], ["--repo", "/tmp/mission-repo", "msg"]);
+        assert!(
+            argv[3].contains("alice handed back the keyboard: answered the grant; carry on"),
+            "{recorded}"
+        );
+
+        let path = ledger_path(&daemon.data_dir.path().join(LEDGER_DIR), &pane_id);
+        let kinds: Vec<String> = read_ledger_tail(&path, 0)
+            .iter()
+            .map(|record| record["type"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "kranz.bound",
+                "lease.taken",
+                "lease.released",
+                "kranz.mirrored"
+            ]
+        );
+        let mirrored = read_ledger_tail(&path, 1).remove(0);
+        assert_eq!(mirrored["payload"]["ok"], json!(true));
+        assert_eq!(mirrored["payload"]["repo"], json!("/tmp/mission-repo"));
+
+        // Unbinding stops the mirror; the ledger says so.
+        client
+            .request::<Value>(DaemonRequest::KranzUnbind {
+                pane_id: pane_id.clone(),
+            })
+            .expect("unbind");
+        let listed: HashMap<String, KranzBinding> = client
+            .request(DaemonRequest::KranzBindings)
+            .expect("bindings");
+        assert!(listed.is_empty());
+        assert_eq!(
+            read_ledger_tail(&path, 1).remove(0)["type"],
+            json!("kranz.unbound")
+        );
+        daemon.shutdown();
     }
 
     #[test]

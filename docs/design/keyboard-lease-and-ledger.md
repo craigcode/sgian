@@ -214,7 +214,11 @@ fallback, marked low-confidence. Ledger `attention.changed` with evidence.
 Expose transitions to scripts: `ctl agent --watch --json`. Relay the same
 signals to a Kranz run via its hook-status lane when the pane belongs to one.
 
-**M4 — Kranz target.** A pane kind that tails a mission run over
+**M4 — Kranz target (lean version shipped 2026-09-14).** Shipped: a shell
+pane running `kranz run` is bound to its mission automatically (or by
+`ctl kranz bind`), `kranz status --json` drives its badge, and a released
+note is mirrored with `kranz msg`, all through the CLI so the daemon needs
+no HTTP client. Remaining from the draft: a pane kind that tails a mission run over
 `GET /api/missions/:id/ws?since=` with the read token from disk, renders the
 transcript as backscroll, maps `MissionStatus` plus pending fields to
 attention, and turns `take` into message mode posting

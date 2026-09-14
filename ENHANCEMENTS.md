@@ -116,11 +116,25 @@ Shipped (M3b, 2026-09-14):
   over the shell prompt. Manual marks are untouched. Verified live against
   an interactive Claude Code session inside a pane.
 
+Shipped (M4, lean, 2026-09-14):
+
+- **Kranz-bound panes.** A shell pane whose process tree contains a Kranz
+  worker loop (`kranz run` / `exec` / `work`) is bound to the mission at the
+  pane's cwd; `ctl kranz bind [PANE] [--repo PATH]` binds by hand and
+  `ctl kranz status` lists bindings. While bound, `kranz status --json`
+  (read-only, no lock) drives the pane's badge as an official reading
+  (`needs input` for a pending question, grant or revision, or a paused or
+  blocked mission), and a released lease's hand-back note is mirrored into
+  the mission inbox with `kranz msg`; `kranz.bound` / `kranz.mirrored` land
+  in the ledger with the outcome. This uses the Kranz CLI in the sibling
+  checkout rather than an HTTP client, so the daemon gains no async runtime;
+  the WebSocket transcript tail and message mode from the draft remain open.
+
 Open, in order:
 
 - **Notification-hook ingestion** (`agent_needs_input`, `permission_prompt`,
   `idle_prompt`) for sub-second needs-input without polling, and the relay
-  to Kranz's hook-status lane once a pane can be bound to a run.
+  to Kranz's hook-status lane for bound panes.
 - **M4 Kranz target**, **M5 SSM / ECS Exec target**, **M6 per-client
   identity** (the lease becomes a boundary).
 
