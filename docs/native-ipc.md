@@ -72,6 +72,15 @@ The native clients currently use:
 - `create_agent_pane_with_spec`, `send_agent_message`
 - `agent_approval`, `interrupt_agent`
 
+Daemons advertising the `lease` capability also accept
+`take_lease {pane_id, holder, force?, why?}`, `release_lease {pane_id, holder,
+note}`, `lease_status {pane_id}`, and `send_input_as {pane_id, input, holder}`;
+the bootstrap snapshot carries a `leases` map for held panes and subscribers
+receive `lease_state` events. `write_to_pane` carries no holder and is refused
+while a pane is held, so a client that wants to type into a held pane must
+take the lease and use `send_input_as`. See
+`docs/design/keyboard-lease-and-ledger.md`.
+
 The bootstrap snapshot supplies the pane registry, active pane, scrollback,
 recorded PTY dimensions, runtime state, agent attention, provider/model specs
 and bounded normalized agent-event replay. Clients size their terminal emulator

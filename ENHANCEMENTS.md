@@ -65,6 +65,33 @@ Shipped:
   pane/agent state, denylist-scrubbed log tail) without prompts, scrollback, or
   environment values. Scrubbing is best-effort, not a cryptographic guarantee.
 
+## 3a. Keyboard lease and session ledger
+
+Design and milestones: [docs/design/keyboard-lease-and-ledger.md](docs/design/keyboard-lease-and-ledger.md).
+
+Shipped (M1, 2026-09-13):
+
+- **Per-pane write lease in the daemon.** `take_lease` / `release_lease` /
+  `lease_status` requests, `send_input_as` for attributed input, a
+  `lease-state` event, `leases` in the bootstrap snapshot, persistence in
+  `workspace.json`, and `lease_policy` (`open` default / `required`) in config.
+- **Hash-chained ledger** at `ledger/<pane-id>.jsonl` (SHA-256 over
+  sorted-key JSON with a version prefix), fsynced per record, kept across
+  pane close. `ctl ledger --verify` names the first broken line.
+- **ctl surface**: `lease`, `lease take`, `lease release -m`, `ledger`,
+  `send --as`.
+
+Open, in order:
+
+- **M2 clients.** All three clients send a holder label, render the holder in
+  the pane header, refuse-with-toast on held panes, and open the note field
+  on release.
+- **M3 official agent signals.** Prefer `claude agents --json` and the
+  Notification hook over screen classification; ledger `attention.changed`;
+  `ctl agent --watch --json`; relay to Kranz's hook-status lane.
+- **M4 Kranz target**, **M5 SSM / ECS Exec target**, **M6 per-client
+  identity** (the lease becomes a boundary).
+
 ## 4. Workbench UX
 
 Shipped:

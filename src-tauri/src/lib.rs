@@ -1571,6 +1571,10 @@ pub struct WorkspaceSnapshot {
     /// objects byte-for-byte.
     #[serde(default)]
     pub agent_specs: HashMap<String, AgentPaneSpec>,
+    /// Keyboard leases for HELD panes only (pane_id → holder and counters).
+    /// Additive: old daemons omit it, old clients ignore it.
+    #[serde(default)]
+    pub leases: HashMap<String, LeaseInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1664,6 +1668,10 @@ struct PersistedWorkspace {
     /// (ENHANCEMENTS §4). Additive: pre-feature workspace files omit it.
     #[serde(default)]
     pane_shells: HashMap<String, ShellConfig>,
+    /// Held keyboard leases (pane_id → holder and counters), so a daemon
+    /// restart does not silently forget who was in control. Additive.
+    #[serde(default)]
+    leases: HashMap<String, HeldLease>,
 }
 
 /// User configuration, loaded from a global config.json and an optional per-workspace
@@ -1713,6 +1721,12 @@ struct Config {
     /// does not auto-restart. An unrecognized value falls back to the default.
     #[serde(default)]
     restore_policy: Option<String>,
+    /// Keyboard lease policy (docs/design/keyboard-lease-and-ledger.md).
+    /// `open` (default): an unheld pane accepts input from anyone and a held
+    /// pane only from its holder. `required`: every write needs the lease.
+    /// An unrecognized value is rejected by `validate`.
+    #[serde(default)]
+    lease_policy: Option<String>,
     /// (T2) Permission mode for agent-pane `claude` processes, passed to
     /// `--permission-mode`. Defaults to `manual`: every tool use that needs
     /// approval arrives as a `permission_request` agent event and blocks until
@@ -1797,6 +1811,7 @@ impl Config {
             theme: other.theme.or(self.theme),
             idle_shutdown_secs: other.idle_shutdown_secs.or(self.idle_shutdown_secs),
             restore_policy: other.restore_policy.or(self.restore_policy),
+            lease_policy: other.lease_policy.or(self.lease_policy),
             agent_permission_mode: other.agent_permission_mode.or(self.agent_permission_mode),
             agent_claude_bin: other.agent_claude_bin.or(self.agent_claude_bin),
             agent_droid_bin: other.agent_droid_bin.or(self.agent_droid_bin),
@@ -1838,6 +1853,15 @@ impl Config {
     /// unrecognized. This is a pure function — the warning for an unrecognized
     /// value is logged once in `run_daemon_with_config` after the tracing
     /// dispatcher is active.
+    /// Effective keyboard lease policy; unset (or, defensively, unparseable)
+    /// falls back to `open` so a stale config can never lock every pane.
+    fn lease_policy_effective(&self) -> LeasePolicy {
+        self.lease_policy
+            .as_deref()
+            .and_then(LeasePolicy::parse)
+            .unwrap_or(LeasePolicy::Open)
+    }
+
     fn restore_policy_effective(&self) -> String {
         match self.restore_policy.as_deref() {
             Some("auto_respawn") | None => "auto_respawn".to_string(),
@@ -1877,6 +1901,13 @@ impl Config {
             if !matches!(policy.as_str(), "auto_respawn" | "restore_on_demand") {
                 return Err(format!(
                     "invalid restore_policy '{policy}': must be 'auto_respawn' or 'restore_on_demand'"
+                ));
+            }
+        }
+        if let Some(ref policy) = self.lease_policy {
+            if LeasePolicy::parse(policy).is_none() {
+                return Err(format!(
+                    "invalid lease_policy '{policy}': must be 'open' or 'required'"
                 ));
             }
         }
@@ -2147,6 +2178,34 @@ enum DaemonRequest {
         pane_id: String,
         input: String,
     },
+    /// `SendInput` attributed to a keyboard-lease holder
+    /// (docs/design/keyboard-lease-and-ledger.md). The legacy `WriteToPane` /
+    /// `SendInput` carry no holder and are refused while a pane is held.
+    SendInputAs {
+        pane_id: String,
+        input: String,
+        holder: String,
+    },
+    /// Claim a pane's keyboard for `holder`. Idempotent for the current
+    /// holder; against another holder it needs `force` plus a `why`, and both
+    /// the revocation and the new claim are ledgered.
+    TakeLease {
+        pane_id: String,
+        holder: String,
+        #[serde(default)]
+        force: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<String>,
+    },
+    /// Hand a pane's keyboard back. The note is mandatory: it is the record.
+    ReleaseLease {
+        pane_id: String,
+        holder: String,
+        note: String,
+    },
+    LeaseStatus {
+        pane_id: String,
+    },
     ResizePaneTerminal {
         pane_id: String,
         cols: u16,
@@ -2342,6 +2401,18 @@ enum DaemonEvent {
         pane_id: String,
         agent: Option<String>,
         attention: Option<AgentAttention>,
+    },
+    /// Keyboard lease transition (docs/design/keyboard-lease-and-ledger.md).
+    /// `holder`/`since_ms` describe the lease AFTER the transition (null once
+    /// released or revoked); `note` rides a release. Old clients skip the
+    /// unknown event tag.
+    LeaseState {
+        pane_id: String,
+        transition: LeaseTransition,
+        holder: Option<String>,
+        since_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     /// (T2) One NORMALIZED conversation event from an agent pane's `claude`
     /// stream-json output. `event` is an object tagged by its `kind` field:
@@ -2629,6 +2700,7 @@ impl PaneRegistry {
             agent_states: HashMap::new(),
             agent_events: HashMap::new(),
             agent_specs: HashMap::new(),
+            leases: HashMap::new(),
         }
     }
 
@@ -4426,10 +4498,15 @@ impl TerminalStore {
             .unwrap_or_default()
     }
 
-    /// Write `data` to every live pane (best-effort); returns the panes written to.
-    fn write_to_all_live(&self, data: &str) -> Vec<String> {
+    /// Write `data` to every live pane except those in `skip` (best-effort);
+    /// returns the panes written to. `skip` carries panes whose keyboard is
+    /// held by someone other than the writer.
+    fn write_to_live_except(&self, data: &str, skip: &HashSet<String>) -> Vec<String> {
         let mut written = Vec::new();
         for pane_id in self.live_pane_ids() {
+            if skip.contains(&pane_id) {
+                continue;
+            }
             if self.write_to_pane(&pane_id, data).is_ok() {
                 written.push(pane_id);
             }
@@ -6544,6 +6621,413 @@ impl SubscriptionBackoff {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Keyboard lease and session ledger (docs/design/keyboard-lease-and-ledger.md)
+//
+// Pure state, predicates, and the hash-chained ledger writer/verifier. The
+// DaemonServer handlers call these; clients never re-derive the rules.
+// ---------------------------------------------------------------------------
+
+/// Per-pane hash-chained ledgers live here beside `agents/` and `scrollback/`.
+/// Unlike those two, a ledger survives pane close: it is the audit record.
+const LEDGER_DIR: &str = "ledger";
+/// Inside the hash input so a record cannot be re-hashed under another
+/// version (the same reasoning as Kranz's `kranz.event-log.v2\n`).
+const LEDGER_HASH_PREFIX: &str = "sgian.ledger.v1\n";
+const HOLDER_MAX_LEN: usize = 64;
+const LEASE_NOTE_MAX_BYTES: usize = 4096;
+const LEASE_WHY_MAX_BYTES: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeasePolicy {
+    /// An unheld pane accepts input from anyone; a held pane only from its holder.
+    Open,
+    /// Every write needs the lease.
+    Required,
+}
+
+impl LeasePolicy {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "required" => Some(Self::Required),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Required => "required",
+        }
+    }
+}
+
+/// The held half of a pane's lease. Persisted verbatim in workspace.json.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HeldLease {
+    holder: String,
+    since_ms: u64,
+    #[serde(default)]
+    writes: u64,
+    #[serde(default)]
+    bytes_typed: u64,
+    #[serde(default)]
+    refused_writes: u64,
+    #[serde(default)]
+    last_input_ms: Option<u64>,
+}
+
+impl HeldLease {
+    fn new(holder: &str, since_ms: u64) -> Self {
+        Self {
+            holder: holder.to_string(),
+            since_ms,
+            writes: 0,
+            bytes_typed: 0,
+            refused_writes: 0,
+            last_input_ms: None,
+        }
+    }
+}
+
+/// Wire shape of a pane's lease (snapshot `leases`, lease responses).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeaseInfo {
+    pub pane_id: String,
+    pub policy: String,
+    pub holder: Option<String>,
+    pub since_ms: Option<u64>,
+    pub held_ms: Option<u64>,
+    #[serde(default)]
+    pub writes: u64,
+    #[serde(default)]
+    pub bytes_typed: u64,
+    #[serde(default)]
+    pub refused_writes: u64,
+    #[serde(default)]
+    pub last_input_ms: Option<u64>,
+}
+
+impl LeaseInfo {
+    fn from_lease(
+        pane_id: &str,
+        policy: LeasePolicy,
+        lease: Option<&HeldLease>,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            pane_id: pane_id.to_string(),
+            policy: policy.as_str().to_string(),
+            holder: lease.map(|held| held.holder.clone()),
+            since_ms: lease.map(|held| held.since_ms),
+            held_ms: lease.map(|held| now_ms.saturating_sub(held.since_ms)),
+            writes: lease.map(|held| held.writes).unwrap_or(0),
+            bytes_typed: lease.map(|held| held.bytes_typed).unwrap_or(0),
+            refused_writes: lease.map(|held| held.refused_writes).unwrap_or(0),
+            last_input_ms: lease.and_then(|held| held.last_input_ms),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LeaseTransition {
+    Taken,
+    Released,
+    Revoked,
+}
+
+/// Holder labels are operator text that ends up in ledgers, status lines and
+/// error messages: short, printable ASCII, no whitespace.
+fn validate_holder(raw: &str) -> Result<String, String> {
+    let holder = raw.trim();
+    if holder.is_empty() {
+        return Err("holder must not be blank".to_string());
+    }
+    if holder.len() > HOLDER_MAX_LEN {
+        return Err(format!("holder is longer than {HOLDER_MAX_LEN} bytes"));
+    }
+    if !holder.chars().all(|c| c.is_ascii_graphic()) {
+        return Err("holder must be printable ASCII with no whitespace".to_string());
+    }
+    Ok(holder.to_string())
+}
+
+/// Notes and reasons: trimmed, bounded, free text (newlines and tabs allowed,
+/// other control characters are not).
+fn validate_bounded_text(raw: &str, what: &str, max: usize) -> Result<String, String> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err(format!("{what} must not be empty"));
+    }
+    if text.len() > max {
+        return Err(format!("{what} is longer than {max} bytes"));
+    }
+    if text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err(format!("{what} must not contain control characters"));
+    }
+    Ok(text.to_string())
+}
+
+/// What a permitted `take` does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TakeOutcome {
+    Fresh,
+    AlreadyHeld,
+    Revoking { previous: String },
+}
+
+fn can_take(
+    lease: Option<&HeldLease>,
+    holder: &str,
+    force: bool,
+    why: Option<&str>,
+) -> Result<TakeOutcome, String> {
+    match lease {
+        None => Ok(TakeOutcome::Fresh),
+        Some(held) if held.holder == holder => Ok(TakeOutcome::AlreadyHeld),
+        Some(held) => {
+            if !force {
+                return Err(format!(
+                    "pane keyboard is held by {}; use --force --why REASON to revoke it",
+                    held.holder
+                ));
+            }
+            if why.map(str::trim).unwrap_or("").is_empty() {
+                return Err("--force requires --why REASON".to_string());
+            }
+            Ok(TakeOutcome::Revoking {
+                previous: held.holder.clone(),
+            })
+        }
+    }
+}
+
+fn can_release(lease: Option<&HeldLease>, holder: &str) -> Result<(), String> {
+    match lease {
+        None => Err("pane keyboard is not held".to_string()),
+        Some(held) if held.holder == holder => Ok(()),
+        Some(held) => Err(format!(
+            "pane keyboard is held by {}, not {holder}",
+            held.holder
+        )),
+    }
+}
+
+fn can_write(
+    policy: LeasePolicy,
+    lease: Option<&HeldLease>,
+    holder: Option<&str>,
+) -> Result<(), String> {
+    match (policy, lease) {
+        (_, Some(held)) => {
+            if holder == Some(held.holder.as_str()) {
+                Ok(())
+            } else {
+                Err(format!("pane keyboard is held by {}", held.holder))
+            }
+        }
+        (LeasePolicy::Open, None) => Ok(()),
+        (LeasePolicy::Required, None) => {
+            Err("pane keyboard is unheld and lease_policy is required; take it first".to_string())
+        }
+    }
+}
+
+/// One ledger line. `h` chains over everything else in the record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LedgerRecord {
+    seq: u64,
+    ts_ms: u64,
+    pane_id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    payload: Value,
+    prev: String,
+    h: String,
+}
+
+fn ledger_path(dir: &Path, pane_id: &str) -> PathBuf {
+    dir.join(format!("{pane_id}.jsonl"))
+}
+
+/// Sorted-key, whitespace-free JSON: the same bytes regardless of the
+/// serializer's map ordering feature or the caller's field order.
+fn canonical_json(value: &Value) -> String {
+    let mut sorted = value.clone();
+    sorted.sort_all_objects();
+    sorted.to_string()
+}
+
+fn ledger_hash(prev: &str, body: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(LEDGER_HASH_PREFIX.as_bytes());
+    hasher.update(prev.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(body.as_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+/// The hashed body: the record without `h`, canonicalized.
+fn ledger_body(record: &LedgerRecord) -> String {
+    let mut value = serde_json::to_value(record).unwrap_or(Value::Null);
+    if let Value::Object(ref mut map) = value {
+        map.remove("h");
+    }
+    canonical_json(&value)
+}
+
+/// The chain head `(seq, h)` from a ledger's last non-blank line;
+/// `(0, "")` for a missing or empty ledger.
+fn ledger_head(path: &Path) -> Result<(u64, String), String> {
+    let data = match fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((0, String::new()))
+        }
+        Err(error) => return Err(format!("failed to read ledger {}: {error}", path.display())),
+    };
+    match data.lines().rev().find(|line| !line.trim().is_empty()) {
+        None => Ok((0, String::new())),
+        Some(line) => {
+            let record: LedgerRecord = serde_json::from_str(line).map_err(|error| {
+                format!("ledger {} tail is unreadable: {error}", path.display())
+            })?;
+            Ok((record.seq, record.h))
+        }
+    }
+}
+
+/// Append one record, chaining from the cached head (seeded from disk on
+/// first use). One `write_all` of line+'\n', then fsync.
+fn ledger_append(
+    dir: &Path,
+    heads: &mut HashMap<String, (u64, String)>,
+    pane_id: &str,
+    kind: &str,
+    payload: Value,
+) -> Result<LedgerRecord, String> {
+    let path = ledger_path(dir, pane_id);
+    let (seq, prev) = match heads.get(pane_id) {
+        Some(head) => head.clone(),
+        None => ledger_head(&path)?,
+    };
+    let mut record = LedgerRecord {
+        seq: seq.saturating_add(1),
+        ts_ms: now_millis(),
+        pane_id: pane_id.to_string(),
+        kind: kind.to_string(),
+        payload,
+        prev,
+        h: String::new(),
+    };
+    record.h = ledger_hash(&record.prev, &ledger_body(&record));
+    let line = serde_json::to_string(&record)
+        .map_err(|error| format!("failed to encode ledger record: {error}"))?;
+    let mut bytes = Vec::with_capacity(line.len() + 1);
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .private_mode()
+        .open(&path)
+        .map_err(|error| format!("failed to open ledger {}: {error}", path.display()))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("failed to append ledger {}: {error}", path.display()))?;
+    heads.insert(pane_id.to_string(), (record.seq, record.h.clone()));
+    Ok(record)
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct LedgerSummary {
+    records: u64,
+    head: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct LedgerBreak {
+    line: usize,
+    seq: Option<u64>,
+    reason: String,
+}
+
+/// Walk a ledger and report the first break: an unparseable line, a sequence
+/// gap, a `prev` that does not match, or a record whose bytes no longer hash
+/// to `h`. Truncation from the tail is NOT detectable here; pin `head` from a
+/// prior run to catch it.
+fn ledger_verify(path: &Path) -> Result<LedgerSummary, LedgerBreak> {
+    let data = fs::read_to_string(path).map_err(|error| LedgerBreak {
+        line: 0,
+        seq: None,
+        reason: format!("cannot read ledger: {error}"),
+    })?;
+    let mut prev = String::new();
+    let mut expected_seq: u64 = 1;
+    let mut records: u64 = 0;
+    for (index, line) in data.lines().enumerate() {
+        let line_no = index + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: LedgerRecord = serde_json::from_str(line).map_err(|error| LedgerBreak {
+            line: line_no,
+            seq: None,
+            reason: format!("unparseable record: {error}"),
+        })?;
+        if record.seq != expected_seq {
+            return Err(LedgerBreak {
+                line: line_no,
+                seq: Some(record.seq),
+                reason: format!("sequence {} where {expected_seq} was expected", record.seq),
+            });
+        }
+        if record.prev != prev {
+            return Err(LedgerBreak {
+                line: line_no,
+                seq: Some(record.seq),
+                reason: "prev hash does not match the previous record".to_string(),
+            });
+        }
+        let expected_hash = ledger_hash(&record.prev, &ledger_body(&record));
+        if !constant_time_eq(&expected_hash, &record.h) {
+            return Err(LedgerBreak {
+                line: line_no,
+                seq: Some(record.seq),
+                reason: "record hash mismatch (content altered)".to_string(),
+            });
+        }
+        prev = record.h;
+        expected_seq = expected_seq.saturating_add(1);
+        records += 1;
+    }
+    Ok(LedgerSummary {
+        records,
+        head: prev,
+    })
+}
+
+/// The last `limit` records (0 = all) as raw JSON values; unparseable lines
+/// are skipped so a torn tail still lists what came before it.
+fn read_ledger_tail(path: &Path, limit: usize) -> Vec<Value> {
+    let data = fs::read_to_string(path).unwrap_or_default();
+    let parsed: Vec<Value> = data
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    if limit == 0 || parsed.len() <= limit {
+        parsed
+    } else {
+        parsed[parsed.len() - limit..].to_vec()
+    }
+}
+
 struct DaemonServer {
     registry: Mutex<PaneRegistry>,
     terminals: Mutex<TerminalStore>,
@@ -6553,6 +7037,16 @@ struct DaemonServer {
     /// (T2) Per-pane agent conversation logs (`agents/<pane-id>.jsonl`), read
     /// for the bootstrap replay.
     agents_dir: PathBuf,
+    /// Per-pane hash-chained lease ledgers (`ledger/<pane-id>.jsonl`). Kept
+    /// across pane close; see docs/design/keyboard-lease-and-ledger.md.
+    ledger_dir: PathBuf,
+    /// Held keyboard leases. A LEAF lock: taken alone, never while holding
+    /// registry/terminals, and dropped before either is acquired (persist()
+    /// takes it last, after registry → terminals).
+    leases: Mutex<HashMap<String, HeldLease>>,
+    /// Cached ledger chain heads (pane_id → (seq, h)), seeded from disk on
+    /// first append. Only ever taken alone.
+    ledger_heads: Mutex<HashMap<String, (u64, String)>>,
     workspace_key: String,
     log_dispatch: tracing::dispatcher::Dispatch,
     /// Keeps the non-blocking log writer alive (flushes on drop). Must be held for
@@ -6623,6 +7117,9 @@ impl DaemonServer {
         let agents_dir = data_dir.join(AGENT_LOG_DIR);
         ensure_private_dir(&agents_dir)?;
         prune_agent_log_temps(&agents_dir);
+        // Lease ledgers are never pruned: a closed pane's ledger is its record.
+        let ledger_dir = data_dir.join(LEDGER_DIR);
+        ensure_private_dir(&ledger_dir)?;
         let token = load_or_create_token(&data_dir)?;
 
         let persist_path = data_dir.join(WORKSPACE_FILE);
@@ -6654,6 +7151,7 @@ impl DaemonServer {
             agents_v2,
             agent_specs,
             pane_shells,
+            leases,
             was_corrupt,
         ) = (
             loaded.registry,
@@ -6665,6 +7163,7 @@ impl DaemonServer {
             loaded.agents_v2,
             loaded.agent_specs,
             loaded.pane_shells,
+            loaded.leases,
             loaded.was_corrupt,
         );
 
@@ -6775,6 +7274,16 @@ impl DaemonServer {
             persist_path,
             scrollback_dir,
             agents_dir,
+            ledger_dir,
+            // A hand-edited lease for a pane that no longer exists must not be
+            // resurrected (same filter as the agent marks above).
+            leases: Mutex::new(
+                leases
+                    .into_iter()
+                    .filter(|(pane_id, _)| live_pane_ids.contains(pane_id))
+                    .collect(),
+            ),
+            ledger_heads: Mutex::new(HashMap::new()),
             workspace_key: ws_key,
             log_dispatch,
             _log_guard: log_guard,
@@ -6923,6 +7432,9 @@ impl DaemonServer {
                 // (T1) The pane's agent state (including a manual mark) dies
                 // with it; pane ids are never reused.
                 self.router.remove_agent(&pane_id);
+                // So does its keyboard lease (ledgered as revoked; the ledger
+                // file itself is kept).
+                self.revoke_lease_on_close(&pane_id);
                 self.lock_terminals()?.close_pane(&pane_id);
                 self.router.invalidate_append_handle(&pane_id);
                 let _ = fs::remove_file(scrollback_path(&self.scrollback_dir, &pane_id));
@@ -6974,12 +7486,36 @@ impl DaemonServer {
                 Ok(json!(CommandOk { ok: true }))
             }
             DaemonRequest::WriteToPane { pane_id, data } => {
-                self.write_input(&pane_id, &data)?;
+                self.write_input(&pane_id, &data, None)?;
                 Ok(json!(CommandOk { ok: true }))
             }
             DaemonRequest::SendInput { pane_id, input } => {
-                self.write_input(&pane_id, &input)?;
+                self.write_input(&pane_id, &input, None)?;
                 Ok(json!(CommandOk { ok: true }))
+            }
+            DaemonRequest::SendInputAs {
+                pane_id,
+                input,
+                holder,
+            } => {
+                let holder = validate_holder(&holder)?;
+                self.write_input(&pane_id, &input, Some(&holder))?;
+                Ok(json!(CommandOk { ok: true }))
+            }
+            DaemonRequest::TakeLease {
+                pane_id,
+                holder,
+                force,
+                why,
+            } => self.handle_take_lease(&pane_id, &holder, force, why.as_deref()),
+            DaemonRequest::ReleaseLease {
+                pane_id,
+                holder,
+                note,
+            } => self.handle_release_lease(&pane_id, &holder, &note),
+            DaemonRequest::LeaseStatus { pane_id } => {
+                self.ensure_pane_exists(&pane_id)?;
+                self.lease_info(&pane_id).map(|info| json!(info))
             }
             DaemonRequest::ResizePaneTerminal {
                 pane_id,
@@ -7017,7 +7553,10 @@ impl DaemonServer {
             }
             DaemonRequest::GetConfig => Ok(self.effective_config().full_config()),
             DaemonRequest::Broadcast { input } => {
-                let written = self.lock_terminals()?.write_to_all_live(&input);
+                // A broadcast has no holder, so every held pane is skipped
+                // rather than the whole broadcast refused.
+                let skip = self.panes_held_by_others(None)?;
+                let written = self.lock_terminals()?.write_to_live_except(&input, &skip);
                 Ok(json!({ "panes": written }))
             }
             DaemonRequest::SetSyncInput { enabled } => {
@@ -7654,14 +8193,323 @@ impl DaemonServer {
     }
 
     /// Write input to a pane, mirroring it to all live panes when synchronize-input is on.
-    fn write_input(&self, pane_id: &str, data: &str) -> Result<(), String> {
+    /// `holder` attributes the write to a keyboard-lease holder (None = the
+    /// legacy unattributed path). The lease gate runs BEFORE the terminal lock
+    /// and the lease map is a leaf lock, so lock order stays
+    /// registry → terminals with leases only ever taken alone.
+    fn write_input(&self, pane_id: &str, data: &str, holder: Option<&str>) -> Result<(), String> {
         self.ensure_pane_exists(pane_id)?;
-        let terminals = self.lock_terminals()?;
         if self.sync_input.load(Ordering::SeqCst) {
-            terminals.write_to_all_live(data);
+            // Mirrored input skips panes held by someone else rather than
+            // refusing the whole write; the target pane itself is still gated.
+            self.check_lease_write(pane_id, holder)?;
+            let skip = self.panes_held_by_others(holder)?;
+            let written = self.lock_terminals()?.write_to_live_except(data, &skip);
+            for written_pane in &written {
+                self.note_lease_write(written_pane, data.len());
+            }
             Ok(())
         } else {
-            terminals.write_to_pane(pane_id, data)
+            self.check_lease_write(pane_id, holder)?;
+            self.lock_terminals()?.write_to_pane(pane_id, data)?;
+            self.note_lease_write(pane_id, data.len());
+            Ok(())
+        }
+    }
+
+    // ----- Keyboard lease handlers (docs/design/keyboard-lease-and-ledger.md) -----
+
+    fn lease_policy(&self) -> LeasePolicy {
+        self.config
+            .read()
+            .map(|config| config.lease_policy_effective())
+            .unwrap_or(LeasePolicy::Open)
+    }
+
+    fn lock_leases(&self) -> Result<MutexGuard<'_, HashMap<String, HeldLease>>, String> {
+        self.leases
+            .lock()
+            .map_err(|_| "lease table lock poisoned".to_string())
+    }
+
+    /// Append one record to a pane's ledger. Heads are cached per pane after the
+    /// first append (seeded from the file's last line), and every append is
+    /// fsynced: lease events are rare and the record is the product.
+    fn ledger_record(
+        &self,
+        pane_id: &str,
+        kind: &str,
+        payload: Value,
+    ) -> Result<LedgerRecord, String> {
+        let mut heads = self
+            .ledger_heads
+            .lock()
+            .map_err(|_| "ledger head lock poisoned".to_string())?;
+        ledger_append(&self.ledger_dir, &mut heads, pane_id, kind, payload)
+    }
+
+    fn lease_info(&self, pane_id: &str) -> Result<LeaseInfo, String> {
+        let policy = self.lease_policy();
+        let leases = self.lock_leases()?;
+        Ok(LeaseInfo::from_lease(
+            pane_id,
+            policy,
+            leases.get(pane_id),
+            now_millis(),
+        ))
+    }
+
+    /// Lease info for every HELD pane (the bootstrap snapshot's `leases` map).
+    fn lease_infos(&self) -> HashMap<String, LeaseInfo> {
+        let policy = self.lease_policy();
+        let now = now_millis();
+        match self.lock_leases() {
+            Ok(leases) => leases
+                .iter()
+                .map(|(pane_id, held)| {
+                    (
+                        pane_id.clone(),
+                        LeaseInfo::from_lease(pane_id, policy, Some(held), now),
+                    )
+                })
+                .collect(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    /// Panes whose keyboard is held by someone other than `holder`.
+    fn panes_held_by_others(&self, holder: Option<&str>) -> Result<HashSet<String>, String> {
+        let leases = self.lock_leases()?;
+        Ok(leases
+            .iter()
+            .filter(|(_, held)| holder != Some(held.holder.as_str()))
+            .map(|(pane_id, _)| pane_id.clone())
+            .collect())
+    }
+
+    /// Gate one write against the pane's lease. A refusal bumps the holder's
+    /// `refused_writes` counter so the eventual release record shows how often
+    /// someone else tried to type while the pane was held.
+    fn check_lease_write(&self, pane_id: &str, holder: Option<&str>) -> Result<(), String> {
+        let policy = self.lease_policy();
+        let mut leases = self.lock_leases()?;
+        match can_write(policy, leases.get(pane_id), holder) {
+            Ok(()) => Ok(()),
+            Err(refusal) => {
+                if let Some(held) = leases.get_mut(pane_id) {
+                    held.refused_writes = held.refused_writes.saturating_add(1);
+                }
+                Err(format!("{refusal} ({pane_id})"))
+            }
+        }
+    }
+
+    /// Count an accepted write against the pane's lease (no-op when unheld).
+    /// Counters reach workspace.json on the lazy-persist cadence, never per
+    /// keystroke.
+    fn note_lease_write(&self, pane_id: &str, bytes: usize) {
+        if let Ok(mut leases) = self.lock_leases() {
+            if let Some(held) = leases.get_mut(pane_id) {
+                held.writes = held.writes.saturating_add(1);
+                held.bytes_typed = held.bytes_typed.saturating_add(bytes as u64);
+                held.last_input_ms = Some(now_millis());
+                self.dirty.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn handle_take_lease(
+        &self,
+        pane_id: &str,
+        holder: &str,
+        force: bool,
+        why: Option<&str>,
+    ) -> Result<Value, String> {
+        self.ensure_pane_exists(pane_id)?;
+        let holder = validate_holder(holder)?;
+        let why = match why {
+            Some(reason) => Some(validate_bounded_text(reason, "why", LEASE_WHY_MAX_BYTES)?),
+            None => None,
+        };
+        let now = now_millis();
+        let (outcome, previous) = {
+            let mut leases = self.lock_leases()?;
+            let outcome = can_take(leases.get(pane_id), &holder, force, why.as_deref())?;
+            let previous = leases.get(pane_id).cloned();
+            if outcome != TakeOutcome::AlreadyHeld {
+                leases.insert(pane_id.to_string(), HeldLease::new(&holder, now));
+            }
+            (outcome, previous)
+        };
+        if outcome == TakeOutcome::AlreadyHeld {
+            return self.lease_info(pane_id).map(|info| json!(info));
+        }
+        // Ledger first: the record is the product. A force-take is two
+        // records so the revoked holder's counters are not lost.
+        if let (TakeOutcome::Revoking { previous: revoked }, Some(prior)) =
+            (&outcome, previous.as_ref())
+        {
+            self.ledger_record(
+                pane_id,
+                "lease.revoked",
+                json!({
+                    "holder": revoked,
+                    "by": holder,
+                    "why": why,
+                    "held_ms": now.saturating_sub(prior.since_ms),
+                    "writes": prior.writes,
+                    "bytes_typed": prior.bytes_typed,
+                    "refused_writes": prior.refused_writes,
+                }),
+            )?;
+        }
+        self.ledger_record(
+            pane_id,
+            "lease.taken",
+            json!({
+                "holder": holder,
+                "force": force,
+                "why": why,
+                "previous_holder": previous.as_ref().map(|prior| prior.holder.clone()),
+            }),
+        )?;
+        if let Err(error) = self.persist() {
+            // Disk, memory, and clients must not diverge: revert the table and
+            // say so in the ledger (best-effort; the persist error is the one
+            // reported).
+            if let Ok(mut leases) = self.lock_leases() {
+                match previous {
+                    Some(prior) => leases.insert(pane_id.to_string(), prior),
+                    None => leases.remove(pane_id),
+                };
+            }
+            let _ = self.ledger_record(
+                pane_id,
+                "lease.revoked",
+                json!({ "holder": holder, "by": "daemon", "why": format!("persist failed: {error}") }),
+            );
+            return Err(error);
+        }
+        if let TakeOutcome::Revoking { previous: revoked } = &outcome {
+            tracing::info!(
+                workspace_key = %self.workspace_key,
+                pane_id = %pane_id,
+                event = "lease_revoked",
+                holder = %revoked,
+                by = %holder,
+                "keyboard lease revoked"
+            );
+            self.router.broadcast(&DaemonEvent::LeaseState {
+                pane_id: pane_id.to_string(),
+                transition: LeaseTransition::Revoked,
+                holder: None,
+                since_ms: None,
+                note: why.clone(),
+            });
+        }
+        tracing::info!(
+            workspace_key = %self.workspace_key,
+            pane_id = %pane_id,
+            event = "lease_taken",
+            holder = %holder,
+            "keyboard lease taken"
+        );
+        self.router.broadcast(&DaemonEvent::LeaseState {
+            pane_id: pane_id.to_string(),
+            transition: LeaseTransition::Taken,
+            holder: Some(holder),
+            since_ms: Some(now),
+            note: None,
+        });
+        self.lease_info(pane_id).map(|info| json!(info))
+    }
+
+    fn handle_release_lease(
+        &self,
+        pane_id: &str,
+        holder: &str,
+        note: &str,
+    ) -> Result<Value, String> {
+        self.ensure_pane_exists(pane_id)?;
+        let holder = validate_holder(holder)?;
+        let note = validate_bounded_text(note, "hand-back note", LEASE_NOTE_MAX_BYTES)?;
+        let now = now_millis();
+        let released = {
+            let mut leases = self.lock_leases()?;
+            can_release(leases.get(pane_id), &holder)?;
+            leases
+                .remove(pane_id)
+                .ok_or_else(|| format!("pane keyboard is not held ({pane_id})"))?
+        };
+        self.ledger_record(
+            pane_id,
+            "lease.released",
+            json!({
+                "holder": holder,
+                "note": note,
+                "held_ms": now.saturating_sub(released.since_ms),
+                "writes": released.writes,
+                "bytes_typed": released.bytes_typed,
+                "refused_writes": released.refused_writes,
+            }),
+        )?;
+        if let Err(error) = self.persist() {
+            if let Ok(mut leases) = self.lock_leases() {
+                leases.insert(pane_id.to_string(), released);
+            }
+            let _ = self.ledger_record(
+                pane_id,
+                "lease.taken",
+                json!({ "holder": holder, "force": false, "why": format!("release persist failed: {error}") }),
+            );
+            return Err(error);
+        }
+        tracing::info!(
+            workspace_key = %self.workspace_key,
+            pane_id = %pane_id,
+            event = "lease_released",
+            holder = %holder,
+            "keyboard lease released"
+        );
+        self.router.broadcast(&DaemonEvent::LeaseState {
+            pane_id: pane_id.to_string(),
+            transition: LeaseTransition::Released,
+            holder: None,
+            since_ms: None,
+            note: Some(note),
+        });
+        self.lease_info(pane_id).map(|info| json!(info))
+    }
+
+    /// A closed pane's lease dies with it (pane ids are never reused). The
+    /// ledger file is kept: it is the audit record, not runtime state.
+    fn revoke_lease_on_close(&self, pane_id: &str) {
+        let removed = match self.lock_leases() {
+            Ok(mut leases) => leases.remove(pane_id),
+            Err(_) => None,
+        };
+        if let Some(held) = removed {
+            let now = now_millis();
+            let _ = self.ledger_record(
+                pane_id,
+                "lease.revoked",
+                json!({
+                    "holder": held.holder,
+                    "by": "daemon",
+                    "why": "pane closed",
+                    "held_ms": now.saturating_sub(held.since_ms),
+                    "writes": held.writes,
+                    "bytes_typed": held.bytes_typed,
+                    "refused_writes": held.refused_writes,
+                }),
+            );
+            self.router.broadcast(&DaemonEvent::LeaseState {
+                pane_id: pane_id.to_string(),
+                transition: LeaseTransition::Revoked,
+                holder: None,
+                since_ms: None,
+                note: Some("pane closed".to_string()),
+            });
         }
     }
 
@@ -7823,6 +8671,9 @@ impl DaemonServer {
         drop(terminals);
         // (T1) Agent info rides the bootstrap payload parallel to pane_states.
         snapshot.agent_states = self.router.agent_states();
+        // Held keyboard leases ride alongside so a client can render the
+        // holder without a second request.
+        snapshot.leases = self.lease_infos();
         // (T2) Bounded conversation replay for agent panes, read back from the
         // per-pane JSONL log (covers live, ended, and not-yet-respawned panes).
         for pane in &snapshot.panes {
@@ -8471,6 +9322,14 @@ impl DaemonServer {
                 .iter()
                 .filter(|(pane_id, _)| registry.contains_pane(pane_id))
                 .map(|(pane_id, shell)| (pane_id.clone(), shell.clone()))
+                .collect(),
+            // Leaf lock, taken last (after registry → terminals) and dropped
+            // before the write below.
+            leases: self
+                .lock_leases()?
+                .iter()
+                .filter(|(pane_id, _)| registry.contains_pane(pane_id))
+                .map(|(pane_id, held)| (pane_id.clone(), held.clone()))
                 .collect(),
         };
         drop(terminals);
@@ -9660,6 +10519,8 @@ fn daemon_capabilities() -> Vec<String> {
         "framed".to_string(),
         "persistent".to_string(),
         "subscribe-ack".to_string(),
+        // Keyboard lease requests, LeaseState events, snapshot `leases`.
+        "lease".to_string(),
     ]
 }
 
@@ -10926,6 +11787,27 @@ fn emit_daemon_event(app: &AppHandle, event: DaemonEvent) {
                 }),
             );
         }
+        // Keyboard lease transitions ride to the frontend as `lease-state`
+        // (docs/design/keyboard-lease-and-ledger.md); the M2 client work
+        // renders them. Unknown to older frontends, which ignore the name.
+        DaemonEvent::LeaseState {
+            pane_id,
+            transition,
+            holder,
+            since_ms,
+            note,
+        } => {
+            let _ = app.emit(
+                "lease-state",
+                json!({
+                    "pane_id": pane_id,
+                    "transition": transition,
+                    "holder": holder,
+                    "since_ms": since_ms,
+                    "note": note,
+                }),
+            );
+        }
         // (T2) Normalized agent conversation events. The Tauri payload keeps
         // the contract's {pane_id, event} shape (the daemon-wire field is
         // `payload` only because of the enum's internal tag — see the
@@ -10964,6 +11846,9 @@ struct LoadedWorkspace {
     /// Frozen shell profile overrides restored from workspace.json (empty for
     /// a fresh, corrupt, or pre-§4 workspace).
     pane_shells: HashMap<String, ShellConfig>,
+    /// Held keyboard leases restored from workspace.json (empty for a fresh,
+    /// corrupt, or pre-lease workspace).
+    leases: HashMap<String, HeldLease>,
     was_corrupt: bool,
     /// The cwd recorded in the persisted workspace.json, if the file was parsed
     /// successfully. Used by the daemon-side collision check (defense-in-depth:
@@ -10986,6 +11871,7 @@ fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
                 agents_v2: HashMap::new(),
                 agent_specs: HashMap::new(),
                 pane_shells: HashMap::new(),
+                leases: HashMap::new(),
                 was_corrupt: false,
                 persisted_cwd: None,
             };
@@ -11005,6 +11891,7 @@ fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
             let agents_v2 = persisted.agents_v2.clone();
             let agent_specs = persisted.agent_specs.clone();
             let pane_shells = persisted.pane_shells.clone();
+            let leases = persisted.leases.clone();
             let persisted_cwd = Some(persisted.cwd.clone());
             let registry = PaneRegistry::from_persisted(persisted, cwd);
             LoadedWorkspace {
@@ -11017,6 +11904,7 @@ fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
                 agents_v2,
                 agent_specs,
                 pane_shells,
+                leases,
                 was_corrupt: false,
                 persisted_cwd,
             }
@@ -11035,6 +11923,7 @@ fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
                 agents_v2: HashMap::new(),
                 agent_specs: HashMap::new(),
                 pane_shells: HashMap::new(),
+                leases: HashMap::new(),
                 was_corrupt: true,
                 persisted_cwd: None,
             }
@@ -11746,6 +12635,28 @@ fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             let client = DaemonClient::connect_or_spawn(options.workspace)?;
             control_restart_pane(&client, &options.args[1..], options.json)
         }
+        "lease" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_lease_args(&options.args[1..])?;
+            // Status never spawns a daemon; take/release start one on demand
+            // like the other mutating pane commands.
+            let client = if parsed.verb == LeaseVerb::Status {
+                DaemonClient::connect_existing(options.workspace)?
+            } else {
+                DaemonClient::connect_or_spawn(options.workspace)?
+            };
+            control_lease(&client, parsed, options.json)
+        }
+        "ledger" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_ledger_args(&options.args[1..])?;
+            let client = DaemonClient::connect_existing(options.workspace)?;
+            control_ledger(&client, parsed, options.json)
+        }
         "attach" => {
             if options.args.len() > 2 {
                 return Err(format!(
@@ -12326,6 +13237,344 @@ fn control_status_verbose(client: &DaemonClient, json_output: bool) -> Result<()
     Ok(())
 }
 
+// ----- ctl: keyboard lease and ledger (docs/design/keyboard-lease-and-ledger.md) -----
+
+/// The holder label `ctl` attributes its writes and lease claims to:
+/// `$SGIAN_HOLDER` when set and valid, else `user@host`.
+fn default_holder() -> String {
+    if let Ok(configured) = std::env::var("SGIAN_HOLDER") {
+        if let Ok(holder) = validate_holder(&configured) {
+            return holder;
+        }
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "operator".to_string());
+    let host = local_hostname();
+    let short_host = host.split('.').next().unwrap_or("local");
+    validate_holder(&format!("{user}@{short_host}")).unwrap_or_else(|_| "operator".to_string())
+}
+
+#[cfg(unix)]
+fn local_hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most `buf.len()` bytes into a buffer we
+    // own for the duration of the call and NUL-terminates on success; a
+    // non-zero return leaves the contents unspecified, so we only read the
+    // buffer when it returns 0 and stop at the first NUL.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return "local".to_string();
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    if name.is_empty() {
+        "local".to_string()
+    } else {
+        name
+    }
+}
+
+#[cfg(not(unix))]
+fn local_hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "local".to_string())
+}
+
+/// Pull `--as HOLDER` out of a send/broadcast argument list, stopping at `--`
+/// like `parse_lf_flag` so a payload can still contain the literal text.
+fn parse_as_flag(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut holder = None;
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut passthrough = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if passthrough {
+            remaining.push(arg.clone());
+        } else if arg == "--as" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| "--as requires a HOLDER".to_string())?;
+            holder = Some(validate_holder(value)?);
+            index += 1;
+        } else if let Some(value) = arg.strip_prefix("--as=") {
+            holder = Some(validate_holder(value)?);
+        } else {
+            if arg == "--" {
+                passthrough = true;
+            }
+            remaining.push(arg.clone());
+        }
+        index += 1;
+    }
+    Ok((holder, remaining))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseVerb {
+    Status,
+    Take,
+    Release,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeaseArgs {
+    verb: LeaseVerb,
+    pane_ref: String,
+    holder: Option<String>,
+    force: bool,
+    why: Option<String>,
+    note: Option<String>,
+}
+
+/// `lease [status|take|release] [PANE] [--as HOLDER] [--force --why REASON] [-m NOTE]`.
+fn parse_lease_args(args: &[String]) -> Result<LeaseArgs, String> {
+    let mut parsed = LeaseArgs {
+        verb: LeaseVerb::Status,
+        pane_ref: "active".to_string(),
+        holder: None,
+        force: false,
+        why: None,
+        note: None,
+    };
+    let mut index = 0;
+    let mut pane_seen = false;
+    if let Some(first) = args.first() {
+        match first.as_str() {
+            "status" => {
+                parsed.verb = LeaseVerb::Status;
+                index = 1;
+            }
+            "take" => {
+                parsed.verb = LeaseVerb::Take;
+                index = 1;
+            }
+            "release" => {
+                parsed.verb = LeaseVerb::Release;
+                index = 1;
+            }
+            _ => {}
+        }
+    }
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let take_value = |index: usize, flag: &str| -> Result<String, String> {
+            args.get(index + 1)
+                .cloned()
+                .ok_or_else(|| format!("{flag} requires a value"))
+        };
+        match arg {
+            "--as" => {
+                parsed.holder = Some(validate_holder(&take_value(index, "--as")?)?);
+                index += 1;
+            }
+            "--force" => parsed.force = true,
+            "--why" => {
+                parsed.why = Some(take_value(index, "--why")?);
+                index += 1;
+            }
+            "-m" | "--note" => {
+                parsed.note = Some(take_value(index, "-m/--note")?);
+                index += 1;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(format!("unexpected argument for lease: {other}"));
+            }
+            other => {
+                if pane_seen {
+                    return Err(format!("unexpected argument for lease: {other}"));
+                }
+                parsed.pane_ref = other.to_string();
+                pane_seen = true;
+            }
+        }
+        index += 1;
+    }
+    if parsed.verb != LeaseVerb::Take && (parsed.force || parsed.why.is_some()) {
+        return Err("--force/--why apply to `lease take`".to_string());
+    }
+    if parsed.verb == LeaseVerb::Release && parsed.note.is_none() {
+        return Err("lease release requires -m NOTE (the hand-back note is mandatory)".to_string());
+    }
+    if parsed.verb != LeaseVerb::Release && parsed.note.is_some() {
+        return Err("-m/--note applies to `lease release`".to_string());
+    }
+    Ok(parsed)
+}
+
+fn format_held_for(held_ms: Option<u64>) -> String {
+    match held_ms {
+        None => "-".to_string(),
+        Some(ms) => {
+            let secs = ms / 1000;
+            if secs >= 3600 {
+                format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+            } else if secs >= 60 {
+                format!("{}m{:02}s", secs / 60, secs % 60)
+            } else {
+                format!("{secs}s")
+            }
+        }
+    }
+}
+
+fn print_lease_info(info: &LeaseInfo, json_output: bool) -> Result<(), String> {
+    if json_output {
+        return write_json_stdout(info);
+    }
+    let mut stdout = std::io::stdout();
+    writeln!(
+        stdout,
+        "{}\t{}\t{}\t{}\twrites={}\trefused={}",
+        info.pane_id,
+        info.policy,
+        info.holder.as_deref().unwrap_or("-"),
+        format_held_for(info.held_ms),
+        info.writes,
+        info.refused_writes
+    )
+    .map_err(|error| format!("failed to write stdout: {error}"))
+}
+
+/// `ctl lease …` — show, take, or release a pane's keyboard lease. The
+/// dispatcher parses first (pure) so status can use a read-only connection.
+fn control_lease(
+    client: &DaemonClient,
+    parsed: LeaseArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let pane_id = resolve_pane_ref(client, &parsed.pane_ref)?;
+    let holder = parsed.holder.clone().unwrap_or_else(default_holder);
+    let info: LeaseInfo = match parsed.verb {
+        LeaseVerb::Status => client.request(DaemonRequest::LeaseStatus { pane_id })?,
+        LeaseVerb::Take => client.request(DaemonRequest::TakeLease {
+            pane_id,
+            holder,
+            force: parsed.force,
+            why: parsed.why,
+        })?,
+        LeaseVerb::Release => client.request(DaemonRequest::ReleaseLease {
+            pane_id,
+            holder,
+            note: parsed.note.unwrap_or_default(),
+        })?,
+    };
+    print_lease_info(&info, json_output)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LedgerArgs {
+    pane_ref: String,
+    limit: usize,
+    verify: bool,
+}
+
+/// `ledger [PANE] [-n N] [--verify]`.
+fn parse_ledger_args(args: &[String]) -> Result<LedgerArgs, String> {
+    let mut parsed = LedgerArgs {
+        pane_ref: "active".to_string(),
+        limit: 0,
+        verify: false,
+    };
+    let mut pane_seen = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--verify" => parsed.verify = true,
+            "-n" | "--lines" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "-n requires a count".to_string())?;
+                parsed.limit = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid -n count '{value}'"))?;
+                index += 1;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(format!("unexpected argument for ledger: {other}"));
+            }
+            other => {
+                if pane_seen {
+                    return Err(format!("unexpected argument for ledger: {other}"));
+                }
+                parsed.pane_ref = other.to_string();
+                pane_seen = true;
+            }
+        }
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+/// `ctl ledger …` — print or verify a pane's lease ledger. Reads the file
+/// from the workspace data dir directly, so a CLOSED pane's ledger (its id
+/// given literally) is still readable; only an open pane needs the daemon to
+/// resolve a title.
+fn control_ledger(
+    client: &DaemonClient,
+    parsed: LedgerArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let pane_id = match resolve_pane_ref(client, &parsed.pane_ref) {
+        Ok(pane_id) => pane_id,
+        Err(error) => {
+            if parsed.pane_ref.starts_with("pane-") {
+                parsed.pane_ref.clone()
+            } else {
+                return Err(error);
+            }
+        }
+    };
+    let path = ledger_path(&client.data_dir.join(LEDGER_DIR), &pane_id);
+    if parsed.verify {
+        return match ledger_verify(&path) {
+            Ok(summary) => {
+                if json_output {
+                    write_json_stdout(&json!({
+                        "pane_id": pane_id,
+                        "ok": true,
+                        "records": summary.records,
+                        "head": summary.head,
+                    }))
+                } else {
+                    let mut stdout = std::io::stdout();
+                    writeln!(
+                        stdout,
+                        "ok\t{}\t{} records\thead {}",
+                        pane_id,
+                        summary.records,
+                        if summary.head.is_empty() {
+                            "-"
+                        } else {
+                            summary.head.as_str()
+                        }
+                    )
+                    .map_err(|error| format!("failed to write stdout: {error}"))
+                }
+            }
+            Err(broken) => Err(format!(
+                "ledger break in {} at line {}{}: {}",
+                path.display(),
+                broken.line,
+                broken
+                    .seq
+                    .map(|seq| format!(" (seq {seq})"))
+                    .unwrap_or_default(),
+                broken.reason
+            )),
+        };
+    }
+    let records = read_ledger_tail(&path, parsed.limit);
+    if json_output {
+        return write_json_stdout(&records);
+    }
+    let mut stdout = std::io::stdout();
+    for record in &records {
+        writeln!(stdout, "{record}").map_err(|error| format!("failed to write stdout: {error}"))?;
+    }
+    Ok(())
+}
+
 fn control_send_input(client: &DaemonClient, args: &[String]) -> Result<(), String> {
     // Help only as the FIRST token (L6): later positions are freeform payload
     // (`send active ls -h` must send "-h").
@@ -12336,6 +13585,7 @@ fn control_send_input(client: &DaemonClient, args: &[String]) -> Result<(), Stri
         return print_control_help();
     }
     let (literal_lf, args) = parse_lf_flag(args);
+    let (holder, args) = parse_as_flag(&args)?;
     if args.len() < 2 {
         return Err("send requires a pane and input".to_string());
     }
@@ -12354,10 +13604,17 @@ fn control_send_input(client: &DaemonClient, args: &[String]) -> Result<(), Stri
         return Ok(());
     }
     let input = decode_cli_text(&args[1..].join(" "), literal_lf);
-    client.request::<CommandOk>(DaemonRequest::SendInput {
-        pane_id: status.pane.id,
-        input,
-    })?;
+    match holder {
+        Some(holder) => client.request::<CommandOk>(DaemonRequest::SendInputAs {
+            pane_id: status.pane.id,
+            input,
+            holder,
+        })?,
+        None => client.request::<CommandOk>(DaemonRequest::SendInput {
+            pane_id: status.pane.id,
+            input,
+        })?,
+    };
     Ok(())
 }
 
@@ -14727,13 +15984,26 @@ Commands (PANE is a pane id or title; defaults to the active pane):
   status --verbose              Show daemon-level runtime detail (subscribers,
                                 pane states, uptime, effective config summary)
   restart [PANE]                Restart a pane's shell (alias: pane restart)
-  send <PANE> [--lf|--raw] [--] <TEXT...>
+  send <PANE> [--lf|--raw] [--as HOLDER] [--] <TEXT...>
                                 Send text to a pane    (alias: pane send)
                                   By default \n and \r submit a line as Enter/CR.
                                   --lf / --raw sends a literal LF (0x0A) instead of CR.
+                                  --as HOLDER attributes the input to a lease holder
                                   -- ends flag parsing (send a literal "--lf" etc.)
                                   To an agent pane, send posts a chat message
                                   (verbatim; no Enter/CR translation, no --lf).
+  lease [PANE]                  Show who holds a pane's keyboard (alias: lease status)
+  lease take [PANE] [--as HOLDER] [--force --why REASON]
+                                Claim the keyboard. While held, input from anyone
+                                  else is refused. --force revokes another holder
+                                  (REASON is ledgered). HOLDER defaults to
+                                  $SGIAN_HOLDER or user@host.
+  lease release [PANE] -m NOTE [--as HOLDER]
+                                Hand the keyboard back; the note is mandatory.
+  ledger [PANE] [-n N] [--verify]
+                                Print a pane's hash-chained lease ledger (JSONL).
+                                  --verify walks the chain and names the first break.
+                                  A closed pane's ledger is readable by literal id.
   interrupt [PANE]              Interrupt an agent pane's current turn
                                   (agent panes only; for shells send a Ctrl-C)
   attach [PANE]                 Stream a pane's output (alias: pane attach)
@@ -14797,7 +16067,8 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   Pass a file path or an inline JSON string starting with {
   shutdown [--all]              Stop this workspace's daemon (or every daemon)
 
-Read-only commands (panes, status, attach, logs, wait, snapshot, find, agent, shutdown)
+Read-only commands (panes, status, attach, logs, wait, snapshot, find, agent, lease
+status, ledger, shutdown)
 need a running daemon; workspaces and daemons only inspect local state (they neither
 need nor start one); the other commands start a daemon on demand.
 
@@ -16034,6 +17305,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             data_dir.join(WORKSPACE_FILE),
@@ -16385,6 +17657,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         let registry = PaneRegistry::from_persisted(persisted, "/tmp/x".to_string());
         let snapshot = registry.snapshot();
@@ -16421,6 +17694,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         let mut registry = PaneRegistry::from_persisted(persisted, "/tmp/x".to_string());
         let snapshot = registry.snapshot();
@@ -18549,6 +19823,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             dir.path().join(WORKSPACE_FILE),
@@ -20160,6 +21435,7 @@ mod tests {
             theme: Some(json!({ "name": "dark" })),
             idle_shutdown_secs: Some(30),
             restore_policy: Some("restore_on_demand".to_string()),
+            lease_policy: None,
             agent_permission_mode: Some("manual".to_string()),
             agent_claude_bin: Some("/opt/claude/bin/claude".to_string()),
             agent_droid_bin: Some("/opt/factory/bin/droid".to_string()),
@@ -25272,6 +26548,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -26774,6 +28051,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -26823,6 +28101,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -26865,6 +28144,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -26919,6 +28199,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -27294,6 +28575,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             dir.path().join(WORKSPACE_FILE),
@@ -27323,6 +28605,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             dir.path().join(WORKSPACE_FILE),
@@ -27362,6 +28645,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             dir.path().join(WORKSPACE_FILE),
@@ -31436,5 +32720,582 @@ exit 0
             agent_bin_display(&AgentBinPlan::NotFound),
             "claude (not found)"
         );
+    }
+
+    // ----- Keyboard lease predicates, ledger chain, ctl parsing, IPC round trip -----
+    // docs/design/keyboard-lease-and-ledger.md
+
+    fn held_by(holder: &str) -> HeldLease {
+        HeldLease::new(holder, 1_000)
+    }
+
+    #[test]
+    fn lease_take_is_fresh_when_unheld_and_idempotent_for_holder() {
+        assert_eq!(can_take(None, "alice", false, None), Ok(TakeOutcome::Fresh));
+        let held = held_by("alice");
+        assert_eq!(
+            can_take(Some(&held), "alice", false, None),
+            Ok(TakeOutcome::AlreadyHeld)
+        );
+        // Force from the current holder is still just idempotent.
+        assert_eq!(
+            can_take(Some(&held), "alice", true, Some("why")),
+            Ok(TakeOutcome::AlreadyHeld)
+        );
+    }
+
+    #[test]
+    fn lease_take_against_another_holder_needs_force_and_why() {
+        let held = held_by("alice");
+        let refused = can_take(Some(&held), "bob", false, None).expect_err("refused");
+        assert!(refused.contains("held by alice"), "{refused}");
+        assert!(refused.contains("--force"), "{refused}");
+        let no_why = can_take(Some(&held), "bob", true, None).expect_err("needs why");
+        assert!(no_why.contains("--why"), "{no_why}");
+        let blank_why = can_take(Some(&held), "bob", true, Some("  ")).expect_err("blank why");
+        assert!(blank_why.contains("--why"), "{blank_why}");
+        assert_eq!(
+            can_take(Some(&held), "bob", true, Some("alice is away")),
+            Ok(TakeOutcome::Revoking {
+                previous: "alice".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn lease_release_requires_the_holder() {
+        assert!(can_release(None, "alice").is_err());
+        let held = held_by("alice");
+        assert_eq!(can_release(Some(&held), "alice"), Ok(()));
+        let wrong = can_release(Some(&held), "bob").expect_err("not the holder");
+        assert!(wrong.contains("held by alice, not bob"), "{wrong}");
+    }
+
+    #[test]
+    fn lease_write_gate_by_policy() {
+        // open: unheld accepts anyone (attributed or not)
+        assert_eq!(can_write(LeasePolicy::Open, None, None), Ok(()));
+        assert_eq!(can_write(LeasePolicy::Open, None, Some("bob")), Ok(()));
+        // required: unheld refuses everyone
+        let refused = can_write(LeasePolicy::Required, None, Some("bob")).expect_err("unheld");
+        assert!(refused.contains("unheld"), "{refused}");
+        // held: only the holder, under either policy
+        let held = held_by("alice");
+        for policy in [LeasePolicy::Open, LeasePolicy::Required] {
+            assert_eq!(can_write(policy, Some(&held), Some("alice")), Ok(()));
+            assert!(can_write(policy, Some(&held), None).is_err());
+            let other = can_write(policy, Some(&held), Some("bob")).expect_err("other");
+            assert!(other.contains("held by alice"), "{other}");
+        }
+    }
+
+    #[test]
+    fn holder_and_note_validation() {
+        assert_eq!(validate_holder("  craig@mbp "), Ok("craig@mbp".to_string()));
+        assert!(validate_holder("").is_err());
+        assert!(validate_holder("two words").is_err());
+        assert!(validate_holder("tab\there").is_err());
+        assert!(validate_holder("ünïcode").is_err());
+        assert!(validate_holder(&"x".repeat(HOLDER_MAX_LEN + 1)).is_err());
+        assert_eq!(
+            validate_bounded_text(" done\nnext: run tests ", "note", 64),
+            Ok("done\nnext: run tests".to_string())
+        );
+        assert!(validate_bounded_text("   ", "note", 64).is_err());
+        assert!(validate_bounded_text("bell\u{7}", "note", 64).is_err());
+        assert!(validate_bounded_text(&"n".repeat(65), "note", 64).is_err());
+    }
+
+    #[test]
+    fn lease_policy_config_validation() {
+        let mut config = Config::default();
+        assert_eq!(config.lease_policy_effective(), LeasePolicy::Open);
+        config.lease_policy = Some("required".to_string());
+        assert!(config.validate().is_ok());
+        assert_eq!(config.lease_policy_effective(), LeasePolicy::Required);
+        config.lease_policy = Some("readonly".to_string());
+        let error = config.validate().expect_err("unknown policy");
+        assert!(error.contains("lease_policy"), "{error}");
+        // The workspace layer overrides the global one, like restore_policy.
+        let global = Config {
+            lease_policy: Some("open".to_string()),
+            ..Config::default()
+        };
+        let workspace = Config {
+            lease_policy: Some("required".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            global.overlay(workspace).lease_policy_effective(),
+            LeasePolicy::Required
+        );
+    }
+
+    #[test]
+    fn canonical_json_sorts_keys_recursively() {
+        let value = json!({"z": {"b": 1, "a": [{"y": 2, "x": 1}]}, "a": 0});
+        assert_eq!(
+            canonical_json(&value),
+            r#"{"a":0,"z":{"a":[{"x":1,"y":2}],"b":1}}"#
+        );
+    }
+
+    #[test]
+    fn ledger_chain_appends_verifies_and_detects_tampering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut heads = HashMap::new();
+        let first = ledger_append(
+            dir.path(),
+            &mut heads,
+            "pane-1",
+            "lease.taken",
+            json!({"holder": "alice"}),
+        )
+        .expect("append 1");
+        assert_eq!(first.seq, 1);
+        assert_eq!(first.prev, "");
+        assert_eq!(first.h.len(), 64);
+        let second = ledger_append(
+            dir.path(),
+            &mut heads,
+            "pane-1",
+            "lease.released",
+            json!({"holder": "alice", "note": "done"}),
+        )
+        .expect("append 2");
+        assert_eq!(second.seq, 2);
+        assert_eq!(second.prev, first.h);
+        // A fresh head cache re-seeds from disk and continues the chain.
+        let mut fresh_heads = HashMap::new();
+        let third = ledger_append(
+            dir.path(),
+            &mut fresh_heads,
+            "pane-1",
+            "lease.taken",
+            json!({"holder": "bob"}),
+        )
+        .expect("append 3");
+        assert_eq!(third.seq, 3);
+        assert_eq!(third.prev, second.h);
+
+        let path = ledger_path(dir.path(), "pane-1");
+        let summary = ledger_verify(&path).expect("chain verifies");
+        assert_eq!(summary.records, 3);
+        assert_eq!(summary.head, third.h);
+
+        // Flip the note inside record 2: the hash no longer matches, and the
+        // verifier names that line.
+        let original = fs::read_to_string(&path).expect("read");
+        let tampered = original.replacen(r#""note":"done""#, r#""note":"dome""#, 1);
+        assert_ne!(original, tampered, "fixture must contain the note");
+        fs::write(&path, &tampered).expect("write tampered");
+        let broken = ledger_verify(&path).expect_err("tamper detected");
+        assert_eq!(broken.line, 2);
+        assert_eq!(broken.seq, Some(2));
+        assert!(broken.reason.contains("hash mismatch"), "{}", broken.reason);
+
+        // Deleting a middle record breaks the sequence at the next line.
+        let mut lines: Vec<&str> = original.lines().collect();
+        lines.remove(1);
+        fs::write(&path, format!("{}\n", lines.join("\n"))).expect("write gap");
+        let gap = ledger_verify(&path).expect_err("gap detected");
+        assert_eq!(gap.line, 2);
+        assert!(gap.reason.contains("sequence 3 where 2"), "{}", gap.reason);
+
+        // Tail reads are bounded and tolerate a torn last line.
+        fs::write(&path, format!("{original}{{\"seq\":4,\"tor")).expect("write torn");
+        let tail = read_ledger_tail(&path, 2);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0]["seq"], json!(2));
+        assert_eq!(tail[1]["seq"], json!(3));
+        assert_eq!(read_ledger_tail(&path, 0).len(), 3);
+    }
+
+    #[test]
+    fn ledger_hash_depends_on_version_prefix_and_prev() {
+        let body = r#"{"a":1}"#;
+        let genesis = ledger_hash("", body);
+        let chained = ledger_hash("abc", body);
+        assert_ne!(genesis, chained);
+        use sha2::Digest;
+        let mut plain = sha2::Sha256::new();
+        plain.update(format!("\n{body}").as_bytes());
+        assert_ne!(
+            genesis,
+            hex_encode(&plain.finalize()),
+            "the version prefix must be inside the hash input"
+        );
+    }
+
+    #[test]
+    fn parse_lease_args_shapes() {
+        let status = parse_lease_args(&[]).expect("bare");
+        assert_eq!(status.verb, LeaseVerb::Status);
+        assert_eq!(status.pane_ref, "active");
+        let take = parse_lease_args(&args(&[
+            "take", "pane-2", "--as", "ci", "--force", "--why", "stuck",
+        ]))
+        .expect("take");
+        assert_eq!(take.verb, LeaseVerb::Take);
+        assert_eq!(take.pane_ref, "pane-2");
+        assert_eq!(take.holder.as_deref(), Some("ci"));
+        assert!(take.force);
+        assert_eq!(take.why.as_deref(), Some("stuck"));
+        let release =
+            parse_lease_args(&args(&["release", "-m", "answered the prompt"])).expect("release");
+        assert_eq!(release.verb, LeaseVerb::Release);
+        assert_eq!(release.note.as_deref(), Some("answered the prompt"));
+        let missing_note =
+            parse_lease_args(&args(&["release", "pane-1"])).expect_err("note required");
+        assert!(missing_note.contains("-m NOTE"), "{missing_note}");
+        assert!(parse_lease_args(&args(&["take", "a", "b"])).is_err());
+        assert!(parse_lease_args(&args(&["status", "--force"])).is_err());
+        assert!(parse_lease_args(&args(&["take", "--as", "bad holder"])).is_err());
+    }
+
+    #[test]
+    fn parse_as_flag_stops_at_double_dash() {
+        let (holder, rest) =
+            parse_as_flag(&args(&["pane-1", "--as", "ci", "echo", "hi"])).expect("parse");
+        assert_eq!(holder.as_deref(), Some("ci"));
+        assert_eq!(rest, args(&["pane-1", "echo", "hi"]));
+        let (holder, rest) =
+            parse_as_flag(&args(&["pane-1", "--", "--as", "literal"])).expect("parse");
+        assert_eq!(holder, None);
+        assert_eq!(rest, args(&["pane-1", "--", "--as", "literal"]));
+        let (holder, _) = parse_as_flag(&args(&["--as=ops", "pane-1", "x"])).expect("parse");
+        assert_eq!(holder.as_deref(), Some("ops"));
+        assert!(parse_as_flag(&args(&["pane-1", "--as"])).is_err());
+    }
+
+    #[test]
+    fn parse_ledger_args_shapes() {
+        let parsed = parse_ledger_args(&args(&["pane-3", "-n", "5", "--verify"])).expect("parse");
+        assert_eq!(parsed.pane_ref, "pane-3");
+        assert_eq!(parsed.limit, 5);
+        assert!(parsed.verify);
+        assert!(parse_ledger_args(&args(&["-n", "x"])).is_err());
+        assert!(parse_ledger_args(&args(&["a", "b"])).is_err());
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn lease_round_trip_over_ipc_gates_input_and_writes_ledger() {
+        let daemon = TestDaemon::spawn(Config::default());
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        assert!(initial.leases.is_empty(), "fresh workspace has no leases");
+
+        // Unheld under `open`: the legacy unattributed write still works.
+        client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: "".to_string(),
+            })
+            .expect("unheld write accepted");
+
+        let taken: LeaseInfo = client
+            .request(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect("take");
+        assert_eq!(taken.holder.as_deref(), Some("alice"));
+        assert_eq!(taken.policy, "open");
+
+        // Unattributed and other-holder writes are refused; the holder's go through.
+        let refused = client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: "x".to_string(),
+            })
+            .expect_err("unattributed write refused while held");
+        assert!(refused.contains("held by alice"), "{refused}");
+        let refused = client
+            .request::<CommandOk>(DaemonRequest::SendInputAs {
+                pane_id: pane_id.clone(),
+                input: "x".to_string(),
+                holder: "bob".to_string(),
+            })
+            .expect_err("bob refused");
+        assert!(refused.contains("held by alice"), "{refused}");
+        client
+            .request::<CommandOk>(DaemonRequest::SendInputAs {
+                pane_id: pane_id.clone(),
+                input: "echo hi\r".to_string(),
+                holder: "alice".to_string(),
+            })
+            .expect("holder write accepted");
+        let broadcast: Value = client
+            .request(DaemonRequest::Broadcast {
+                input: "".to_string(),
+            })
+            .expect("broadcast");
+        assert!(
+            !broadcast["panes"]
+                .as_array()
+                .expect("panes array")
+                .iter()
+                .any(|id| id == &json!(pane_id)),
+            "broadcast skips a held pane: {broadcast}"
+        );
+
+        let status: LeaseInfo = client
+            .request(DaemonRequest::LeaseStatus {
+                pane_id: pane_id.clone(),
+            })
+            .expect("status");
+        assert_eq!(status.holder.as_deref(), Some("alice"));
+        assert_eq!(status.writes, 1);
+        assert_eq!(status.bytes_typed, "echo hi\r".len() as u64);
+        assert_eq!(status.refused_writes, 2);
+        let snapshot: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap while held");
+        assert_eq!(
+            snapshot
+                .leases
+                .get(&pane_id)
+                .and_then(|info| info.holder.clone()),
+            Some("alice".to_string())
+        );
+        let persisted: PersistedWorkspace = serde_json::from_str(
+            &fs::read_to_string(daemon.data_dir.path().join(WORKSPACE_FILE))
+                .expect("workspace.json"),
+        )
+        .expect("parse workspace.json");
+        assert_eq!(
+            persisted
+                .leases
+                .get(&pane_id)
+                .map(|held| held.holder.as_str()),
+            Some("alice")
+        );
+
+        // Contention: bob needs --force and a reason.
+        let contended = client
+            .request::<LeaseInfo>(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "bob".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect_err("contended take refused");
+        assert!(contended.contains("held by alice"), "{contended}");
+        let forced: LeaseInfo = client
+            .request(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "bob".to_string(),
+                force: true,
+                why: Some("alice went home".to_string()),
+            })
+            .expect("forced take");
+        assert_eq!(forced.holder.as_deref(), Some("bob"));
+        assert_eq!(forced.writes, 0, "counters restart with the new holder");
+
+        // Release: mandatory note, only the holder.
+        let empty_note = client
+            .request::<LeaseInfo>(DaemonRequest::ReleaseLease {
+                pane_id: pane_id.clone(),
+                holder: "bob".to_string(),
+                note: "   ".to_string(),
+            })
+            .expect_err("empty note refused");
+        assert!(empty_note.contains("hand-back note"), "{empty_note}");
+        let wrong_holder = client
+            .request::<LeaseInfo>(DaemonRequest::ReleaseLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                note: "not mine".to_string(),
+            })
+            .expect_err("alice no longer holds it");
+        assert!(
+            wrong_holder.contains("held by bob, not alice"),
+            "{wrong_holder}"
+        );
+        let released: LeaseInfo = client
+            .request(DaemonRequest::ReleaseLease {
+                pane_id: pane_id.clone(),
+                holder: "bob".to_string(),
+                note: "answered the y/N; agent can carry on".to_string(),
+            })
+            .expect("release");
+        assert_eq!(released.holder, None);
+        let after: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap after release");
+        assert!(
+            after.leases.is_empty(),
+            "released panes leave the snapshot map"
+        );
+
+        // The ledger has the whole story, in order, and verifies.
+        let path = ledger_path(&daemon.data_dir.path().join(LEDGER_DIR), &pane_id);
+        let summary = ledger_verify(&path).expect("ledger verifies");
+        assert_eq!(summary.records, 4);
+        let kinds: Vec<String> = read_ledger_tail(&path, 0)
+            .iter()
+            .map(|record| record["type"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "lease.taken",
+                "lease.revoked",
+                "lease.taken",
+                "lease.released"
+            ]
+        );
+        let records = read_ledger_tail(&path, 0);
+        assert_eq!(records[1]["payload"]["holder"], json!("alice"));
+        assert_eq!(records[1]["payload"]["by"], json!("bob"));
+        assert_eq!(records[1]["payload"]["why"], json!("alice went home"));
+        assert_eq!(records[1]["payload"]["refused_writes"], json!(2));
+        assert_eq!(records[2]["payload"]["previous_holder"], json!("alice"));
+        assert_eq!(
+            records[3]["payload"]["note"],
+            json!("answered the y/N; agent can carry on")
+        );
+
+        // Closing a held pane revokes the lease but keeps the ledger.
+        client
+            .request::<LeaseInfo>(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect("retake");
+        let created: Pane = client
+            .request(DaemonRequest::CreatePane {
+                title: None,
+                profile: None,
+            })
+            .expect("second pane so the first can close");
+        let _ = created;
+        client
+            .request::<Value>(DaemonRequest::ClosePane {
+                pane_id: pane_id.clone(),
+            })
+            .expect("close held pane");
+        let summary = ledger_verify(&path).expect("ledger survives close");
+        assert_eq!(summary.records, 6);
+        let last = read_ledger_tail(&path, 1).remove(0);
+        assert_eq!(last["type"], json!("lease.revoked"));
+        assert_eq!(last["payload"]["why"], json!("pane closed"));
+        daemon.shutdown();
+    }
+
+    #[test]
+    fn lease_required_policy_refuses_unheld_writes() {
+        let daemon = TestDaemon::spawn(Config {
+            lease_policy: Some("required".to_string()),
+            ..Config::default()
+        });
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        let refused = client
+            .request::<CommandOk>(DaemonRequest::SendInputAs {
+                pane_id: pane_id.clone(),
+                input: "x".to_string(),
+                holder: "alice".to_string(),
+            })
+            .expect_err("unheld write refused under required");
+        assert!(refused.contains("unheld"), "{refused}");
+        let status: LeaseInfo = client
+            .request(DaemonRequest::LeaseStatus {
+                pane_id: pane_id.clone(),
+            })
+            .expect("status");
+        assert_eq!(status.policy, "required");
+        assert_eq!(status.holder, None);
+        client
+            .request::<LeaseInfo>(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect("take");
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        client
+            .request::<CommandOk>(DaemonRequest::SendInputAs {
+                pane_id,
+                input: "".to_string(),
+                holder: "alice".to_string(),
+            })
+            .expect("holder write accepted");
+        daemon.shutdown();
+    }
+
+    #[test]
+    fn lease_survives_daemon_restart_via_workspace_json() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let cwd = PathBuf::from("/tmp/sgian-lease-restart");
+        {
+            let server = DaemonServer::with_config(
+                cwd.clone(),
+                data_dir.path().to_path_buf(),
+                Config::default(),
+            )
+            .expect("server");
+            let pane = server.lock_registry().expect("registry").create_pane(None);
+            server
+                .handle(DaemonRequest::TakeLease {
+                    pane_id: pane.id.clone(),
+                    holder: "alice".to_string(),
+                    force: false,
+                    why: None,
+                })
+                .expect("take");
+        }
+        let server =
+            DaemonServer::with_config(cwd, data_dir.path().to_path_buf(), Config::default())
+                .expect("server restarted");
+        let leases = server.lease_infos();
+        assert_eq!(leases.len(), 1);
+        let info = leases.values().next().expect("one lease");
+        assert_eq!(info.holder.as_deref(), Some("alice"));
+        // A lease for a pane that is not in the registry is not resurrected.
+        let mut persisted: PersistedWorkspace = serde_json::from_str(
+            &fs::read_to_string(data_dir.path().join(WORKSPACE_FILE)).expect("workspace.json"),
+        )
+        .expect("parse");
+        persisted
+            .leases
+            .insert("pane-999".to_string(), HeldLease::new("ghost", 1));
+        fs::write(
+            data_dir.path().join(WORKSPACE_FILE),
+            serde_json::to_string(&persisted).expect("encode"),
+        )
+        .expect("write");
+        drop(server);
+        let server = DaemonServer::with_config(
+            PathBuf::from("/tmp/sgian-lease-restart"),
+            data_dir.path().to_path_buf(),
+            Config::default(),
+        )
+        .expect("server restarted again");
+        assert_eq!(server.lease_infos().len(), 1, "ghost lease filtered");
     }
 }

@@ -99,6 +99,14 @@ A single binary runs in three modes:
 - Agent awareness (shell panes): the daemon classifies a pane's screen for known
   agent TUIs (Claude Code) and broadcasts `agent-state` transitions
   (working / needs input / idle), badged on the pane's tab.
+- Keyboard lease: one holder per pane. While a pane is held, input from
+  anyone else is refused (`lease_policy: "open"`, the default) or every write
+  needs the lease (`"required"`). Takeovers, forced revocations, and releases
+  are appended to a per-pane hash-chained ledger with a mandatory hand-back
+  note; keystrokes are never recorded, only counts. The lease is a
+  coordination and audit record: every client still shares one workspace
+  token, so it is not yet a security boundary. See
+  [docs/design/keyboard-lease-and-ledger.md](docs/design/keyboard-lease-and-ledger.md).
 - Agent panes: a daemon-owned Claude stream-json or Factory Droid JSON-RPC
   process per pane, selected when the pane is created. Both feed a normalized
   event stream with permission round-trips, bounded conversation logs, and
@@ -118,6 +126,10 @@ A single binary runs in three modes:
 - `ctl new --profile NAME` to create a pane from a named shell/agent profile.
 - Batched multi-pane exec via `--all` / `--panes`.
 - `--lf` / `--raw` literal LF flag for precise input control.
+- `ctl lease take|release|status` to claim, hand back (with a note), or show a
+  pane's keyboard lease; `ctl send --as HOLDER` attributes input to a holder.
+- `ctl ledger [PANE] [--verify]` to print or verify a pane's hash-chained
+  lease ledger; a closed pane's ledger stays readable by id.
 - `ctl logs` to tail daemon logs.
 - `ctl status --verbose` for detailed daemon state.
 - `ctl write-config` to persist config changes.
