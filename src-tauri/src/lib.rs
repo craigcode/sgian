@@ -35369,6 +35369,115 @@ exit 0
         ));
     }
 
+    /// docs/design/keyboard-lease-and-ledger.md §7: an agent dumping tens of
+    /// megabytes must not stall the daemon, must not grow the scrollback file
+    /// past its cap, and must die with its pane when closed mid-flood.
+    #[cfg(unix)]
+    #[test]
+    fn output_flood_keeps_the_daemon_responsive_bounded_and_killable() {
+        let daemon = TestDaemon::spawn(Config::default());
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        let _: Pane = client
+            .request(DaemonRequest::CreatePane {
+                title: None,
+                profile: None,
+            })
+            .expect("a second pane so the first can close");
+
+        // 18 MiB through the PTY: past the 16 MiB scrollback cap.
+        let marker = daemon.data_dir.path().join("flood.done");
+        client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: format!("yes | head -c 18874368; touch '{}'\n", marker.display()),
+            })
+            .expect("start flood");
+        let scrollback = scrollback_path(&daemon.data_dir.path().join(SCROLLBACK_DIR), &pane_id);
+        let started = Instant::now();
+        let mut slowest = Duration::ZERO;
+        let mut largest: u64 = 0;
+        while !marker.exists() && started.elapsed() < Duration::from_secs(60) {
+            let ping = Instant::now();
+            client
+                .request::<Value>(DaemonRequest::Ping)
+                .expect("ping answers during the flood");
+            slowest = slowest.max(ping.elapsed());
+            if let Ok(meta) = fs::metadata(&scrollback) {
+                largest = largest.max(meta.len());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!(
+            "flood: 18874368 bytes in {:?}, slowest ping {:?}, largest scrollback {} bytes",
+            started.elapsed(),
+            slowest,
+            largest
+        );
+        assert!(marker.exists(), "the flood should finish within the budget");
+        assert!(
+            slowest < Duration::from_millis(1500),
+            "a request stalled for {slowest:?} during the flood"
+        );
+        assert!(largest > 0, "the flood must reach the scrollback file");
+        assert!(
+            largest <= SCROLLBACK_MAX_BYTES + 256 * 1024,
+            "scrollback grew to {largest} bytes, past the cap"
+        );
+
+        // An unbounded producer dies with its pane.
+        let pid_file = daemon.data_dir.path().join("yes.pid");
+        client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: format!("yes & echo $! > '{}'\n", pid_file.display()),
+            })
+            .expect("start unbounded flood");
+        let mut producer: Option<u32> = None;
+        for _ in 0..200 {
+            if let Some(pid) = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            {
+                producer = Some(pid);
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let producer = producer.expect("the shell reported the producer pid");
+        thread::sleep(Duration::from_millis(300));
+        client
+            .request::<Value>(DaemonRequest::ClosePane {
+                pane_id: pane_id.clone(),
+            })
+            .expect("close mid-flood");
+        let mut gone = false;
+        for _ in 0..200 {
+            // SAFETY: existence probe on a pid we were handed.
+            if unsafe { libc::kill(producer as libc::pid_t, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !gone {
+            // SAFETY: cleanup of our own test process.
+            unsafe {
+                libc::kill(producer as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        daemon.shutdown();
+        assert!(gone, "the producer must die with its pane");
+    }
+
     #[test]
     fn agent_probe_interval_config() {
         let mut config = Config::default();

@@ -246,9 +246,13 @@ Ranked by leverage against effort. None are committed beyond M1.
 
 1. **Read-side backpressure.** The PTY reader has no watermark: a slow
    subscriber is dropped, never stalls the pane, which is the right default
-   for a GUI. But scrollback appends and the vt100 model are on the read
-   path, and `local:yes` for a minute is the draft's torture test worth
-   running before M5 adds a network producer.
+   for a GUI. The draft's torture test is now a regression test
+   (`output_flood_keeps_the_daemon_responsive_bounded_and_killable`): 18 MiB
+   of `yes` through one pane on the development Mac took about 11 s (roughly
+   1.7 MB/s through PTY, vt100 model, scrollback append and fan-out), the
+   slowest concurrent request was 110 ms, the scrollback file never exceeded
+   its 16 MiB cap, and an unbounded `yes` died with its pane. The throughput
+   figure is the number to beat if a network producer (M5) ever needs more.
 2. **Scrollback search and permalinks.** `Find` filters metadata only. A
    substring search over the scrollback file with `ctl lines <pane> a:b`
    is small and makes the ledger's `seq` range citable.
