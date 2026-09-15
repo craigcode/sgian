@@ -130,6 +130,16 @@ Shipped (M4, lean, 2026-09-14):
   checkout rather than an HTTP client, so the daemon gains no async runtime;
   the WebSocket transcript tail and message mode from the draft remain open.
 
+Shipped (2026-09-15):
+
+- **Unattended-mode badge.** The permission mode is read off a Claude Code
+  screen (`⏵⏵ auto mode on`, `⏵⏵ bypass permissions on`, `accept edits on`,
+  `plan mode on`) and an agent pane's configured mode is overlaid at
+  bootstrap; `AgentPaneInfo` gains `mode` and `unattended`, every client
+  marks an unattended pane (amber ⚠ / shield), `ctl agent` prints
+  `UNATTENDED`, and mode transitions are ledgered as `mode.changed`.
+  Verified live by cycling modes with Shift+Tab in a real session.
+
 Open, in order:
 
 - **Notification-hook ingestion** (`agent_needs_input`, `permission_prompt`,

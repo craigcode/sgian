@@ -95,6 +95,16 @@ struct PaneHeader: View {
                 Label(model.permissionMode, systemImage: "exclamationmark.shield")
                     .font(.caption).foregroundStyle(.orange)
             }
+            if pane.kind == .shell, let info = model.agentStates[pane.id], let mode = info.mode {
+                // An agent in the shell running tools without approval is the
+                // loudest thing a supervisor needs to see.
+                Label(info.isUnattended ? "\(mode) · unattended" : mode,
+                      systemImage: info.isUnattended ? "exclamationmark.shield.fill" : "shield")
+                    .font(.caption)
+                    .foregroundStyle(info.isUnattended ? Color.orange : Color.secondary)
+                    .help(info.isUnattended ? "\(mode) mode: tools run without your approval" : "Permission mode: \(mode)")
+                    .accessibilityIdentifier("agent-mode")
+            }
             if pane.kind == .agent, let spec = model.agentSpecs[pane.id] {
                 Text([spec.backend.displayName, spec.model].compactMap { $0 }.joined(separator: " · "))
                     .font(.caption)

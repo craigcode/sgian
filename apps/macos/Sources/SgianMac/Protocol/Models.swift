@@ -44,6 +44,19 @@ struct AgentPaneSpec: Codable, Equatable, Sendable {
 struct AgentPaneInfo: Codable, Equatable, Sendable {
     var agent: String?
     var attention: AgentAttention?
+    /// The agent's observed permission mode (`auto`, `bypass`, …); nil when unknown.
+    var mode: String?
+    /// True when tools run without a person approving them (auto / bypass).
+    var unattended: Bool?
+
+    init(agent: String?, attention: AgentAttention?, mode: String? = nil, unattended: Bool? = nil) {
+        self.agent = agent
+        self.attention = attention
+        self.mode = mode
+        self.unattended = unattended
+    }
+
+    var isUnattended: Bool { unattended == true }
 }
 
 /// A pane's keyboard lease (docs/design/keyboard-lease-and-ledger.md).

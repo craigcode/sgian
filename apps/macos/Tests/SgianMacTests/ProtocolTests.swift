@@ -256,3 +256,13 @@ func daemonRoundTrip() async throws {
     let holder = WorkspaceModel.defaultHolder()
     #expect(LeaseText.isValidHolder(holder))
 }
+
+
+@Test func agentPaneInfoDecodesModeAndUnattendedWithDefaults() throws {
+    let flagged = try JSONDecoder().decode(AgentPaneInfo.self, from: Data(#"{"agent":"claude","attention":"idle","mode":"auto","unattended":true}"#.utf8))
+    #expect(flagged.mode == "auto")
+    #expect(flagged.isUnattended)
+    let legacy = try JSONDecoder().decode(AgentPaneInfo.self, from: Data(#"{"agent":"claude","attention":"working"}"#.utf8))
+    #expect(legacy.mode == nil)
+    #expect(!legacy.isUnattended)
+}

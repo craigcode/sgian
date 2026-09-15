@@ -1535,6 +1535,40 @@ pub struct AgentPaneInfo {
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<AgentAttention>,
+    /// The agent's permission mode as observed (`auto`, `bypass`,
+    /// `accept-edits`, `plan` from a Claude Code screen; an agent pane's
+    /// configured mode verbatim). Absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// True when `mode` runs tools without asking a person (`auto`, `bypass`,
+    /// `bypassPermissions`, `dontAsk`): the pane must be visibly marked.
+    #[serde(default)]
+    pub unattended: bool,
+}
+
+/// Modes in which an agent runs tools without a person approving them.
+fn is_unattended_mode(mode: Option<&str>) -> bool {
+    matches!(
+        mode,
+        Some("auto") | Some("bypass") | Some("bypassPermissions") | Some("dontAsk")
+    )
+}
+
+/// Claude Code prints its permission mode in the input-box footer
+/// (`⏵⏵ auto mode on`, `⏵⏵ bypass permissions on`, `⏵⏵ accept edits on`,
+/// `⏸ plan mode on`). Reduce it to a short stable token.
+fn classify_agent_mode(text: &str) -> Option<&'static str> {
+    if text.contains("bypass permissions on") {
+        Some("bypass")
+    } else if text.contains("auto mode on") {
+        Some("auto")
+    } else if text.contains("accept edits on") || text.contains("auto-accept edits on") {
+        Some("accept-edits")
+    } else if text.contains("plan mode on") {
+        Some("plan")
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2463,6 +2497,9 @@ enum DaemonEvent {
         pane_id: String,
         agent: Option<String>,
         attention: Option<AgentAttention>,
+        /// Observed permission mode (see `AgentPaneInfo::mode`); additive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
     },
     /// Keyboard lease transition (docs/design/keyboard-lease-and-ledger.md).
     /// `holder`/`since_ms` describe the lease AFTER the transition (null once
@@ -2586,6 +2623,10 @@ struct FindEntry {
     agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attention: Option<AgentAttention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    #[serde(default)]
+    unattended: bool,
     group: Option<String>,
     cols: u16,
     rows: u16,
@@ -3322,6 +3363,8 @@ struct AgentPaneState {
     /// (M3b) Until when an official `claude agents --json` reading outranks
     /// the screen heuristic for this pane. `None` = never had one.
     official_until: Option<Instant>,
+    /// The permission mode read off the screen (see `classify_agent_mode`).
+    mode: Option<String>,
 }
 
 impl AgentPaneState {
@@ -3330,6 +3373,8 @@ impl AgentPaneState {
         AgentPaneInfo {
             agent: self.agent.clone(),
             attention: self.attention,
+            mode: self.mode.clone(),
+            unattended: is_unattended_mode(self.mode.as_deref()),
         }
     }
 }
@@ -3839,11 +3884,31 @@ impl OutputRouter {
             return;
         };
         let entry = tracker.panes.entry(pane_id.to_string()).or_default();
-        // (M3b) A fresh official reading outranks the screen heuristic.
+        // (M3b) A fresh official reading outranks the screen heuristic for
+        // attention; the permission mode is only ever on the screen, so it
+        // still tracks it.
         if entry
             .official_until
             .is_some_and(|until| until > Instant::now())
         {
+            let new_mode = entry
+                .agent
+                .as_ref()
+                .and_then(|_| classify_agent_mode(text).map(str::to_string));
+            if entry.mode == new_mode {
+                return;
+            }
+            let previous_mode = std::mem::replace(&mut entry.mode, new_mode.clone());
+            let agent = entry.agent.clone();
+            let attention = entry.attention;
+            drop(tracker);
+            self.note_mode_change(pane_id, agent.as_deref(), previous_mode, new_mode.clone());
+            self.broadcast(&DaemonEvent::AgentState {
+                pane_id: pane_id.to_string(),
+                agent,
+                attention,
+                mode: new_mode,
+            });
             return;
         }
         let new_agent = if entry.manual {
@@ -3875,30 +3940,69 @@ impl OutputRouter {
         } else {
             new_agent.as_ref().map(|_| classify_agent_attention(text))
         };
-        if entry.agent == new_agent && entry.attention == new_attention {
+        let new_mode = new_agent
+            .as_ref()
+            .and_then(|_| classify_agent_mode(text).map(str::to_string));
+        if entry.agent == new_agent && entry.attention == new_attention && entry.mode == new_mode {
             return;
         }
         let previous_attention = entry.attention;
+        let previous_agent = entry.agent.clone();
+        let previous_mode = std::mem::replace(&mut entry.mode, new_mode.clone());
         entry.agent = new_agent.clone();
         entry.attention = new_attention;
         drop(tracker);
         // Every transition is ledgered with its evidence so a wrong guess is
         // auditable (docs/design/keyboard-lease-and-ledger.md §6 M3).
-        self.ledger_note(
-            pane_id,
-            "attention.changed",
-            json!({
-                "agent": new_agent,
-                "from": previous_attention,
-                "to": new_attention,
-                "evidence": "screen",
-            }),
-        );
+        if previous_agent != new_agent || previous_attention != new_attention {
+            self.ledger_note(
+                pane_id,
+                "attention.changed",
+                json!({
+                    "agent": new_agent,
+                    "from": previous_attention,
+                    "to": new_attention,
+                    "evidence": "screen",
+                }),
+            );
+        }
+        if previous_mode != new_mode {
+            self.note_mode_change(
+                pane_id,
+                new_agent.as_deref(),
+                previous_mode,
+                new_mode.clone(),
+            );
+        }
         self.broadcast(&DaemonEvent::AgentState {
             pane_id: pane_id.to_string(),
             agent: new_agent,
             attention: new_attention,
+            mode: new_mode,
         });
+    }
+
+    /// A permission-mode change is its own ledger record: "the agent went
+    /// unattended at 14:02" is exactly the line an audit wants to find.
+    fn note_mode_change(
+        &self,
+        pane_id: &str,
+        agent: Option<&str>,
+        from: Option<String>,
+        to: Option<String>,
+    ) {
+        let unattended = is_unattended_mode(to.as_deref());
+        self.ledger_note(
+            pane_id,
+            "mode.changed",
+            json!({
+                "agent": agent,
+                "from": from,
+                "to": to,
+                "unattended": unattended,
+                "evidence": "screen",
+            }),
+        );
     }
 
     /// (M3b) An official reading from `claude agents --json` for a pane whose
@@ -3943,6 +4047,7 @@ impl OutputRouter {
             return newly_official;
         }
         let previous_attention = entry.attention;
+        let mode = entry.mode.clone();
         entry.agent = new_agent.clone();
         entry.attention = new_attention;
         drop(tracker);
@@ -3960,6 +4065,7 @@ impl OutputRouter {
             pane_id: pane_id.to_string(),
             agent: new_agent,
             attention: new_attention,
+            mode,
         });
         newly_official
     }
@@ -3985,6 +4091,7 @@ impl OutputRouter {
         }
         let previous_agent = entry.agent.take();
         let previous_attention = entry.attention.take();
+        entry.mode = None;
         drop(tracker);
         self.ledger_note(
             pane_id,
@@ -4000,6 +4107,7 @@ impl OutputRouter {
             pane_id: pane_id.to_string(),
             agent: None,
             attention: None,
+            mode: None,
         });
     }
 
@@ -4069,9 +4177,9 @@ impl OutputRouter {
             entry
                 .attention
                 .take()
-                .map(|previous| (entry.agent.clone(), previous))
+                .map(|previous| (entry.agent.clone(), previous, entry.mode.clone()))
         });
-        if let Some((Some(agent), previous)) = cleared {
+        if let Some((Some(agent), previous, mode)) = cleared {
             self.ledger_note(
                 pane_id,
                 "attention.changed",
@@ -4086,6 +4194,7 @@ impl OutputRouter {
                 pane_id: pane_id.to_string(),
                 agent: Some(agent),
                 attention: None,
+                mode,
             });
         }
     }
@@ -9297,6 +9406,8 @@ impl DaemonServer {
                 exit_code,
                 agent: agent_info.agent,
                 attention: agent_info.attention,
+                mode: agent_info.mode,
+                unattended: agent_info.unattended,
                 group: None,
                 cols,
                 rows,
@@ -9787,6 +9898,28 @@ impl DaemonServer {
         drop(terminals);
         // (T1) Agent info rides the bootstrap payload parallel to pane_states.
         snapshot.agent_states = self.router.agent_states();
+        // An agent-kind pane's mode is its configured permission mode, not a
+        // screen: overlay it so every pane carries `unattended` the same way.
+        let permission_mode = self.effective_config().agent_config().permission_mode;
+        for pane in &snapshot.panes {
+            if pane.kind != PaneKind::Agent {
+                continue;
+            }
+            let backend = snapshot
+                .agent_specs
+                .get(&pane.id)
+                .map(|spec| spec.backend.as_str().to_string())
+                .unwrap_or_else(|| "claude".to_string());
+            let entry = snapshot
+                .agent_states
+                .entry(pane.id.clone())
+                .or_insert_with(|| AgentPaneInfo {
+                    agent: Some(backend),
+                    ..AgentPaneInfo::default()
+                });
+            entry.mode = Some(permission_mode.clone());
+            entry.unattended = is_unattended_mode(Some(&permission_mode));
+        }
         // Held keyboard leases ride alongside so a client can render the
         // holder without a second request.
         snapshot.leases = self.lease_infos();
@@ -12988,13 +13121,17 @@ fn emit_daemon_event(app: &AppHandle, event: DaemonEvent) {
             pane_id,
             agent,
             attention,
+            mode,
         } => {
+            let unattended = is_unattended_mode(mode.as_deref());
             let _ = app.emit(
                 "agent-state",
                 json!({
                     "pane_id": pane_id,
                     "agent": agent,
                     "attention": attention,
+                    "mode": mode,
+                    "unattended": unattended,
                 }),
             );
         }
@@ -16456,12 +16593,14 @@ fn format_watch_event(event: &DaemonEvent, json_output: bool) -> Option<String> 
             pane_id,
             agent,
             attention,
+            mode,
         } => format!(
-            "{pane_id}\tagent_state\t{}\t{}",
+            "{pane_id}\tagent_state\t{}\t{}\t{}",
             agent.as_deref().unwrap_or("-"),
             attention
                 .map(|value| enum_name(&value))
-                .unwrap_or_else(|| "-".to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            mode.as_deref().unwrap_or("-")
         ),
         DaemonEvent::LeaseState {
             pane_id,
@@ -16534,6 +16673,7 @@ fn control_agent_watch(
             pane_id: pane_id.to_string(),
             agent: entry["agent"].as_str().map(str::to_string),
             attention: serde_json::from_value(entry["attention"].clone()).ok(),
+            mode: entry["mode"].as_str().map(str::to_string),
         };
         if let Some(line) = format_watch_event(&baseline, json_output) {
             writeln!(stdout, "{line}")
@@ -16587,6 +16727,11 @@ fn query_agent_state(client: &DaemonClient, pane_id: &str) -> Result<Value, Stri
         "pane_id": pane_id,
         "agent": entry.and_then(|entry| entry.get("agent")).cloned().unwrap_or(Value::Null),
         "attention": entry.and_then(|entry| entry.get("attention")).cloned().unwrap_or(Value::Null),
+        "mode": entry.and_then(|entry| entry.get("mode")).cloned().unwrap_or(Value::Null),
+        "unattended": entry
+            .and_then(|entry| entry.get("unattended"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }))
 }
 
@@ -16622,10 +16767,16 @@ fn control_agent(client: &DaemonClient, args: &[String], json_output: bool) -> R
         let mut stdout = std::io::stdout();
         writeln!(
             stdout,
-            "{}\t{}\t{}",
+            "{}\t{}\t{}\t{}{}",
             pane_id,
             state["agent"].as_str().unwrap_or("-"),
-            state["attention"].as_str().unwrap_or("-")
+            state["attention"].as_str().unwrap_or("-"),
+            state["mode"].as_str().unwrap_or("-"),
+            if state["unattended"].as_bool().unwrap_or(false) {
+                "\tUNATTENDED"
+            } else {
+                ""
+            }
         )
         .map_err(|error| format!("failed to write stdout: {error}"))
     }
@@ -31077,6 +31228,7 @@ mod tests {
                 pane_id: "pane-1".to_string(),
                 agent: Some("claude".to_string()),
                 attention: Some(AgentAttention::Idle),
+                mode: None,
             }
         );
 
@@ -31102,6 +31254,7 @@ mod tests {
                 pane_id: "pane-1".to_string(),
                 agent: Some("claude".to_string()),
                 attention: Some(AgentAttention::Working),
+                mode: None,
             }
         );
 
@@ -31126,6 +31279,7 @@ mod tests {
                 pane_id: "pane-1".to_string(),
                 agent: None,
                 attention: None,
+                mode: None,
             }
         );
 
@@ -31197,6 +31351,7 @@ mod tests {
                 pane_id: id,
                 agent,
                 attention,
+                ..
             } = event
             {
                 if id == pane_id {
@@ -31881,6 +32036,7 @@ mod tests {
             pane_id: "pane-1".to_string(),
             agent: Some("claude".to_string()),
             attention: Some(AgentAttention::NeedsInput),
+            mode: None,
         };
         assert_eq!(
             serde_json::to_value(&event).expect("serialize event"),
@@ -31904,6 +32060,7 @@ mod tests {
                 pane_id: "pane-1".to_string(),
                 agent: None,
                 attention: None,
+                mode: None,
             }
         );
 
@@ -34855,10 +35012,11 @@ exit 0
             pane_id: "pane-1".to_string(),
             agent: Some("claude".to_string()),
             attention: Some(AgentAttention::NeedsInput),
+            mode: Some("auto".to_string()),
         };
         assert_eq!(
             format_watch_event(&state, false).as_deref(),
-            Some("pane-1\tagent_state\tclaude\tneeds_input")
+            Some("pane-1\tagent_state\tclaude\tneeds_input\tauto")
         );
         let json_line = format_watch_event(&state, true).expect("json");
         let parsed: Value = serde_json::from_str(&json_line).expect("valid json");
@@ -35367,6 +35525,94 @@ exit 0
         assert!(!is_transient_pty_error(
             "No such file or directory (os error 2)"
         ));
+    }
+
+    #[test]
+    fn permission_mode_is_read_off_the_screen_and_flagged() {
+        assert_eq!(
+            classify_agent_mode("⏵⏵ auto mode on (shift+tab to cycle)"),
+            Some("auto")
+        );
+        assert_eq!(
+            classify_agent_mode("⏵⏵ bypass permissions on"),
+            Some("bypass")
+        );
+        assert_eq!(
+            classify_agent_mode("⏵⏵ accept edits on"),
+            Some("accept-edits")
+        );
+        assert_eq!(
+            classify_agent_mode("⏵⏵ auto-accept edits on"),
+            Some("accept-edits")
+        );
+        assert_eq!(classify_agent_mode("⏸ plan mode on"), Some("plan"));
+        assert_eq!(classify_agent_mode("❯ "), None);
+        assert!(is_unattended_mode(Some("auto")));
+        assert!(is_unattended_mode(Some("bypass")));
+        assert!(is_unattended_mode(Some("bypassPermissions")));
+        assert!(is_unattended_mode(Some("dontAsk")));
+        assert!(!is_unattended_mode(Some("accept-edits")));
+        assert!(!is_unattended_mode(Some("plan")));
+        assert!(!is_unattended_mode(Some("manual")));
+        assert!(!is_unattended_mode(None));
+    }
+
+    #[test]
+    fn mode_transitions_ride_agent_state_and_the_ledger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let router = OutputRouter::new(dir.path().join("scrollback"));
+        let ledger_dir = dir.path().join(LEDGER_DIR);
+        fs::create_dir_all(&ledger_dir).expect("ledger dir");
+        router.set_ledger(Arc::new(Mutex::new(LedgerSink::new(ledger_dir.clone()))));
+        let auto_screen = format!("{CLAUDE_IDLE_SCREEN}  ⏵⏵ auto mode on (shift+tab to cycle)\r\n");
+        let bypass_screen = format!("{CLAUDE_IDLE_SCREEN}  ⏵⏵ bypass permissions on\r\n");
+
+        router.apply_agent_classification("pane-4", CLAUDE_IDLE_SCREEN);
+        let info = router.agent_state("pane-4");
+        assert_eq!(info.mode, None);
+        assert!(!info.unattended);
+
+        router.apply_agent_classification("pane-4", &auto_screen);
+        let info = router.agent_state("pane-4");
+        assert_eq!(info.mode.as_deref(), Some("auto"));
+        assert!(info.unattended);
+        assert_eq!(info.attention, Some(AgentAttention::Idle));
+
+        // Under a fresh official reading the mode still tracks the screen.
+        router.apply_official_attention(
+            "pane-4",
+            "claude",
+            AgentAttention::Working,
+            Duration::from_secs(5),
+        );
+        router.apply_agent_classification("pane-4", &bypass_screen);
+        let info = router.agent_state("pane-4");
+        assert_eq!(info.mode.as_deref(), Some("bypass"));
+        assert_eq!(
+            info.attention,
+            Some(AgentAttention::Working),
+            "official attention is untouched by a mode change"
+        );
+
+        let records = read_ledger_tail(&ledger_path(&ledger_dir, "pane-4"), 0);
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|record| record["type"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "attention.changed",
+                "mode.changed",
+                "attention.changed",
+                "mode.changed"
+            ]
+        );
+        assert_eq!(records[1]["payload"]["from"], Value::Null);
+        assert_eq!(records[1]["payload"]["to"], json!("auto"));
+        assert_eq!(records[1]["payload"]["unattended"], json!(true));
+        assert_eq!(records[3]["payload"]["from"], json!("auto"));
+        assert_eq!(records[3]["payload"]["to"], json!("bypass"));
     }
 
     #[test]

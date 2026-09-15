@@ -519,6 +519,8 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             item.Attention = snapshot.AgentStates.TryGetValue(pane.Id, out var info)
                 ? info.Attention
                 : null;
+            item.Mode = info?.Mode;
+            item.Unattended = info?.Unattended ?? false;
             item.AgentSpec = snapshot.AgentSpecs.TryGetValue(pane.Id, out var spec) ? spec : null;
             ApplyLease(item, snapshot.Leases.TryGetValue(pane.Id, out var lease) ? lease : null);
             if (pane.Kind == "agent")
@@ -588,7 +590,13 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                 break;
             case "agent_state":
                 var statePane = Panes.FirstOrDefault(pane => pane.Id == item.String("pane_id"));
-                if (statePane is not null) statePane.Attention = item.String("attention");
+                if (statePane is not null)
+                {
+                    statePane.Attention = item.String("attention");
+                    statePane.Mode = item.String("mode");
+                    statePane.Unattended = item.Payload.TryGetProperty("unattended", out var flag)
+                        && flag.ValueKind == JsonValueKind.True;
+                }
                 break;
             case "lease_state":
                 var leaseMap = new Dictionary<string, LeaseInfo>(StringComparer.Ordinal);
