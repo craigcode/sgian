@@ -11367,19 +11367,33 @@ fn run_daemon_with_config_and_warnings(
     // (M3b) The official agent probe runs on its own thread so a slow
     // `claude agents --json` never touches the accept loop; it re-reads the
     // interval each round so a config reload takes effect without a restart.
+    // It holds only a Weak reference and sleeps in short slices: a strong Arc
+    // parked in a one-second sleep would keep the server (and its log guard,
+    // whose drop flushes `daemon_shutdown`) alive after the accept loop ended.
     #[cfg(unix)]
     {
-        let probe_server = Arc::clone(&server);
+        let probe_server = Arc::downgrade(&server);
         thread::spawn(move || {
-            let _guard = tracing::dispatcher::set_default(&probe_server.log_dispatch);
-            while !probe_server.shutdown.load(Ordering::SeqCst) {
-                match probe_server.effective_config().agent_probe_interval() {
-                    Some(interval) => {
-                        probe_server.run_agent_probe(interval);
-                        thread::sleep(interval);
-                    }
-                    None => thread::sleep(Duration::from_secs(1)),
+            let mut next_round = Instant::now();
+            loop {
+                let Some(server) = probe_server.upgrade() else {
+                    return;
+                };
+                if server.shutdown.load(Ordering::SeqCst) {
+                    return;
                 }
+                if Instant::now() >= next_round {
+                    let _guard = tracing::dispatcher::set_default(&server.log_dispatch);
+                    match server.effective_config().agent_probe_interval() {
+                        Some(interval) => {
+                            server.run_agent_probe(interval);
+                            next_round = Instant::now() + interval;
+                        }
+                        None => next_round = Instant::now() + Duration::from_secs(1),
+                    }
+                }
+                drop(server);
+                thread::sleep(Duration::from_millis(50));
             }
         });
     }
