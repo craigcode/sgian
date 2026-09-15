@@ -99,9 +99,9 @@ A single binary runs in three modes:
   inside a Claude Code session does not make every pane's `claude` a child
   session with transcripts off.
 - Closing a pane (or the daemon exiting) terminates the pane's whole process
-  tree, not just its shell: descendants are signalled on Unix (SIGTERM, then
-  SIGKILL after a grace period) and held in a kill-on-close Job Object on
-  Windows.
+  tree, not just its shell: descendants are found without forking (libproc on
+  macOS, /proc on Linux) and signalled (SIGTERM, then SIGKILL after a grace
+  period); on Windows the child is held in a kill-on-close Job Object.
 - Config file-watch with live reload.
 - Bounded log rotation so logs do not grow unbounded.
 - Agent awareness (shell panes): the daemon classifies a pane's screen for known
