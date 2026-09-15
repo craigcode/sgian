@@ -23,6 +23,8 @@ function createController({
     openSettingsModal: vi.fn(),
     openOverview: vi.fn(),
     installUpdate: vi.fn(),
+    takeLease: vi.fn(),
+    openReleaseDialog: vi.fn(),
   };
   if (focusNextAttentionPane) {
     controller.focusNextAttentionPane = vi.fn();
@@ -92,6 +94,8 @@ describe("buildPaletteCommands", () => {
         "settings",
         "session-overview",
         "focus-attention",
+        "lease-take",
+        "lease-release",
       ]),
     );
   });
@@ -147,5 +151,16 @@ describe("buildPaletteCommands", () => {
     const shellCommand = commands.find((entry) => entry.id === "new-pane-profile-dev-shell");
     shellCommand.run();
     expect(controller.newPaneWithProfile).toHaveBeenCalledWith("dev-shell");
+  });
+});
+
+describe("keyboard lease palette commands", () => {
+  it("route to the controller with the active pane", () => {
+    const controller = createController();
+    const commands = buildPaletteCommands(controller);
+    commands.find((command) => command.id === "lease-take").run();
+    expect(controller.takeLease).toHaveBeenCalledWith("pane-1");
+    commands.find((command) => command.id === "lease-release").run();
+    expect(controller.openReleaseDialog).toHaveBeenCalledWith("pane-1");
   });
 });

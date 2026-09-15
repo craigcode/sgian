@@ -20,6 +20,9 @@ tauri-build = { version = "2", features = [] }
 portable-pty = { path = "vendor/portable-pty" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Ledger chain hashes (docs/design/keyboard-lease-and-ledger.md). Already a
+# transitive dependency of tauri, so this adds no new crate to the lockfile.
+sha2 = "0.10"
 tauri = { version = "2", features = [] }
 libc = "0.2"
 tempfile = "3"
@@ -42,6 +45,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }

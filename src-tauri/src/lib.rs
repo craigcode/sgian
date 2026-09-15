@@ -1571,6 +1571,10 @@ pub struct WorkspaceSnapshot {
     /// objects byte-for-byte.
     #[serde(default)]
     pub agent_specs: HashMap<String, AgentPaneSpec>,
+    /// Keyboard leases for HELD panes only (pane_id → holder and counters).
+    /// Additive: old daemons omit it, old clients ignore it.
+    #[serde(default)]
+    pub leases: HashMap<String, LeaseInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1664,6 +1668,10 @@ struct PersistedWorkspace {
     /// (ENHANCEMENTS §4). Additive: pre-feature workspace files omit it.
     #[serde(default)]
     pane_shells: HashMap<String, ShellConfig>,
+    /// Held keyboard leases (pane_id → holder and counters), so a daemon
+    /// restart does not silently forget who was in control. Additive.
+    #[serde(default)]
+    leases: HashMap<String, HeldLease>,
 }
 
 /// User configuration, loaded from a global config.json and an optional per-workspace
@@ -1713,6 +1721,23 @@ struct Config {
     /// does not auto-restart. An unrecognized value falls back to the default.
     #[serde(default)]
     restore_policy: Option<String>,
+    /// Keyboard lease policy (docs/design/keyboard-lease-and-ledger.md).
+    /// `open` (default): an unheld pane accepts input from anyone and a held
+    /// pane only from its holder. `required`: every write needs the lease.
+    /// An unrecognized value is rejected by `validate`.
+    #[serde(default)]
+    lease_policy: Option<String>,
+    /// (M3b) How often the daemon polls `claude agents --json` to read Claude
+    /// Code's own session state for shell panes (milliseconds). Unset =
+    /// 2000; `0` disables the probe. While a probe result is fresh it
+    /// outranks the screen heuristic. Unix only.
+    #[serde(default)]
+    agent_probe_interval_ms: Option<u64>,
+    /// (M4) The `kranz` CLI used to read a bound pane's mission state and to
+    /// mirror hand-back notes into its inbox. Unset resolves `SGIAN_KRANZ_BIN`
+    /// and then `kranz` on PATH.
+    #[serde(default)]
+    kranz_bin: Option<String>,
     /// (T2) Permission mode for agent-pane `claude` processes, passed to
     /// `--permission-mode`. Defaults to `manual`: every tool use that needs
     /// approval arrives as a `permission_request` agent event and blocks until
@@ -1797,6 +1822,11 @@ impl Config {
             theme: other.theme.or(self.theme),
             idle_shutdown_secs: other.idle_shutdown_secs.or(self.idle_shutdown_secs),
             restore_policy: other.restore_policy.or(self.restore_policy),
+            lease_policy: other.lease_policy.or(self.lease_policy),
+            agent_probe_interval_ms: other
+                .agent_probe_interval_ms
+                .or(self.agent_probe_interval_ms),
+            kranz_bin: other.kranz_bin.or(self.kranz_bin),
             agent_permission_mode: other.agent_permission_mode.or(self.agent_permission_mode),
             agent_claude_bin: other.agent_claude_bin.or(self.agent_claude_bin),
             agent_droid_bin: other.agent_droid_bin.or(self.agent_droid_bin),
@@ -1838,6 +1868,36 @@ impl Config {
     /// unrecognized. This is a pure function — the warning for an unrecognized
     /// value is logged once in `run_daemon_with_config` after the tracing
     /// dispatcher is active.
+    /// Effective keyboard lease policy; unset (or, defensively, unparseable)
+    /// falls back to `open` so a stale config can never lock every pane.
+    fn lease_policy_effective(&self) -> LeasePolicy {
+        self.lease_policy
+            .as_deref()
+            .and_then(LeasePolicy::parse)
+            .unwrap_or(LeasePolicy::Open)
+    }
+
+    /// (M4) The `kranz` binary: config, then `SGIAN_KRANZ_BIN`, then PATH.
+    fn kranz_bin_effective(&self) -> String {
+        self.kranz_bin
+            .clone()
+            .filter(|bin| !bin.is_empty())
+            .or_else(|| {
+                std::env::var("SGIAN_KRANZ_BIN")
+                    .ok()
+                    .filter(|bin| !bin.is_empty())
+            })
+            .unwrap_or_else(|| "kranz".to_string())
+    }
+
+    /// (M3b) The official agent probe cadence; `None` when disabled.
+    fn agent_probe_interval(&self) -> Option<Duration> {
+        match self.agent_probe_interval_ms.unwrap_or(2000) {
+            0 => None,
+            millis => Some(Duration::from_millis(millis.max(250))),
+        }
+    }
+
     fn restore_policy_effective(&self) -> String {
         match self.restore_policy.as_deref() {
             Some("auto_respawn") | None => "auto_respawn".to_string(),
@@ -1877,6 +1937,13 @@ impl Config {
             if !matches!(policy.as_str(), "auto_respawn" | "restore_on_demand") {
                 return Err(format!(
                     "invalid restore_policy '{policy}': must be 'auto_respawn' or 'restore_on_demand'"
+                ));
+            }
+        }
+        if let Some(ref policy) = self.lease_policy {
+            if LeasePolicy::parse(policy).is_none() {
+                return Err(format!(
+                    "invalid lease_policy '{policy}': must be 'open' or 'required'"
                 ));
             }
         }
@@ -2094,6 +2161,18 @@ fn load_config(data_dir: &Path) -> (Config, Vec<String>) {
 /// `spawn_pane` applies the same logic via `CommandBuilder::env_remove` /
 /// `env` (verified end-to-end by `env_scrubbing_integration_spawned_pane`).
 /// VAL-SEC-003/004/007.
+/// Claude Code marks its own subprocesses so a nested `claude` knows it is a
+/// child session (transcripts off, not listed by `claude agents`). A daemon
+/// started from inside such a session would otherwise pass those marks to
+/// every pane it ever spawns, since it outlives the session. Pane shells are
+/// the operator's, not Claude's tools, so the marks are always dropped; an
+/// explicit `env` entry still wins.
+const INHERITED_SESSION_MARKERS: [&str; 3] = [
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+];
+
 #[cfg(test)]
 fn compute_spawn_env(
     inherited: &HashMap<String, String>,
@@ -2101,6 +2180,9 @@ fn compute_spawn_env(
     explicit: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut env = inherited.clone();
+    for key in INHERITED_SESSION_MARKERS {
+        env.remove(key);
+    }
     for key in scrub {
         env.remove(key);
     }
@@ -2147,6 +2229,45 @@ enum DaemonRequest {
         pane_id: String,
         input: String,
     },
+    /// `SendInput` attributed to a keyboard-lease holder
+    /// (docs/design/keyboard-lease-and-ledger.md). The legacy `WriteToPane` /
+    /// `SendInput` carry no holder and are refused while a pane is held.
+    SendInputAs {
+        pane_id: String,
+        input: String,
+        holder: String,
+    },
+    /// Claim a pane's keyboard for `holder`. Idempotent for the current
+    /// holder; against another holder it needs `force` plus a `why`, and both
+    /// the revocation and the new claim are ledgered.
+    TakeLease {
+        pane_id: String,
+        holder: String,
+        #[serde(default)]
+        force: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<String>,
+    },
+    /// Hand a pane's keyboard back. The note is mandatory: it is the record.
+    ReleaseLease {
+        pane_id: String,
+        holder: String,
+        note: String,
+    },
+    LeaseStatus {
+        pane_id: String,
+    },
+    /// (M4) Bind a pane to a Kranz mission by hand (`repo` defaults to the
+    /// pane's cwd); auto bindings come from a `kranz run` under the pane.
+    KranzBind {
+        pane_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+    },
+    KranzUnbind {
+        pane_id: String,
+    },
+    KranzBindings,
     ResizePaneTerminal {
         pane_id: String,
         cols: u16,
@@ -2342,6 +2463,18 @@ enum DaemonEvent {
         pane_id: String,
         agent: Option<String>,
         attention: Option<AgentAttention>,
+    },
+    /// Keyboard lease transition (docs/design/keyboard-lease-and-ledger.md).
+    /// `holder`/`since_ms` describe the lease AFTER the transition (null once
+    /// released or revoked); `note` rides a release. Old clients skip the
+    /// unknown event tag.
+    LeaseState {
+        pane_id: String,
+        transition: LeaseTransition,
+        holder: Option<String>,
+        since_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     /// (T2) One NORMALIZED conversation event from an agent pane's `claude`
     /// stream-json output. `event` is an object tagged by its `kind` field:
@@ -2629,6 +2762,7 @@ impl PaneRegistry {
             agent_states: HashMap::new(),
             agent_events: HashMap::new(),
             agent_specs: HashMap::new(),
+            leases: HashMap::new(),
         }
     }
 
@@ -2646,8 +2780,227 @@ impl PaneRegistry {
     }
 }
 
+/// Every descendant of `root` in one `ps` snapshot (root excluded).
+#[cfg(unix)]
+fn process_descendants(root: u32, table: &ProcessTable) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, ppid) in &table.parent {
+        children.entry(*ppid).or_default().push(*pid);
+    }
+    let mut found = Vec::new();
+    let mut queue = vec![root];
+    while let Some(pid) = queue.pop() {
+        if let Some(kids) = children.get(&pid) {
+            for kid in kids {
+                if *kid != root && !found.contains(kid) {
+                    found.push(*kid);
+                    queue.push(*kid);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Terminate everything under a pane's child, not only the shell: an
+/// interactive shell puts each job in its own process group, so killing the
+/// shell alone orphans an agent started from it. Descendants get SIGTERM now
+/// and SIGKILL after a grace period if still alive. Best-effort; pid reuse
+/// inside the grace window is the accepted hazard.
+/// Child → parent for every process, read from the kernel without forking:
+/// libproc on macOS, /proc on Linux. Forking here would be wrong twice over:
+/// a pane close would pay a `ps` per session, and a forked child briefly
+/// holds duplicates of every fd, which keeps an advisory `flock` alive past
+/// its owner's drop (the daemon lock probe races that window).
+#[cfg(target_os = "macos")]
+fn process_parent_snapshot() -> Option<HashMap<u32, u32>> {
+    // SAFETY: proc_listallpids sizes its answer to the buffer we pass, and
+    // proc_pidinfo writes at most `size_of::<proc_bsdinfo>()` bytes into a
+    // zeroed struct we own; every pointer is valid for the call's duration.
+    unsafe {
+        let needed = libc::proc_listallpids(std::ptr::null_mut(), 0);
+        if needed <= 0 {
+            return None;
+        }
+        let mut pids = vec![0 as libc::pid_t; needed as usize + 64];
+        let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        let count = libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes);
+        if count <= 0 {
+            return None;
+        }
+        pids.truncate(count as usize);
+        let mut parents = HashMap::with_capacity(pids.len());
+        for pid in pids {
+            if pid <= 0 {
+                continue;
+            }
+            let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+            let got = libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            );
+            if got == size {
+                parents.insert(pid as u32, info.pbi_ppid);
+            }
+        }
+        Some(parents)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_parent_snapshot() -> Option<HashMap<u32, u32>> {
+    let mut parents = HashMap::new();
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // `pid (comm) state ppid …` — comm may contain spaces or parens, so
+        // split after the LAST ')'.
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        fields.next(); // state
+        if let Some(ppid) = fields.next().and_then(|field| field.parse().ok()) {
+            parents.insert(pid, ppid);
+        }
+    }
+    Some(parents)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn process_parent_snapshot() -> Option<HashMap<u32, u32>> {
+    None
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(root: u32) {
+    let parent = match process_parent_snapshot() {
+        Some(parent) => parent,
+        None => {
+            // Last resort on other Unixes: a `ps` snapshot (forks once).
+            let Ok(output) = Command::new("ps")
+                .args(["-axo", "pid=,ppid="])
+                .stdin(Stdio::null())
+                .output()
+            else {
+                return;
+            };
+            parse_process_table(&String::from_utf8_lossy(&output.stdout)).parent
+        }
+    };
+    let table = ProcessTable {
+        parent,
+        args: HashMap::new(),
+    };
+    let targets = process_descendants(root, &table);
+    if targets.is_empty() {
+        return;
+    }
+    for pid in &targets {
+        // SAFETY: kill(2) with a pid we just read from the process table; a
+        // stale pid is an ESRCH we ignore.
+        unsafe {
+            libc::kill(*pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1500));
+        for pid in targets {
+            // SAFETY: as above; signal 0 only probes existence.
+            unsafe {
+                if libc::kill(pid as libc::pid_t, 0) == 0 {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    });
+}
+
+/// A kill-on-close Job Object holding the pane's child so closing the pane
+/// (or the daemon exiting) terminates the whole tree, ConPTY included.
+#[cfg(windows)]
+struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl KillOnCloseJob {
+    fn attach(pid: u32) -> Option<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+        // SAFETY: plain Win32 calls with valid arguments; every handle we
+        // open is closed on every path below.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() || job == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if set == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if process.is_null() {
+                CloseHandle(job);
+                return None;
+            }
+            let assigned = AssignProcessToJobObject(job, process);
+            CloseHandle(process);
+            if assigned == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(Self(job))
+        }
+    }
+}
+
+// SAFETY: a job object handle is a kernel object reference with no thread
+// affinity; it is only ever used to close the job, from whichever thread
+// drops the owning session.
+#[cfg(windows)]
+unsafe impl Send for KillOnCloseJob {}
+#[cfg(windows)]
+unsafe impl Sync for KillOnCloseJob {}
+
+#[cfg(windows)]
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        // SAFETY: the handle was created by CreateJobObjectW and is closed once.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 struct TerminalSession {
     _master: Box<dyn MasterPty + Send>,
+    /// The child's pid, for terminating its descendants on close (Unix).
+    pid: Option<u32>,
+    /// Kill-on-close job holding the child tree (Windows). Dropped last.
+    #[cfg(windows)]
+    _job: Option<KillOnCloseJob>,
     /// A killer split off the child via `clone_killer()`. The `child` itself is
     /// owned by the reader thread (which reaps it via `child.wait()`), so the
     /// session keeps only this handle to terminate the process on close/restart.
@@ -2662,6 +3015,10 @@ struct TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid {
+            terminate_process_tree(pid);
+        }
         let _ = self.killer.kill();
     }
 }
@@ -2714,6 +3071,10 @@ struct PaneLiveness {
     command: Option<String>,
     cwd: Option<String>,
     exit_code: Option<i32>,
+    /// The shell pane's child pid, so the official agent probe can map a
+    /// `claude agents --json` session to its pane through the process tree
+    /// (M3b). `None` for agent panes and restored-not-yet-spawned panes.
+    pid: Option<u32>,
 }
 
 /// Per-pane spawn/exit metadata surfaced to snapshot/find (and the reaper's
@@ -2958,6 +3319,9 @@ struct AgentPaneState {
     /// must not be re-classified back to a working/needs-input badge from
     /// its preserved final screen (M2).
     ended: bool,
+    /// (M3b) Until when an official `claude agents --json` reading outranks
+    /// the screen heuristic for this pane. `None` = never had one.
+    official_until: Option<Instant>,
 }
 
 impl AgentPaneState {
@@ -3040,6 +3404,10 @@ struct OutputRouter {
     /// except that the per-pane MODEL lock may already be held by the caller
     /// (lock order: model → agents, never reversed).
     agents: Arc<Mutex<AgentTracker>>,
+    /// The workspace ledger (docs/design/keyboard-lease-and-ledger.md), set
+    /// once by `DaemonServer::with_config`; `None` in unit tests that build a
+    /// bare router. Attention transitions and pane ends are noted here.
+    ledger: Arc<std::sync::OnceLock<Arc<Mutex<LedgerSink>>>>,
 }
 
 /// Cached append state for one pane's scrollback file (M11): the open handle
@@ -3062,6 +3430,21 @@ impl OutputRouter {
             models: Arc::new(Mutex::new(HashMap::new())),
             append_handles: Arc::new(Mutex::new(HashMap::new())),
             agents: Arc::new(Mutex::new(AgentTracker::default())),
+            ledger: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    fn set_ledger(&self, sink: Arc<Mutex<LedgerSink>>) {
+        let _ = self.ledger.set(sink);
+    }
+
+    /// Best-effort, non-durable ledger note from the output path. Called with
+    /// no other lock held (the ledger is a leaf lock).
+    fn ledger_note(&self, pane_id: &str, kind: &str, payload: Value) {
+        if let Some(sink) = self.ledger.get() {
+            if let Ok(mut sink) = sink.lock() {
+                let _ = sink.record(pane_id, kind, payload, false);
+            }
         }
     }
 
@@ -3456,6 +3839,13 @@ impl OutputRouter {
             return;
         };
         let entry = tracker.panes.entry(pane_id.to_string()).or_default();
+        // (M3b) A fresh official reading outranks the screen heuristic.
+        if entry
+            .official_until
+            .is_some_and(|until| until > Instant::now())
+        {
+            return;
+        }
         let new_agent = if entry.manual {
             entry.agent.clone()
         } else {
@@ -3488,13 +3878,128 @@ impl OutputRouter {
         if entry.agent == new_agent && entry.attention == new_attention {
             return;
         }
+        let previous_attention = entry.attention;
         entry.agent = new_agent.clone();
         entry.attention = new_attention;
         drop(tracker);
+        // Every transition is ledgered with its evidence so a wrong guess is
+        // auditable (docs/design/keyboard-lease-and-ledger.md §6 M3).
+        self.ledger_note(
+            pane_id,
+            "attention.changed",
+            json!({
+                "agent": new_agent,
+                "from": previous_attention,
+                "to": new_attention,
+                "evidence": "screen",
+            }),
+        );
         self.broadcast(&DaemonEvent::AgentState {
             pane_id: pane_id.to_string(),
             agent: new_agent,
             attention: new_attention,
+        });
+    }
+
+    /// (M3b) An official reading from `claude agents --json` for a pane whose
+    /// process tree contains that session. It outranks screen classification
+    /// until `ttl` elapses without a refresh, then the heuristic resumes.
+    /// Transitions are ledgered with evidence `claude-agents`.
+    /// Returns true when this is the pane's first official reading (the
+    /// caller logs the acquisition once).
+    fn apply_official_attention(
+        &self,
+        pane_id: &str,
+        agent: &str,
+        attention: AgentAttention,
+        ttl: Duration,
+    ) -> bool {
+        self.apply_official_attention_with(pane_id, agent, attention, ttl, "claude-agents")
+    }
+
+    fn apply_official_attention_with(
+        &self,
+        pane_id: &str,
+        agent: &str,
+        attention: AgentAttention,
+        ttl: Duration,
+        evidence: &'static str,
+    ) -> bool {
+        let Ok(mut tracker) = self.agents.lock() else {
+            return false;
+        };
+        let entry = tracker.panes.entry(pane_id.to_string()).or_default();
+        if entry.ended {
+            return false;
+        }
+        // First reading, or the first after a lapse: worth one log line.
+        let newly_official = entry
+            .official_until
+            .is_none_or(|until| until <= Instant::now());
+        entry.official_until = Some(Instant::now() + ttl);
+        let new_agent = Some(agent.to_string());
+        let new_attention = Some(attention);
+        if entry.agent == new_agent && entry.attention == new_attention {
+            return newly_official;
+        }
+        let previous_attention = entry.attention;
+        entry.agent = new_agent.clone();
+        entry.attention = new_attention;
+        drop(tracker);
+        self.ledger_note(
+            pane_id,
+            "attention.changed",
+            json!({
+                "agent": new_agent,
+                "from": previous_attention,
+                "to": new_attention,
+                "evidence": evidence,
+            }),
+        );
+        self.broadcast(&DaemonEvent::AgentState {
+            pane_id: pane_id.to_string(),
+            agent: new_agent,
+            attention: new_attention,
+        });
+        newly_official
+    }
+
+    /// (M3b) The official session a pane was mapped to is gone from the
+    /// listing (two probes in a row): drop the official reading and, unless
+    /// the pane is manually marked, clear its agent badge — the screen
+    /// heuristic would otherwise keep a stale "claude · idle" over the
+    /// shell prompt that replaced the agent.
+    fn clear_official_attention(&self, pane_id: &str) {
+        let Ok(mut tracker) = self.agents.lock() else {
+            return;
+        };
+        let Some(entry) = tracker.panes.get_mut(pane_id) else {
+            return;
+        };
+        if entry.official_until.is_none() {
+            return;
+        }
+        entry.official_until = None;
+        if entry.manual || (entry.agent.is_none() && entry.attention.is_none()) {
+            return;
+        }
+        let previous_agent = entry.agent.take();
+        let previous_attention = entry.attention.take();
+        drop(tracker);
+        self.ledger_note(
+            pane_id,
+            "attention.changed",
+            json!({
+                "agent": previous_agent,
+                "from": previous_attention,
+                "to": Value::Null,
+                "evidence": "claude-agents: session gone",
+            }),
+        );
+        self.broadcast(&DaemonEvent::AgentState {
+            pane_id: pane_id.to_string(),
+            agent: None,
+            attention: None,
         });
     }
 
@@ -3558,17 +4063,25 @@ impl OutputRouter {
     /// signature is still on screen, and a manual mark outlives its process.
     /// Broadcasts the final AgentState transition if the pane had attention.
     fn clear_agent_attention(&self, pane_id: &str) {
-        let agent = self
-            .agents
-            .lock()
-            .ok()
-            .and_then(|mut tracker| {
-                let entry = tracker.panes.get_mut(pane_id)?;
-                entry.ended = true;
-                entry.attention.take().map(|_| entry.agent.clone())
-            })
-            .flatten();
-        if let Some(agent) = agent {
+        let cleared = self.agents.lock().ok().and_then(|mut tracker| {
+            let entry = tracker.panes.get_mut(pane_id)?;
+            entry.ended = true;
+            entry
+                .attention
+                .take()
+                .map(|previous| (entry.agent.clone(), previous))
+        });
+        if let Some((Some(agent), previous)) = cleared {
+            self.ledger_note(
+                pane_id,
+                "attention.changed",
+                json!({
+                    "agent": agent,
+                    "from": previous,
+                    "to": Value::Null,
+                    "evidence": "process ended",
+                }),
+            );
             self.broadcast(&DaemonEvent::AgentState {
                 pane_id: pane_id.to_string(),
                 agent: Some(agent),
@@ -3704,6 +4217,7 @@ impl OutputRouter {
             event = "pane_end",
             "pane ended"
         );
+        self.ledger_note(pane_id, "pane.ended", json!({ "exit_code": exit_code }));
         let event = DaemonEvent::PaneEnded {
             pane_id: pane_id.to_string(),
             exit_code,
@@ -3939,11 +4453,42 @@ struct PreparedSpawn {
 /// run WITHOUT the TerminalStore lock (M7: a slow spawn used to stall input,
 /// resize, and liveness for every pane). On a partial failure after
 /// `spawn_command` succeeded, the child is killed + reaped (review-low).
+/// Whether an `openpty` failure is worth a brief retry: the kernel's pty pool
+/// momentarily exhausted (macOS ENXIO "Device not configured", EAGAIN on
+/// either platform) rather than a configuration error.
+fn is_transient_pty_error(message: &str) -> bool {
+    message.contains("Device not configured")
+        || message.contains("Resource temporarily unavailable")
+        || message.contains("os error 6)")
+        || message.contains("os error 11)")
+        || message.contains("os error 35)")
+}
+
+/// `openpty` with a short bounded retry on transient pool exhaustion (seen
+/// under parallel test load on CI runners); anything else fails immediately.
+fn open_pty_with_retry(
+    pty_system: &dyn portable_pty::PtySystem,
+    size: PtySize,
+) -> Result<portable_pty::PtyPair, String> {
+    let mut attempt: u32 = 0;
+    loop {
+        match pty_system.openpty(size) {
+            Ok(pair) => return Ok(pair),
+            Err(error) => {
+                let message = error.to_string();
+                attempt += 1;
+                if !is_transient_pty_error(&message) || attempt >= 8 {
+                    return Err(format!("failed to open pty: {message}"));
+                }
+                thread::sleep(Duration::from_millis(25 * u64::from(attempt)));
+            }
+        }
+    }
+}
+
 fn execute_spawn(plan: &SpawnPlan) -> Result<PreparedSpawn, String> {
     let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(plan.size)
-        .map_err(|error| format!("failed to open pty: {error}"))?;
+    let pair = open_pty_with_retry(pty_system.as_ref(), plan.size)?;
 
     let mut command = CommandBuilder::new(&plan.shell);
     for arg in &plan.args {
@@ -3956,6 +4501,9 @@ fn execute_spawn(plan: &SpawnPlan) -> Result<PreparedSpawn, String> {
     // TERM/COLORTERM defaults below) are applied AFTER scrubbing, so an
     // operator-set value takes precedence over the scrub list for the same
     // variable name. VAL-SEC-003/004/007.
+    for key in INHERITED_SESSION_MARKERS {
+        command.env_remove(key);
+    }
     for key in &plan.scrub_env {
         command.env_remove(key);
     }
@@ -4085,6 +4633,7 @@ impl TerminalStore {
                     command: None,
                     cwd: None,
                     exit_code: None,
+                    pid: None,
                 });
             }
         }
@@ -4175,6 +4724,7 @@ impl TerminalStore {
 
         self.next_generation += 1;
         let generation = self.next_generation;
+        let child_pid = child.process_id();
         if let Ok(mut liveness) = self.liveness.lock() {
             liveness.insert(
                 pane_id.to_string(),
@@ -4184,6 +4734,7 @@ impl TerminalStore {
                     command: Some(command_str),
                     cwd: Some(cwd_str),
                     exit_code: None,
+                    pid: child_pid,
                 },
             );
         }
@@ -4296,6 +4847,9 @@ impl TerminalStore {
             pane_id.to_string(),
             TerminalSession {
                 _master: master,
+                pid: child_pid,
+                #[cfg(windows)]
+                _job: child_pid.and_then(KillOnCloseJob::attach),
                 killer,
                 input: spawn_input_writer(writer),
             },
@@ -4332,6 +4886,10 @@ impl TerminalStore {
     /// and leak SIGHUP-ignoring children past daemon exit (L17).
     fn kill_all_sessions(&mut self) {
         for session in self.sessions.values_mut() {
+            #[cfg(unix)]
+            if let Some(pid) = session.pid {
+                terminate_process_tree(pid);
+            }
             let _ = session.killer.kill();
         }
         // (T2) Same for agent CLIs; each AgentSession's Drop also fires, but a
@@ -4413,6 +4971,44 @@ impl TerminalStore {
         queue_pane_input(&session.input, pane_id, data)
     }
 
+    /// (M4) Live panes and their spawn cwd (the default Kranz repo).
+    fn live_pane_cwds(&self) -> HashMap<String, String> {
+        self.liveness
+            .lock()
+            .map(|liveness| {
+                liveness
+                    .iter()
+                    .filter(|(_, entry)| !entry.ended)
+                    .filter_map(|(pane_id, entry)| {
+                        entry.cwd.clone().map(|cwd| (pane_id.clone(), cwd))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn pane_cwd(&self, pane_id: &str) -> Option<String> {
+        self.liveness
+            .lock()
+            .ok()
+            .and_then(|liveness| liveness.get(pane_id).and_then(|entry| entry.cwd.clone()))
+    }
+
+    /// (M3b) Live shell panes with a recorded child pid, for the official
+    /// agent probe's process-tree mapping.
+    fn live_pane_pids(&self) -> Vec<(String, u32)> {
+        self.liveness
+            .lock()
+            .map(|liveness| {
+                liveness
+                    .iter()
+                    .filter(|(_, entry)| !entry.ended)
+                    .filter_map(|(pane_id, entry)| entry.pid.map(|pid| (pane_id.clone(), pid)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn live_pane_ids(&self) -> Vec<String> {
         self.liveness
             .lock()
@@ -4426,10 +5022,15 @@ impl TerminalStore {
             .unwrap_or_default()
     }
 
-    /// Write `data` to every live pane (best-effort); returns the panes written to.
-    fn write_to_all_live(&self, data: &str) -> Vec<String> {
+    /// Write `data` to every live pane except those in `skip` (best-effort);
+    /// returns the panes written to. `skip` carries panes whose keyboard is
+    /// held by someone other than the writer.
+    fn write_to_live_except(&self, data: &str, skip: &HashSet<String>) -> Vec<String> {
         let mut written = Vec::new();
         for pane_id in self.live_pane_ids() {
+            if skip.contains(&pane_id) {
+                continue;
+            }
             if self.write_to_pane(&pane_id, data).is_ok() {
                 written.push(pane_id);
             }
@@ -4965,6 +5566,9 @@ fn execute_agent_spawn(plan: &AgentSpawnPlan) -> Result<PreparedAgentSpawn, Stri
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         command.creation_flags(CREATE_NO_WINDOW);
+    }
+    for key in INHERITED_SESSION_MARKERS {
+        command.env_remove(key);
     }
     for key in &plan.scrub_env {
         command.env_remove(key);
@@ -6060,6 +6664,9 @@ impl TerminalStore {
                     command: Some(command_str),
                     cwd: Some(cwd_str),
                     exit_code: None,
+                    // Agent panes report attention from their own event
+                    // stream; the process-tree probe is for shell panes.
+                    pid: None,
                 },
             );
         }
@@ -6544,6 +7151,685 @@ impl SubscriptionBackoff {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Keyboard lease and session ledger (docs/design/keyboard-lease-and-ledger.md)
+//
+// Pure state, predicates, and the hash-chained ledger writer/verifier. The
+// DaemonServer handlers call these; clients never re-derive the rules.
+// ---------------------------------------------------------------------------
+
+/// Per-pane hash-chained ledgers live here beside `agents/` and `scrollback/`.
+/// Unlike those two, a ledger survives pane close: it is the audit record.
+const LEDGER_DIR: &str = "ledger";
+/// Inside the hash input so a record cannot be re-hashed under another
+/// version (the same reasoning as Kranz's `kranz.event-log.v2\n`).
+const LEDGER_HASH_PREFIX: &str = "sgian.ledger.v1\n";
+const HOLDER_MAX_LEN: usize = 64;
+const LEASE_NOTE_MAX_BYTES: usize = 4096;
+const LEASE_WHY_MAX_BYTES: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeasePolicy {
+    /// An unheld pane accepts input from anyone; a held pane only from its holder.
+    Open,
+    /// Every write needs the lease.
+    Required,
+}
+
+impl LeasePolicy {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "required" => Some(Self::Required),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Required => "required",
+        }
+    }
+}
+
+/// The held half of a pane's lease. Persisted verbatim in workspace.json.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HeldLease {
+    holder: String,
+    since_ms: u64,
+    #[serde(default)]
+    writes: u64,
+    #[serde(default)]
+    bytes_typed: u64,
+    #[serde(default)]
+    refused_writes: u64,
+    #[serde(default)]
+    last_input_ms: Option<u64>,
+}
+
+impl HeldLease {
+    fn new(holder: &str, since_ms: u64) -> Self {
+        Self {
+            holder: holder.to_string(),
+            since_ms,
+            writes: 0,
+            bytes_typed: 0,
+            refused_writes: 0,
+            last_input_ms: None,
+        }
+    }
+}
+
+/// Wire shape of a pane's lease (snapshot `leases`, lease responses).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeaseInfo {
+    pub pane_id: String,
+    pub policy: String,
+    pub holder: Option<String>,
+    pub since_ms: Option<u64>,
+    pub held_ms: Option<u64>,
+    #[serde(default)]
+    pub writes: u64,
+    #[serde(default)]
+    pub bytes_typed: u64,
+    #[serde(default)]
+    pub refused_writes: u64,
+    #[serde(default)]
+    pub last_input_ms: Option<u64>,
+}
+
+impl LeaseInfo {
+    fn from_lease(
+        pane_id: &str,
+        policy: LeasePolicy,
+        lease: Option<&HeldLease>,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            pane_id: pane_id.to_string(),
+            policy: policy.as_str().to_string(),
+            holder: lease.map(|held| held.holder.clone()),
+            since_ms: lease.map(|held| held.since_ms),
+            held_ms: lease.map(|held| now_ms.saturating_sub(held.since_ms)),
+            writes: lease.map(|held| held.writes).unwrap_or(0),
+            bytes_typed: lease.map(|held| held.bytes_typed).unwrap_or(0),
+            refused_writes: lease.map(|held| held.refused_writes).unwrap_or(0),
+            last_input_ms: lease.and_then(|held| held.last_input_ms),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LeaseTransition {
+    Taken,
+    Released,
+    Revoked,
+}
+
+/// Holder labels are operator text that ends up in ledgers, status lines and
+/// error messages: short, printable ASCII, no whitespace.
+fn validate_holder(raw: &str) -> Result<String, String> {
+    let holder = raw.trim();
+    if holder.is_empty() {
+        return Err("holder must not be blank".to_string());
+    }
+    if holder.len() > HOLDER_MAX_LEN {
+        return Err(format!("holder is longer than {HOLDER_MAX_LEN} bytes"));
+    }
+    if !holder.chars().all(|c| c.is_ascii_graphic()) {
+        return Err("holder must be printable ASCII with no whitespace".to_string());
+    }
+    Ok(holder.to_string())
+}
+
+/// Notes and reasons: trimmed, bounded, free text (newlines and tabs allowed,
+/// other control characters are not).
+fn validate_bounded_text(raw: &str, what: &str, max: usize) -> Result<String, String> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err(format!("{what} must not be empty"));
+    }
+    if text.len() > max {
+        return Err(format!("{what} is longer than {max} bytes"));
+    }
+    if text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err(format!("{what} must not contain control characters"));
+    }
+    Ok(text.to_string())
+}
+
+/// What a permitted `take` does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TakeOutcome {
+    Fresh,
+    AlreadyHeld,
+    Revoking { previous: String },
+}
+
+fn can_take(
+    lease: Option<&HeldLease>,
+    holder: &str,
+    force: bool,
+    why: Option<&str>,
+) -> Result<TakeOutcome, String> {
+    match lease {
+        None => Ok(TakeOutcome::Fresh),
+        Some(held) if held.holder == holder => Ok(TakeOutcome::AlreadyHeld),
+        Some(held) => {
+            if !force {
+                return Err(format!(
+                    "pane keyboard is held by {}; use --force --why REASON to revoke it",
+                    held.holder
+                ));
+            }
+            if why.map(str::trim).unwrap_or("").is_empty() {
+                return Err("--force requires --why REASON".to_string());
+            }
+            Ok(TakeOutcome::Revoking {
+                previous: held.holder.clone(),
+            })
+        }
+    }
+}
+
+fn can_release(lease: Option<&HeldLease>, holder: &str) -> Result<(), String> {
+    match lease {
+        None => Err("pane keyboard is not held".to_string()),
+        Some(held) if held.holder == holder => Ok(()),
+        Some(held) => Err(format!(
+            "pane keyboard is held by {}, not {holder}",
+            held.holder
+        )),
+    }
+}
+
+fn can_write(
+    policy: LeasePolicy,
+    lease: Option<&HeldLease>,
+    holder: Option<&str>,
+) -> Result<(), String> {
+    match (policy, lease) {
+        (_, Some(held)) => {
+            if holder == Some(held.holder.as_str()) {
+                Ok(())
+            } else {
+                Err(format!("pane keyboard is held by {}", held.holder))
+            }
+        }
+        (LeasePolicy::Open, None) => Ok(()),
+        (LeasePolicy::Required, None) => {
+            Err("pane keyboard is unheld and lease_policy is required; take it first".to_string())
+        }
+    }
+}
+
+/// One ledger line. `h` chains over everything else in the record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LedgerRecord {
+    seq: u64,
+    ts_ms: u64,
+    pane_id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    payload: Value,
+    prev: String,
+    h: String,
+}
+
+fn ledger_path(dir: &Path, pane_id: &str) -> PathBuf {
+    dir.join(format!("{pane_id}.jsonl"))
+}
+
+/// Sorted-key, whitespace-free JSON: the same bytes regardless of the
+/// serializer's map ordering feature or the caller's field order.
+fn canonical_json(value: &Value) -> String {
+    let mut sorted = value.clone();
+    sorted.sort_all_objects();
+    sorted.to_string()
+}
+
+fn ledger_hash(prev: &str, body: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(LEDGER_HASH_PREFIX.as_bytes());
+    hasher.update(prev.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(body.as_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+/// The hashed body: the record without `h`, canonicalized.
+fn ledger_body(record: &LedgerRecord) -> String {
+    let mut value = serde_json::to_value(record).unwrap_or(Value::Null);
+    if let Value::Object(ref mut map) = value {
+        map.remove("h");
+    }
+    canonical_json(&value)
+}
+
+/// The chain head `(seq, h)` from a ledger's last non-blank line;
+/// `(0, "")` for a missing or empty ledger.
+fn ledger_head(path: &Path) -> Result<(u64, String), String> {
+    let data = match fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((0, String::new()))
+        }
+        Err(error) => return Err(format!("failed to read ledger {}: {error}", path.display())),
+    };
+    match data.lines().rev().find(|line| !line.trim().is_empty()) {
+        None => Ok((0, String::new())),
+        Some(line) => {
+            let record: LedgerRecord = serde_json::from_str(line).map_err(|error| {
+                format!("ledger {} tail is unreadable: {error}", path.display())
+            })?;
+            Ok((record.seq, record.h))
+        }
+    }
+}
+
+/// One workspace's ledger writer: the directory plus cached chain heads,
+/// shared by the daemon handlers (lease events, durable) and the output
+/// router (attention transitions and pane ends, best-effort). A LEAF lock:
+/// `record` does file I/O under it and no caller holds another lock then.
+struct LedgerSink {
+    dir: PathBuf,
+    heads: HashMap<String, (u64, String)>,
+}
+
+impl LedgerSink {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            heads: HashMap::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        pane_id: &str,
+        kind: &str,
+        payload: Value,
+        durable: bool,
+    ) -> Result<LedgerRecord, String> {
+        ledger_append(&self.dir, &mut self.heads, pane_id, kind, payload, durable)
+    }
+}
+
+/// Append one record, chaining from the cached head (seeded from disk on
+/// first use). One `write_all` of line+'\n'; `durable` adds an fsync (lease
+/// events are rare and are the product; attention flaps are frequent and
+/// are not).
+fn ledger_append(
+    dir: &Path,
+    heads: &mut HashMap<String, (u64, String)>,
+    pane_id: &str,
+    kind: &str,
+    payload: Value,
+    durable: bool,
+) -> Result<LedgerRecord, String> {
+    let path = ledger_path(dir, pane_id);
+    let (seq, prev) = match heads.get(pane_id) {
+        Some(head) => head.clone(),
+        None => ledger_head(&path)?,
+    };
+    let mut record = LedgerRecord {
+        seq: seq.saturating_add(1),
+        ts_ms: now_millis(),
+        pane_id: pane_id.to_string(),
+        kind: kind.to_string(),
+        payload,
+        prev,
+        h: String::new(),
+    };
+    record.h = ledger_hash(&record.prev, &ledger_body(&record));
+    let line = serde_json::to_string(&record)
+        .map_err(|error| format!("failed to encode ledger record: {error}"))?;
+    let mut bytes = Vec::with_capacity(line.len() + 1);
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .private_mode()
+        .open(&path)
+        .map_err(|error| format!("failed to open ledger {}: {error}", path.display()))?;
+    file.write_all(&bytes)
+        .and_then(|_| if durable { file.sync_all() } else { Ok(()) })
+        .map_err(|error| format!("failed to append ledger {}: {error}", path.display()))?;
+    heads.insert(pane_id.to_string(), (record.seq, record.h.clone()));
+    Ok(record)
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct LedgerSummary {
+    records: u64,
+    head: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct LedgerBreak {
+    line: usize,
+    seq: Option<u64>,
+    reason: String,
+}
+
+/// Walk a ledger and report the first break: an unparseable line, a sequence
+/// gap, a `prev` that does not match, or a record whose bytes no longer hash
+/// to `h`. Truncation from the tail is NOT detectable here; pin `head` from a
+/// prior run to catch it.
+fn ledger_verify(path: &Path) -> Result<LedgerSummary, LedgerBreak> {
+    let data = fs::read_to_string(path).map_err(|error| LedgerBreak {
+        line: 0,
+        seq: None,
+        reason: format!("cannot read ledger: {error}"),
+    })?;
+    let mut prev = String::new();
+    let mut expected_seq: u64 = 1;
+    let mut records: u64 = 0;
+    for (index, line) in data.lines().enumerate() {
+        let line_no = index + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: LedgerRecord = serde_json::from_str(line).map_err(|error| LedgerBreak {
+            line: line_no,
+            seq: None,
+            reason: format!("unparseable record: {error}"),
+        })?;
+        if record.seq != expected_seq {
+            return Err(LedgerBreak {
+                line: line_no,
+                seq: Some(record.seq),
+                reason: format!("sequence {} where {expected_seq} was expected", record.seq),
+            });
+        }
+        if record.prev != prev {
+            return Err(LedgerBreak {
+                line: line_no,
+                seq: Some(record.seq),
+                reason: "prev hash does not match the previous record".to_string(),
+            });
+        }
+        let expected_hash = ledger_hash(&record.prev, &ledger_body(&record));
+        if !constant_time_eq(&expected_hash, &record.h) {
+            return Err(LedgerBreak {
+                line: line_no,
+                seq: Some(record.seq),
+                reason: "record hash mismatch (content altered)".to_string(),
+            });
+        }
+        prev = record.h;
+        expected_seq = expected_seq.saturating_add(1);
+        records += 1;
+    }
+    Ok(LedgerSummary {
+        records,
+        head: prev,
+    })
+}
+
+/// The last `limit` records (0 = all) as raw JSON values; unparseable lines
+/// are skipped so a torn tail still lists what came before it.
+fn read_ledger_tail(path: &Path, limit: usize) -> Vec<Value> {
+    let data = fs::read_to_string(path).unwrap_or_default();
+    let parsed: Vec<Value> = data
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    if limit == 0 || parsed.len() <= limit {
+        parsed
+    } else {
+        parsed[parsed.len() - limit..].to_vec()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Official agent probe (M3b): `claude agents --json` mapped to panes through
+// the process tree. Pure parts here; the loop lives on DaemonServer.
+// ---------------------------------------------------------------------------
+
+/// One entry of `claude agents --json`. Only the fields the probe reads;
+/// unknown fields are ignored so newer CLIs keep parsing.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+struct AgentProbeEntry {
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default, rename = "waitingFor")]
+    waiting_for: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// Map Claude Code's vocabulary (`status`: busy/waiting/idle; `waitingFor`
+/// when it needs a person; `state`: working/blocked/done/failed/stopped) onto
+/// the pane attention states. `None` = nothing to say.
+fn attention_from_probe(entry: &AgentProbeEntry) -> Option<AgentAttention> {
+    if entry
+        .waiting_for
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Some(AgentAttention::NeedsInput);
+    }
+    match entry.status.as_deref().map(str::trim) {
+        Some("waiting") | Some("blocked") => Some(AgentAttention::NeedsInput),
+        Some("busy") | Some("working") | Some("running") => Some(AgentAttention::Working),
+        Some("idle") => Some(AgentAttention::Idle),
+        _ => match entry.state.as_deref().map(str::trim) {
+            Some("blocked") => Some(AgentAttention::NeedsInput),
+            Some("working") => Some(AgentAttention::Working),
+            Some("done") | Some("failed") | Some("stopped") => Some(AgentAttention::Idle),
+            _ => None,
+        },
+    }
+}
+
+/// One `ps -axo pid=,ppid=,args=` snapshot: child → parent, and each pid's
+/// command line (empty when `ps` was asked for pids only).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ProcessTable {
+    parent: HashMap<u32, u32>,
+    args: HashMap<u32, String>,
+}
+
+fn parse_process_table(text: &str) -> ProcessTable {
+    let mut table = ProcessTable::default();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(ppid)) = (
+            fields.next().and_then(|field| field.parse::<u32>().ok()),
+            fields.next().and_then(|field| field.parse::<u32>().ok()),
+        ) else {
+            continue;
+        };
+        table.parent.insert(pid, ppid);
+        let args = fields.collect::<Vec<_>>().join(" ");
+        if !args.is_empty() {
+            table.args.insert(pid, args);
+        }
+    }
+    table
+}
+
+/// Whether a command line is a Kranz worker loop (`kranz run` / `exec` /
+/// `work`), by its argv[0] basename and first subcommand.
+fn is_kranz_worker_command(args: &str) -> bool {
+    let mut fields = args.split_whitespace();
+    let Some(program) = fields.next() else {
+        return false;
+    };
+    let basename = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    if basename != "kranz" && basename != "kranz.exe" {
+        return false;
+    }
+    // Global flags precede the subcommand; `--repo`/`--mission` take a value.
+    let mut skip_value = false;
+    for field in fields {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if let Some(flag) = field.strip_prefix("--") {
+            skip_value = matches!(flag, "repo" | "mission");
+            continue;
+        }
+        return matches!(field, "run" | "exec" | "work");
+    }
+    false
+}
+
+/// (M4) Panes whose process tree contains a Kranz worker loop: pane → the
+/// worker's pid. A pane with several workers reports the first found.
+fn find_kranz_panes(table: &ProcessTable, pane_pids: &[(String, u32)]) -> HashMap<String, u32> {
+    let pane_by_pid: HashMap<u32, &str> = pane_pids
+        .iter()
+        .map(|(pane_id, pid)| (*pid, pane_id.as_str()))
+        .collect();
+    let mut found: HashMap<String, u32> = HashMap::new();
+    for (pid, args) in &table.args {
+        if !is_kranz_worker_command(args) {
+            continue;
+        }
+        let mut cursor = *pid;
+        for _ in 0..64 {
+            if let Some(pane_id) = pane_by_pid.get(&cursor) {
+                found.entry((*pane_id).to_string()).or_insert(*pid);
+                break;
+            }
+            match table.parent.get(&cursor) {
+                Some(parent) if *parent != cursor && *parent > 1 => cursor = *parent,
+                _ => break,
+            }
+        }
+    }
+    found
+}
+
+/// (M4) Map a Kranz `MissionState` (camelCase JSON, as `kranz status --json`
+/// prints it) onto pane attention: anything pending on a person is
+/// needs-input, an active loop is working, a terminal state is idle.
+fn kranz_attention_from_state(state: &Value) -> Option<AgentAttention> {
+    let non_empty = |key: &str| {
+        state.get(key).is_some_and(|value| match value {
+            Value::Array(items) => !items.is_empty(),
+            Value::Null => false,
+            Value::Object(_) => true,
+            _ => true,
+        })
+    };
+    if non_empty("pendingQuestions")
+        || non_empty("pendingGrantRequest")
+        || non_empty("pendingRevision")
+    {
+        return Some(AgentAttention::NeedsInput);
+    }
+    match state.get("status").and_then(Value::as_str) {
+        Some("planning") | Some("approved") | Some("running") | Some("validating") => {
+            Some(AgentAttention::Working)
+        }
+        Some("paused") | Some("blocked") => Some(AgentAttention::NeedsInput),
+        Some("complete") | Some("failed") | Some("abandoned") => Some(AgentAttention::Idle),
+        _ => None,
+    }
+}
+
+/// (M4) A pane bound to a Kranz mission: hand-back notes are mirrored into
+/// its inbox and its attention comes from `kranz status`. Auto bindings come
+/// from the process tree (a `kranz run` under the pane's shell); manual ones
+/// from `ctl kranz bind` and survive the worker exiting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KranzBinding {
+    pub repo: String,
+    pub manual: bool,
+}
+
+/// Attribute each probe entry to the pane whose child process is its ancestor
+/// (or itself). When several sessions land in one pane the loudest wins:
+/// needs-input over working over idle.
+fn map_probe_entries(
+    entries: &[AgentProbeEntry],
+    parent_of: &HashMap<u32, u32>,
+    pane_pids: &[(String, u32)],
+) -> HashMap<String, AgentAttention> {
+    fn rank(attention: AgentAttention) -> u8 {
+        match attention {
+            AgentAttention::NeedsInput => 2,
+            AgentAttention::Working => 1,
+            AgentAttention::Idle => 0,
+        }
+    }
+    let pane_by_pid: HashMap<u32, &str> = pane_pids
+        .iter()
+        .map(|(pane_id, pid)| (*pid, pane_id.as_str()))
+        .collect();
+    let mut mapped: HashMap<String, AgentAttention> = HashMap::new();
+    for entry in entries {
+        let (Some(mut pid), Some(attention)) = (entry.pid, attention_from_probe(entry)) else {
+            continue;
+        };
+        let mut pane = None;
+        for _ in 0..64 {
+            if let Some(found) = pane_by_pid.get(&pid) {
+                pane = Some((*found).to_string());
+                break;
+            }
+            match parent_of.get(&pid) {
+                Some(parent) if *parent != pid && *parent > 1 => pid = *parent,
+                _ => break,
+            }
+        }
+        let Some(pane) = pane else {
+            continue;
+        };
+        let keep = mapped
+            .get(&pane)
+            .is_none_or(|current| rank(attention) > rank(*current));
+        if keep {
+            mapped.insert(pane, attention);
+        }
+    }
+    mapped
+}
+
+/// Bookkeeping between probe rounds: `previous` holds panes with an official
+/// reading and how many rounds in a row they have been missing from the
+/// listing. Returns the panes whose reading should now be cleared (missing
+/// twice, or no longer live).
+fn reconcile_probe_rounds(
+    previous: &mut HashMap<String, u8>,
+    mapped: &HashMap<String, AgentAttention>,
+    live_panes: &[String],
+) -> Vec<String> {
+    let mut clear = Vec::new();
+    for pane_id in mapped.keys() {
+        previous.insert(pane_id.clone(), 0);
+    }
+    previous.retain(|pane_id, misses| {
+        if mapped.contains_key(pane_id) {
+            return true;
+        }
+        if !live_panes.iter().any(|live| live == pane_id) {
+            clear.push(pane_id.clone());
+            return false;
+        }
+        *misses = misses.saturating_add(1);
+        if *misses >= 2 {
+            clear.push(pane_id.clone());
+            return false;
+        }
+        true
+    });
+    clear
+}
+
 struct DaemonServer {
     registry: Mutex<PaneRegistry>,
     terminals: Mutex<TerminalStore>,
@@ -6553,6 +7839,13 @@ struct DaemonServer {
     /// (T2) Per-pane agent conversation logs (`agents/<pane-id>.jsonl`), read
     /// for the bootstrap replay.
     agents_dir: PathBuf,
+    /// Per-pane hash-chained ledgers (`ledger/<pane-id>.jsonl`), shared with
+    /// the router; kept across pane close. docs/design/keyboard-lease-and-ledger.md.
+    ledger: Arc<Mutex<LedgerSink>>,
+    /// Held keyboard leases. A LEAF lock: taken alone, never while holding
+    /// registry/terminals, and dropped before either is acquired (persist()
+    /// takes it last, after registry → terminals).
+    leases: Mutex<HashMap<String, HeldLease>>,
     workspace_key: String,
     log_dispatch: tracing::dispatcher::Dispatch,
     /// Keeps the non-blocking log writer alive (flushes on drop). Must be held for
@@ -6588,6 +7881,14 @@ struct DaemonServer {
     /// daemon fell back to a fresh workspace; this flag surfaces a warning in
     /// `run_daemon_with_config` after the tracing dispatcher is active.
     workspace_was_corrupt: bool,
+    /// (M3b) The official agent probe warns once about a failing `claude`
+    /// invocation and then only logs at debug level.
+    probe_warned: AtomicBool,
+    /// (M3b) Panes with an official reading → consecutive rounds missing from
+    /// the listing (see `reconcile_probe_rounds`). Leaf lock.
+    probe_mapped: Mutex<HashMap<String, u8>>,
+    /// (M4) Panes bound to a Kranz mission. Leaf lock.
+    kranz_bindings: Mutex<HashMap<String, KranzBinding>>,
 }
 
 /// Removes a pane's in-flight spawn marker and wakes any ensure/restart
@@ -6623,6 +7924,10 @@ impl DaemonServer {
         let agents_dir = data_dir.join(AGENT_LOG_DIR);
         ensure_private_dir(&agents_dir)?;
         prune_agent_log_temps(&agents_dir);
+        // Ledgers are never pruned: a closed pane's ledger is its record.
+        let ledger_dir = data_dir.join(LEDGER_DIR);
+        ensure_private_dir(&ledger_dir)?;
+        let ledger = Arc::new(Mutex::new(LedgerSink::new(ledger_dir)));
         let token = load_or_create_token(&data_dir)?;
 
         let persist_path = data_dir.join(WORKSPACE_FILE);
@@ -6654,6 +7959,7 @@ impl DaemonServer {
             agents_v2,
             agent_specs,
             pane_shells,
+            leases,
             was_corrupt,
         ) = (
             loaded.registry,
@@ -6665,6 +7971,7 @@ impl DaemonServer {
             loaded.agents_v2,
             loaded.agent_specs,
             loaded.pane_shells,
+            loaded.leases,
             loaded.was_corrupt,
         );
 
@@ -6696,6 +8003,7 @@ impl DaemonServer {
 
         let router = OutputRouter::new(scrollback_dir.clone());
         router.set_log_context(log_dispatch.clone(), ws_key.clone());
+        router.set_ledger(Arc::clone(&ledger));
         // (T1) Restore persisted manual agent marks before any pane spawns, so
         // the first classification of a marked pane keeps its agent. Filtered
         // against the registry (L6b — mirroring the agents_v2 seed filter
@@ -6775,6 +8083,15 @@ impl DaemonServer {
             persist_path,
             scrollback_dir,
             agents_dir,
+            ledger,
+            // A hand-edited lease for a pane that no longer exists must not be
+            // resurrected (same filter as the agent marks above).
+            leases: Mutex::new(
+                leases
+                    .into_iter()
+                    .filter(|(pane_id, _)| live_pane_ids.contains(pane_id))
+                    .collect(),
+            ),
             workspace_key: ws_key,
             log_dispatch,
             _log_guard: log_guard,
@@ -6789,7 +8106,308 @@ impl DaemonServer {
             persist_lock: Mutex::new(()),
             spawn_cvar: Condvar::new(),
             workspace_was_corrupt: was_corrupt,
+            probe_warned: AtomicBool::new(false),
+            probe_mapped: Mutex::new(HashMap::new()),
+            kranz_bindings: Mutex::new(HashMap::new()),
         })
+    }
+
+    // ----- Kranz bindings (M4, docs/design/keyboard-lease-and-ledger.md) -----
+
+    fn lock_kranz(&self) -> Result<MutexGuard<'_, HashMap<String, KranzBinding>>, String> {
+        self.kranz_bindings
+            .lock()
+            .map_err(|_| "kranz binding lock poisoned".to_string())
+    }
+
+    fn handle_kranz_bind(&self, pane_id: &str, repo: Option<String>) -> Result<Value, String> {
+        self.ensure_pane_exists(pane_id)?;
+        let repo = match repo {
+            Some(repo) => validate_bounded_text(&repo, "repo", 4096)?,
+            None => self
+                .lock_terminals()?
+                .pane_cwd(pane_id)
+                .ok_or_else(|| format!("pane {pane_id} has no recorded cwd; pass --repo PATH"))?,
+        };
+        let binding = KranzBinding { repo, manual: true };
+        self.lock_kranz()?
+            .insert(pane_id.to_string(), binding.clone());
+        let _ = self.ledger_record(
+            pane_id,
+            "kranz.bound",
+            json!({ "repo": binding.repo, "manual": true }),
+        );
+        Ok(json!({ "pane_id": pane_id, "binding": binding }))
+    }
+
+    fn handle_kranz_unbind(&self, pane_id: &str) -> Result<Value, String> {
+        self.ensure_pane_exists(pane_id)?;
+        let removed = self.lock_kranz()?.remove(pane_id);
+        if let Some(binding) = &removed {
+            let _ = self.ledger_record(
+                pane_id,
+                "kranz.unbound",
+                json!({ "repo": binding.repo, "manual": binding.manual }),
+            );
+        }
+        Ok(json!({ "pane_id": pane_id, "binding": removed }))
+    }
+
+    fn kranz_bindings_snapshot(&self) -> HashMap<String, KranzBinding> {
+        self.lock_kranz()
+            .map(|bindings| bindings.clone())
+            .unwrap_or_default()
+    }
+
+    /// (M4) Reconcile auto bindings with this round's process table: bind
+    /// panes that gained a `kranz run` descendant (repo = the pane's cwd) and
+    /// drop auto bindings whose worker is gone or whose pane is not live.
+    /// Manual bindings are left alone. Returns every current binding.
+    fn reconcile_kranz_bindings(
+        &self,
+        workers: &HashMap<String, u32>,
+        live_cwds: &HashMap<String, String>,
+    ) -> Vec<(String, KranzBinding)> {
+        let Ok(mut bindings) = self.lock_kranz() else {
+            return Vec::new();
+        };
+        let mut newly = Vec::new();
+        for pane_id in workers.keys() {
+            if bindings.contains_key(pane_id) {
+                continue;
+            }
+            let Some(repo) = live_cwds.get(pane_id) else {
+                continue;
+            };
+            bindings.insert(
+                pane_id.clone(),
+                KranzBinding {
+                    repo: repo.clone(),
+                    manual: false,
+                },
+            );
+            newly.push((pane_id.clone(), repo.clone()));
+        }
+        bindings.retain(|pane_id, binding| {
+            binding.manual || (workers.contains_key(pane_id) && live_cwds.contains_key(pane_id))
+        });
+        let current: Vec<(String, KranzBinding)> = bindings
+            .iter()
+            .map(|(pane_id, binding)| (pane_id.clone(), binding.clone()))
+            .collect();
+        drop(bindings);
+        for (pane_id, repo) in newly {
+            tracing::info!(
+                workspace_key = %self.workspace_key,
+                pane_id = %pane_id,
+                repo = %repo,
+                event = "kranz_bound",
+                "Kranz worker found under pane; mission state now drives its badge"
+            );
+            let _ = self.ledger_record(
+                &pane_id,
+                "kranz.bound",
+                json!({ "repo": repo, "manual": false }),
+            );
+        }
+        current
+    }
+
+    /// (M4) Read a bound mission's state through the CLI (`kranz status
+    /// --json`, read-only, no lock) and apply it as an official reading.
+    #[cfg(unix)]
+    fn probe_kranz_binding(&self, pane_id: &str, binding: &KranzBinding, ttl: Duration) {
+        let bin = self.effective_config().kranz_bin_effective();
+        let output = match Command::new(&bin)
+            .args(["--repo", &binding.repo, "status", "--json"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => output.stdout,
+            Ok(output) => {
+                self.note_probe_failure(&format!(
+                    "`{bin} --repo {} status --json` exited {}",
+                    binding.repo, output.status
+                ));
+                return;
+            }
+            Err(error) => {
+                self.note_probe_failure(&format!("cannot run `{bin} status --json`: {error}"));
+                return;
+            }
+        };
+        let state: Value = match serde_json::from_slice(&output) {
+            Ok(state) => state,
+            Err(error) => {
+                self.note_probe_failure(&format!("unreadable `kranz status --json`: {error}"));
+                return;
+            }
+        };
+        if let Some(attention) = kranz_attention_from_state(&state) {
+            self.router.apply_official_attention_with(
+                pane_id,
+                "kranz",
+                attention,
+                ttl,
+                "kranz-status",
+            );
+        }
+    }
+
+    /// (M4) Mirror a hand-back note into the bound mission's inbox via
+    /// `kranz msg`, and ledger the outcome either way. The release itself has
+    /// already succeeded; a failed mirror is recorded, never surfaced as an
+    /// error.
+    fn mirror_release_to_kranz(&self, pane_id: &str, holder: &str, note: &str) {
+        let binding = match self.lock_kranz() {
+            Ok(bindings) => bindings.get(pane_id).cloned(),
+            Err(_) => None,
+        };
+        let Some(binding) = binding else {
+            return;
+        };
+        let bin = self.effective_config().kranz_bin_effective();
+        let text = format!("[sgian] {holder} handed back the keyboard: {note}");
+        let outcome = Command::new(&bin)
+            .args(["--repo", &binding.repo, "msg", &text])
+            .stdin(Stdio::null())
+            .output();
+        let (ok, error) = match outcome {
+            Ok(output) if output.status.success() => (true, None),
+            Ok(output) => (
+                false,
+                Some(format!(
+                    "{bin} msg exited {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+            ),
+            Err(error) => (false, Some(format!("cannot run {bin}: {error}"))),
+        };
+        if let Some(error) = &error {
+            tracing::warn!(
+                workspace_key = %self.workspace_key,
+                pane_id = %pane_id,
+                event = "kranz_mirror_failed",
+                error = %error,
+                "hand-back note was not mirrored to kranz"
+            );
+        }
+        let _ = self.ledger_record(
+            pane_id,
+            "kranz.mirrored",
+            json!({ "repo": binding.repo, "ok": ok, "error": error }),
+        );
+    }
+
+    /// (M3b) One round of the official agent probe: run `claude agents --json`,
+    /// attribute each session to a live shell pane through the process tree,
+    /// and feed the result to the router as an official reading that outlives
+    /// two probe intervals. Skipped entirely when no shell pane is live.
+    #[cfg(unix)]
+    fn run_agent_probe(&self, interval: Duration) {
+        let pane_pids = match self.lock_terminals() {
+            Ok(terminals) => terminals.live_pane_pids(),
+            Err(_) => return,
+        };
+        if pane_pids.is_empty() {
+            return;
+        }
+        let config = self.effective_config();
+        let AgentBinPlan::Direct(bin) =
+            resolve_provider_bin(&config.agent_config(), AgentBackendKind::Claude)
+        else {
+            return;
+        };
+        let output = match Command::new(&bin)
+            .args(["agents", "--json"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => output.stdout,
+            Ok(output) => {
+                self.note_probe_failure(&format!("`{bin} agents --json` exited {}", output.status));
+                return;
+            }
+            Err(error) => {
+                self.note_probe_failure(&format!("cannot run `{bin} agents --json`: {error}"));
+                return;
+            }
+        };
+        let entries: Vec<AgentProbeEntry> = match serde_json::from_slice(&output) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.note_probe_failure(&format!("unreadable `agents --json` output: {error}"));
+                return;
+            }
+        };
+        let table = match Command::new("ps")
+            .args(["-axo", "pid=,ppid=,args="])
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(output) => parse_process_table(&String::from_utf8_lossy(&output.stdout)),
+            Err(error) => {
+                self.note_probe_failure(&format!("cannot run ps: {error}"));
+                return;
+            }
+        };
+        let ttl = interval.saturating_mul(2) + Duration::from_millis(500);
+        // (M4) Kranz workers under a pane bind it to their mission.
+        let workers = find_kranz_panes(&table, &pane_pids);
+        let live_cwds = self
+            .lock_terminals()
+            .map(|terminals| terminals.live_pane_cwds())
+            .unwrap_or_default();
+        for (pane_id, binding) in self.reconcile_kranz_bindings(&workers, &live_cwds) {
+            self.probe_kranz_binding(&pane_id, &binding, ttl);
+        }
+        let mapped = map_probe_entries(&entries, &table.parent, &pane_pids);
+        for (pane_id, attention) in &mapped {
+            if self
+                .router
+                .apply_official_attention(pane_id, "claude", *attention, ttl)
+            {
+                tracing::info!(
+                    workspace_key = %self.workspace_key,
+                    pane_id = %pane_id,
+                    event = "agent_probe_mapped",
+                    "Claude Code session mapped to pane; its own state now drives the badge"
+                );
+            }
+        }
+        let live: Vec<String> = pane_pids
+            .iter()
+            .map(|(pane_id, _)| pane_id.clone())
+            .collect();
+        let cleared = match self.probe_mapped.lock() {
+            Ok(mut previous) => reconcile_probe_rounds(&mut previous, &mapped, &live),
+            Err(_) => Vec::new(),
+        };
+        for pane_id in cleared {
+            self.router.clear_official_attention(&pane_id);
+        }
+    }
+
+    #[cfg(unix)]
+    fn note_probe_failure(&self, message: &str) {
+        if !self.probe_warned.swap(true, Ordering::SeqCst) {
+            tracing::warn!(
+                workspace_key = %self.workspace_key,
+                event = "agent_probe_failed",
+                error = %message,
+                "official agent probe failed; falling back to screen classification"
+            );
+        } else {
+            tracing::debug!(
+                workspace_key = %self.workspace_key,
+                event = "agent_probe_failed",
+                error = %message,
+                "official agent probe failed"
+            );
+        }
     }
 
     /// Dispatch a request with no peer connection attached. Production paths
@@ -6923,6 +8541,9 @@ impl DaemonServer {
                 // (T1) The pane's agent state (including a manual mark) dies
                 // with it; pane ids are never reused.
                 self.router.remove_agent(&pane_id);
+                // So does its keyboard lease (ledgered as revoked; the ledger
+                // file itself is kept).
+                self.revoke_lease_on_close(&pane_id);
                 self.lock_terminals()?.close_pane(&pane_id);
                 self.router.invalidate_append_handle(&pane_id);
                 let _ = fs::remove_file(scrollback_path(&self.scrollback_dir, &pane_id));
@@ -6974,12 +8595,39 @@ impl DaemonServer {
                 Ok(json!(CommandOk { ok: true }))
             }
             DaemonRequest::WriteToPane { pane_id, data } => {
-                self.write_input(&pane_id, &data)?;
+                self.write_input(&pane_id, &data, None)?;
                 Ok(json!(CommandOk { ok: true }))
             }
             DaemonRequest::SendInput { pane_id, input } => {
-                self.write_input(&pane_id, &input)?;
+                self.write_input(&pane_id, &input, None)?;
                 Ok(json!(CommandOk { ok: true }))
+            }
+            DaemonRequest::SendInputAs {
+                pane_id,
+                input,
+                holder,
+            } => {
+                let holder = validate_holder(&holder)?;
+                self.write_input(&pane_id, &input, Some(&holder))?;
+                Ok(json!(CommandOk { ok: true }))
+            }
+            DaemonRequest::TakeLease {
+                pane_id,
+                holder,
+                force,
+                why,
+            } => self.handle_take_lease(&pane_id, &holder, force, why.as_deref()),
+            DaemonRequest::ReleaseLease {
+                pane_id,
+                holder,
+                note,
+            } => self.handle_release_lease(&pane_id, &holder, &note),
+            DaemonRequest::KranzBind { pane_id, repo } => self.handle_kranz_bind(&pane_id, repo),
+            DaemonRequest::KranzUnbind { pane_id } => self.handle_kranz_unbind(&pane_id),
+            DaemonRequest::KranzBindings => Ok(json!(self.kranz_bindings_snapshot())),
+            DaemonRequest::LeaseStatus { pane_id } => {
+                self.ensure_pane_exists(&pane_id)?;
+                self.lease_info(&pane_id).map(|info| json!(info))
             }
             DaemonRequest::ResizePaneTerminal {
                 pane_id,
@@ -7017,7 +8665,10 @@ impl DaemonServer {
             }
             DaemonRequest::GetConfig => Ok(self.effective_config().full_config()),
             DaemonRequest::Broadcast { input } => {
-                let written = self.lock_terminals()?.write_to_all_live(&input);
+                // A broadcast has no holder, so every held pane is skipped
+                // rather than the whole broadcast refused.
+                let skip = self.panes_held_by_others(None)?;
+                let written = self.lock_terminals()?.write_to_live_except(&input, &skip);
                 Ok(json!({ "panes": written }))
             }
             DaemonRequest::SetSyncInput { enabled } => {
@@ -7168,6 +8819,9 @@ impl DaemonServer {
         // Automation must honor the same environment policy as shell and agent
         // panes. Clone the policy before spawn so no config lock spans execution.
         let config = self.effective_config();
+        for key in INHERITED_SESSION_MARKERS {
+            command.env_remove(key);
+        }
         for key in &config.scrub_env {
             command.env_remove(key);
         }
@@ -7654,14 +9308,324 @@ impl DaemonServer {
     }
 
     /// Write input to a pane, mirroring it to all live panes when synchronize-input is on.
-    fn write_input(&self, pane_id: &str, data: &str) -> Result<(), String> {
+    /// `holder` attributes the write to a keyboard-lease holder (None = the
+    /// legacy unattributed path). The lease gate runs BEFORE the terminal lock
+    /// and the lease map is a leaf lock, so lock order stays
+    /// registry → terminals with leases only ever taken alone.
+    fn write_input(&self, pane_id: &str, data: &str, holder: Option<&str>) -> Result<(), String> {
         self.ensure_pane_exists(pane_id)?;
-        let terminals = self.lock_terminals()?;
         if self.sync_input.load(Ordering::SeqCst) {
-            terminals.write_to_all_live(data);
+            // Mirrored input skips panes held by someone else rather than
+            // refusing the whole write; the target pane itself is still gated.
+            self.check_lease_write(pane_id, holder)?;
+            let skip = self.panes_held_by_others(holder)?;
+            let written = self.lock_terminals()?.write_to_live_except(data, &skip);
+            for written_pane in &written {
+                self.note_lease_write(written_pane, data.len());
+            }
             Ok(())
         } else {
-            terminals.write_to_pane(pane_id, data)
+            self.check_lease_write(pane_id, holder)?;
+            self.lock_terminals()?.write_to_pane(pane_id, data)?;
+            self.note_lease_write(pane_id, data.len());
+            Ok(())
+        }
+    }
+
+    // ----- Keyboard lease handlers (docs/design/keyboard-lease-and-ledger.md) -----
+
+    fn lease_policy(&self) -> LeasePolicy {
+        self.config
+            .read()
+            .map(|config| config.lease_policy_effective())
+            .unwrap_or(LeasePolicy::Open)
+    }
+
+    fn lock_leases(&self) -> Result<MutexGuard<'_, HashMap<String, HeldLease>>, String> {
+        self.leases
+            .lock()
+            .map_err(|_| "lease table lock poisoned".to_string())
+    }
+
+    /// Append one record to a pane's ledger. Heads are cached per pane after the
+    /// first append (seeded from the file's last line), and every append is
+    /// fsynced: lease events are rare and the record is the product.
+    fn ledger_record(
+        &self,
+        pane_id: &str,
+        kind: &str,
+        payload: Value,
+    ) -> Result<LedgerRecord, String> {
+        self.ledger
+            .lock()
+            .map_err(|_| "ledger lock poisoned".to_string())?
+            .record(pane_id, kind, payload, true)
+    }
+
+    fn lease_info(&self, pane_id: &str) -> Result<LeaseInfo, String> {
+        let policy = self.lease_policy();
+        let leases = self.lock_leases()?;
+        Ok(LeaseInfo::from_lease(
+            pane_id,
+            policy,
+            leases.get(pane_id),
+            now_millis(),
+        ))
+    }
+
+    /// Lease info for every HELD pane (the bootstrap snapshot's `leases` map).
+    fn lease_infos(&self) -> HashMap<String, LeaseInfo> {
+        let policy = self.lease_policy();
+        let now = now_millis();
+        match self.lock_leases() {
+            Ok(leases) => leases
+                .iter()
+                .map(|(pane_id, held)| {
+                    (
+                        pane_id.clone(),
+                        LeaseInfo::from_lease(pane_id, policy, Some(held), now),
+                    )
+                })
+                .collect(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    /// Panes whose keyboard is held by someone other than `holder`.
+    fn panes_held_by_others(&self, holder: Option<&str>) -> Result<HashSet<String>, String> {
+        let leases = self.lock_leases()?;
+        Ok(leases
+            .iter()
+            .filter(|(_, held)| holder != Some(held.holder.as_str()))
+            .map(|(pane_id, _)| pane_id.clone())
+            .collect())
+    }
+
+    /// Gate one write against the pane's lease. A refusal bumps the holder's
+    /// `refused_writes` counter so the eventual release record shows how often
+    /// someone else tried to type while the pane was held.
+    fn check_lease_write(&self, pane_id: &str, holder: Option<&str>) -> Result<(), String> {
+        let policy = self.lease_policy();
+        let mut leases = self.lock_leases()?;
+        match can_write(policy, leases.get(pane_id), holder) {
+            Ok(()) => Ok(()),
+            Err(refusal) => {
+                if let Some(held) = leases.get_mut(pane_id) {
+                    held.refused_writes = held.refused_writes.saturating_add(1);
+                }
+                Err(format!("{refusal} ({pane_id})"))
+            }
+        }
+    }
+
+    /// Count an accepted write against the pane's lease (no-op when unheld).
+    /// Counters reach workspace.json on the lazy-persist cadence, never per
+    /// keystroke.
+    fn note_lease_write(&self, pane_id: &str, bytes: usize) {
+        if let Ok(mut leases) = self.lock_leases() {
+            if let Some(held) = leases.get_mut(pane_id) {
+                held.writes = held.writes.saturating_add(1);
+                held.bytes_typed = held.bytes_typed.saturating_add(bytes as u64);
+                held.last_input_ms = Some(now_millis());
+                self.dirty.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn handle_take_lease(
+        &self,
+        pane_id: &str,
+        holder: &str,
+        force: bool,
+        why: Option<&str>,
+    ) -> Result<Value, String> {
+        self.ensure_pane_exists(pane_id)?;
+        let holder = validate_holder(holder)?;
+        let why = match why {
+            Some(reason) => Some(validate_bounded_text(reason, "why", LEASE_WHY_MAX_BYTES)?),
+            None => None,
+        };
+        let now = now_millis();
+        let (outcome, previous) = {
+            let mut leases = self.lock_leases()?;
+            let outcome = can_take(leases.get(pane_id), &holder, force, why.as_deref())?;
+            let previous = leases.get(pane_id).cloned();
+            if outcome != TakeOutcome::AlreadyHeld {
+                leases.insert(pane_id.to_string(), HeldLease::new(&holder, now));
+            }
+            (outcome, previous)
+        };
+        if outcome == TakeOutcome::AlreadyHeld {
+            return self.lease_info(pane_id).map(|info| json!(info));
+        }
+        // Ledger first: the record is the product. A force-take is two
+        // records so the revoked holder's counters are not lost.
+        if let (TakeOutcome::Revoking { previous: revoked }, Some(prior)) =
+            (&outcome, previous.as_ref())
+        {
+            self.ledger_record(
+                pane_id,
+                "lease.revoked",
+                json!({
+                    "holder": revoked,
+                    "by": holder,
+                    "why": why,
+                    "held_ms": now.saturating_sub(prior.since_ms),
+                    "writes": prior.writes,
+                    "bytes_typed": prior.bytes_typed,
+                    "refused_writes": prior.refused_writes,
+                }),
+            )?;
+        }
+        self.ledger_record(
+            pane_id,
+            "lease.taken",
+            json!({
+                "holder": holder,
+                "force": force,
+                "why": why,
+                "previous_holder": previous.as_ref().map(|prior| prior.holder.clone()),
+            }),
+        )?;
+        if let Err(error) = self.persist() {
+            // Disk, memory, and clients must not diverge: revert the table and
+            // say so in the ledger (best-effort; the persist error is the one
+            // reported).
+            if let Ok(mut leases) = self.lock_leases() {
+                match previous {
+                    Some(prior) => leases.insert(pane_id.to_string(), prior),
+                    None => leases.remove(pane_id),
+                };
+            }
+            let _ = self.ledger_record(
+                pane_id,
+                "lease.revoked",
+                json!({ "holder": holder, "by": "daemon", "why": format!("persist failed: {error}") }),
+            );
+            return Err(error);
+        }
+        if let TakeOutcome::Revoking { previous: revoked } = &outcome {
+            tracing::info!(
+                workspace_key = %self.workspace_key,
+                pane_id = %pane_id,
+                event = "lease_revoked",
+                holder = %revoked,
+                by = %holder,
+                "keyboard lease revoked"
+            );
+            self.router.broadcast(&DaemonEvent::LeaseState {
+                pane_id: pane_id.to_string(),
+                transition: LeaseTransition::Revoked,
+                holder: None,
+                since_ms: None,
+                note: why.clone(),
+            });
+        }
+        tracing::info!(
+            workspace_key = %self.workspace_key,
+            pane_id = %pane_id,
+            event = "lease_taken",
+            holder = %holder,
+            "keyboard lease taken"
+        );
+        self.router.broadcast(&DaemonEvent::LeaseState {
+            pane_id: pane_id.to_string(),
+            transition: LeaseTransition::Taken,
+            holder: Some(holder),
+            since_ms: Some(now),
+            note: None,
+        });
+        self.lease_info(pane_id).map(|info| json!(info))
+    }
+
+    fn handle_release_lease(
+        &self,
+        pane_id: &str,
+        holder: &str,
+        note: &str,
+    ) -> Result<Value, String> {
+        self.ensure_pane_exists(pane_id)?;
+        let holder = validate_holder(holder)?;
+        let note = validate_bounded_text(note, "hand-back note", LEASE_NOTE_MAX_BYTES)?;
+        let now = now_millis();
+        let released = {
+            let mut leases = self.lock_leases()?;
+            can_release(leases.get(pane_id), &holder)?;
+            leases
+                .remove(pane_id)
+                .ok_or_else(|| format!("pane keyboard is not held ({pane_id})"))?
+        };
+        self.ledger_record(
+            pane_id,
+            "lease.released",
+            json!({
+                "holder": holder,
+                "note": note,
+                "held_ms": now.saturating_sub(released.since_ms),
+                "writes": released.writes,
+                "bytes_typed": released.bytes_typed,
+                "refused_writes": released.refused_writes,
+            }),
+        )?;
+        if let Err(error) = self.persist() {
+            if let Ok(mut leases) = self.lock_leases() {
+                leases.insert(pane_id.to_string(), released);
+            }
+            let _ = self.ledger_record(
+                pane_id,
+                "lease.taken",
+                json!({ "holder": holder, "force": false, "why": format!("release persist failed: {error}") }),
+            );
+            return Err(error);
+        }
+        tracing::info!(
+            workspace_key = %self.workspace_key,
+            pane_id = %pane_id,
+            event = "lease_released",
+            holder = %holder,
+            "keyboard lease released"
+        );
+        // (M4) A bound pane's note also reaches the mission's inbox.
+        self.mirror_release_to_kranz(pane_id, &holder, &note);
+        self.router.broadcast(&DaemonEvent::LeaseState {
+            pane_id: pane_id.to_string(),
+            transition: LeaseTransition::Released,
+            holder: None,
+            since_ms: None,
+            note: Some(note),
+        });
+        self.lease_info(pane_id).map(|info| json!(info))
+    }
+
+    /// A closed pane's lease dies with it (pane ids are never reused). The
+    /// ledger file is kept: it is the audit record, not runtime state.
+    fn revoke_lease_on_close(&self, pane_id: &str) {
+        let removed = match self.lock_leases() {
+            Ok(mut leases) => leases.remove(pane_id),
+            Err(_) => None,
+        };
+        if let Some(held) = removed {
+            let now = now_millis();
+            let _ = self.ledger_record(
+                pane_id,
+                "lease.revoked",
+                json!({
+                    "holder": held.holder,
+                    "by": "daemon",
+                    "why": "pane closed",
+                    "held_ms": now.saturating_sub(held.since_ms),
+                    "writes": held.writes,
+                    "bytes_typed": held.bytes_typed,
+                    "refused_writes": held.refused_writes,
+                }),
+            );
+            self.router.broadcast(&DaemonEvent::LeaseState {
+                pane_id: pane_id.to_string(),
+                transition: LeaseTransition::Revoked,
+                holder: None,
+                since_ms: None,
+                note: Some("pane closed".to_string()),
+            });
         }
     }
 
@@ -7823,6 +9787,9 @@ impl DaemonServer {
         drop(terminals);
         // (T1) Agent info rides the bootstrap payload parallel to pane_states.
         snapshot.agent_states = self.router.agent_states();
+        // Held keyboard leases ride alongside so a client can render the
+        // holder without a second request.
+        snapshot.leases = self.lease_infos();
         // (T2) Bounded conversation replay for agent panes, read back from the
         // per-pane JSONL log (covers live, ended, and not-yet-respawned panes).
         for pane in &snapshot.panes {
@@ -8472,6 +10439,14 @@ impl DaemonServer {
                 .filter(|(pane_id, _)| registry.contains_pane(pane_id))
                 .map(|(pane_id, shell)| (pane_id.clone(), shell.clone()))
                 .collect(),
+            // Leaf lock, taken last (after registry → terminals) and dropped
+            // before the write below.
+            leases: self
+                .lock_leases()?
+                .iter()
+                .filter(|(pane_id, _)| registry.contains_pane(pane_id))
+                .map(|(pane_id, held)| (pane_id.clone(), held.clone()))
+                .collect(),
         };
         drop(terminals);
         drop(registry);
@@ -8666,15 +10641,71 @@ fn restart_pane_terminal(pane_id: String, state: State<'_, AppState>) -> Result<
         .request(DaemonRequest::RestartPaneTerminal { pane_id })
 }
 
+/// GUI keystrokes are attributed to this machine's operator (the same
+/// `user@host` label `ctl` defaults to), so a pane held by someone else
+/// refuses them and a pane the operator took accepts them
+/// (docs/design/keyboard-lease-and-ledger.md §6 M2). A daemon predating the
+/// lease capability rejects the variant with a serde "unknown variant"
+/// error; fall back to the unattributed write so the GUI keeps working
+/// against it.
 #[tauri::command]
 fn write_to_pane(
     pane_id: String,
     data: String,
     state: State<'_, AppState>,
 ) -> Result<CommandOk, String> {
+    let client = state.client()?;
+    match client.request(DaemonRequest::SendInputAs {
+        pane_id: pane_id.clone(),
+        input: data.clone(),
+        holder: default_holder(),
+    }) {
+        Err(error) if error.contains("unknown variant") => {
+            client.request(DaemonRequest::WriteToPane { pane_id, data })
+        }
+        result => result,
+    }
+}
+
+/// The holder label this client writes and takes leases as.
+#[tauri::command]
+fn client_holder() -> String {
+    default_holder()
+}
+
+#[tauri::command]
+fn take_lease(
+    pane_id: String,
+    force: bool,
+    why: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<LeaseInfo, String> {
+    state.client()?.request(DaemonRequest::TakeLease {
+        pane_id,
+        holder: default_holder(),
+        force,
+        why,
+    })
+}
+
+#[tauri::command]
+fn release_lease(
+    pane_id: String,
+    note: String,
+    state: State<'_, AppState>,
+) -> Result<LeaseInfo, String> {
+    state.client()?.request(DaemonRequest::ReleaseLease {
+        pane_id,
+        holder: default_holder(),
+        note,
+    })
+}
+
+#[tauri::command]
+fn lease_status(pane_id: String, state: State<'_, AppState>) -> Result<LeaseInfo, String> {
     state
         .client()?
-        .request(DaemonRequest::WriteToPane { pane_id, data })
+        .request(DaemonRequest::LeaseStatus { pane_id })
 }
 
 #[tauri::command]
@@ -9333,6 +11364,40 @@ fn run_daemon_with_config_and_warnings(
     // for the entire run so all tracing calls in the accept loop are captured.
     let _log_guard = tracing::dispatcher::set_default(&server.log_dispatch);
 
+    // (M3b) The official agent probe runs on its own thread so a slow
+    // `claude agents --json` never touches the accept loop; it re-reads the
+    // interval each round so a config reload takes effect without a restart.
+    // It holds only a Weak reference and sleeps in short slices: a strong Arc
+    // parked in a one-second sleep would keep the server (and its log guard,
+    // whose drop flushes `daemon_shutdown`) alive after the accept loop ended.
+    #[cfg(unix)]
+    {
+        let probe_server = Arc::downgrade(&server);
+        thread::spawn(move || {
+            let mut next_round = Instant::now();
+            loop {
+                let Some(server) = probe_server.upgrade() else {
+                    return;
+                };
+                if server.shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                if Instant::now() >= next_round {
+                    let _guard = tracing::dispatcher::set_default(&server.log_dispatch);
+                    match server.effective_config().agent_probe_interval() {
+                        Some(interval) => {
+                            server.run_agent_probe(interval);
+                            next_round = Instant::now() + interval;
+                        }
+                        None => next_round = Instant::now() + Duration::from_secs(1),
+                    }
+                }
+                drop(server);
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+    }
+
     install_shutdown_signal_handlers();
     tracing::info!(
         workspace_key = %server.workspace_key,
@@ -9660,6 +11725,8 @@ fn daemon_capabilities() -> Vec<String> {
         "framed".to_string(),
         "persistent".to_string(),
         "subscribe-ack".to_string(),
+        // Keyboard lease requests, LeaseState events, snapshot `leases`.
+        "lease".to_string(),
     ]
 }
 
@@ -10100,10 +12167,15 @@ fn read_ipc_line<R: BufRead>(reader: &mut R) -> Result<String, String> {
 }
 
 fn write_json_line<T: Serialize>(stream: &mut TransportStream, value: &T) -> Result<(), String> {
-    serde_json::to_writer(&mut *stream, value)
-        .map_err(|error| format!("failed to encode ipc: {error}"))?;
+    // ONE write of line+'\n': a peer that reads the first bytes, decides the
+    // message is a protocol error and closes (the v2 bad-magic path) must not
+    // turn the trailing newline into a spurious EPIPE for a message that was
+    // fully delivered. Also one syscall instead of two per message.
+    let mut bytes =
+        serde_json::to_vec(value).map_err(|error| format!("failed to encode ipc: {error}"))?;
+    bytes.push(b'\n');
     stream
-        .write_all(b"\n")
+        .write_all(&bytes)
         .map_err(|error| format!("failed to write ipc: {error}"))?;
     stream
         .flush()
@@ -10926,6 +12998,27 @@ fn emit_daemon_event(app: &AppHandle, event: DaemonEvent) {
                 }),
             );
         }
+        // Keyboard lease transitions ride to the frontend as `lease-state`
+        // (docs/design/keyboard-lease-and-ledger.md); the M2 client work
+        // renders them. Unknown to older frontends, which ignore the name.
+        DaemonEvent::LeaseState {
+            pane_id,
+            transition,
+            holder,
+            since_ms,
+            note,
+        } => {
+            let _ = app.emit(
+                "lease-state",
+                json!({
+                    "pane_id": pane_id,
+                    "transition": transition,
+                    "holder": holder,
+                    "since_ms": since_ms,
+                    "note": note,
+                }),
+            );
+        }
         // (T2) Normalized agent conversation events. The Tauri payload keeps
         // the contract's {pane_id, event} shape (the daemon-wire field is
         // `payload` only because of the enum's internal tag — see the
@@ -10964,6 +13057,9 @@ struct LoadedWorkspace {
     /// Frozen shell profile overrides restored from workspace.json (empty for
     /// a fresh, corrupt, or pre-§4 workspace).
     pane_shells: HashMap<String, ShellConfig>,
+    /// Held keyboard leases restored from workspace.json (empty for a fresh,
+    /// corrupt, or pre-lease workspace).
+    leases: HashMap<String, HeldLease>,
     was_corrupt: bool,
     /// The cwd recorded in the persisted workspace.json, if the file was parsed
     /// successfully. Used by the daemon-side collision check (defense-in-depth:
@@ -10986,6 +13082,7 @@ fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
                 agents_v2: HashMap::new(),
                 agent_specs: HashMap::new(),
                 pane_shells: HashMap::new(),
+                leases: HashMap::new(),
                 was_corrupt: false,
                 persisted_cwd: None,
             };
@@ -11005,6 +13102,7 @@ fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
             let agents_v2 = persisted.agents_v2.clone();
             let agent_specs = persisted.agent_specs.clone();
             let pane_shells = persisted.pane_shells.clone();
+            let leases = persisted.leases.clone();
             let persisted_cwd = Some(persisted.cwd.clone());
             let registry = PaneRegistry::from_persisted(persisted, cwd);
             LoadedWorkspace {
@@ -11017,6 +13115,7 @@ fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
                 agents_v2,
                 agent_specs,
                 pane_shells,
+                leases,
                 was_corrupt: false,
                 persisted_cwd,
             }
@@ -11035,6 +13134,7 @@ fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
                 agents_v2: HashMap::new(),
                 agent_specs: HashMap::new(),
                 pane_shells: HashMap::new(),
+                leases: HashMap::new(),
                 was_corrupt: true,
                 persisted_cwd: None,
             }
@@ -11746,6 +13846,40 @@ fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             let client = DaemonClient::connect_or_spawn(options.workspace)?;
             control_restart_pane(&client, &options.args[1..], options.json)
         }
+        "lease" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_lease_args(&options.args[1..])?;
+            // Status never spawns a daemon; take/release start one on demand
+            // like the other mutating pane commands.
+            let client = if parsed.verb == LeaseVerb::Status {
+                DaemonClient::connect_existing(options.workspace)?
+            } else {
+                DaemonClient::connect_or_spawn(options.workspace)?
+            };
+            control_lease(&client, parsed, options.json)
+        }
+        "kranz" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_kranz_args(&options.args[1..])?;
+            let client = if parsed.verb == KranzVerb::Status {
+                DaemonClient::connect_existing(options.workspace)?
+            } else {
+                DaemonClient::connect_or_spawn(options.workspace)?
+            };
+            control_kranz(&client, parsed, options.json)
+        }
+        "ledger" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_ledger_args(&options.args[1..])?;
+            let client = DaemonClient::connect_existing(options.workspace)?;
+            control_ledger(&client, parsed, options.json)
+        }
         "attach" => {
             if options.args.len() > 2 {
                 return Err(format!(
@@ -12326,6 +14460,460 @@ fn control_status_verbose(client: &DaemonClient, json_output: bool) -> Result<()
     Ok(())
 }
 
+// ----- ctl: keyboard lease and ledger (docs/design/keyboard-lease-and-ledger.md) -----
+
+/// The holder label `ctl` attributes its writes and lease claims to:
+/// `$SGIAN_HOLDER` when set and valid, else `user@host`.
+fn default_holder() -> String {
+    if let Ok(configured) = std::env::var("SGIAN_HOLDER") {
+        if let Ok(holder) = validate_holder(&configured) {
+            return holder;
+        }
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "operator".to_string());
+    let host = local_hostname();
+    let short_host = host.split('.').next().unwrap_or("local");
+    validate_holder(&format!("{user}@{short_host}")).unwrap_or_else(|_| "operator".to_string())
+}
+
+#[cfg(unix)]
+fn local_hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most `buf.len()` bytes into a buffer we
+    // own for the duration of the call and NUL-terminates on success; a
+    // non-zero return leaves the contents unspecified, so we only read the
+    // buffer when it returns 0 and stop at the first NUL.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return "local".to_string();
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    if name.is_empty() {
+        "local".to_string()
+    } else {
+        name
+    }
+}
+
+#[cfg(not(unix))]
+fn local_hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "local".to_string())
+}
+
+/// Pull `--as HOLDER` out of a send/broadcast argument list, stopping at `--`
+/// like `parse_lf_flag` so a payload can still contain the literal text.
+fn parse_as_flag(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut holder = None;
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut passthrough = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if passthrough {
+            remaining.push(arg.clone());
+        } else if arg == "--as" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| "--as requires a HOLDER".to_string())?;
+            holder = Some(validate_holder(value)?);
+            index += 1;
+        } else if let Some(value) = arg.strip_prefix("--as=") {
+            holder = Some(validate_holder(value)?);
+        } else {
+            if arg == "--" {
+                passthrough = true;
+            }
+            remaining.push(arg.clone());
+        }
+        index += 1;
+    }
+    Ok((holder, remaining))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseVerb {
+    Status,
+    Take,
+    Release,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeaseArgs {
+    verb: LeaseVerb,
+    pane_ref: String,
+    holder: Option<String>,
+    force: bool,
+    why: Option<String>,
+    note: Option<String>,
+}
+
+/// `lease [status|take|release] [PANE] [--as HOLDER] [--force --why REASON] [-m NOTE]`.
+fn parse_lease_args(args: &[String]) -> Result<LeaseArgs, String> {
+    let mut parsed = LeaseArgs {
+        verb: LeaseVerb::Status,
+        pane_ref: "active".to_string(),
+        holder: None,
+        force: false,
+        why: None,
+        note: None,
+    };
+    let mut index = 0;
+    let mut pane_seen = false;
+    if let Some(first) = args.first() {
+        match first.as_str() {
+            "status" => {
+                parsed.verb = LeaseVerb::Status;
+                index = 1;
+            }
+            "take" => {
+                parsed.verb = LeaseVerb::Take;
+                index = 1;
+            }
+            "release" => {
+                parsed.verb = LeaseVerb::Release;
+                index = 1;
+            }
+            _ => {}
+        }
+    }
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let take_value = |index: usize, flag: &str| -> Result<String, String> {
+            args.get(index + 1)
+                .cloned()
+                .ok_or_else(|| format!("{flag} requires a value"))
+        };
+        match arg {
+            "--as" => {
+                parsed.holder = Some(validate_holder(&take_value(index, "--as")?)?);
+                index += 1;
+            }
+            "--force" => parsed.force = true,
+            "--why" => {
+                parsed.why = Some(take_value(index, "--why")?);
+                index += 1;
+            }
+            "-m" | "--note" => {
+                parsed.note = Some(take_value(index, "-m/--note")?);
+                index += 1;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(format!("unexpected argument for lease: {other}"));
+            }
+            other => {
+                if pane_seen {
+                    return Err(format!("unexpected argument for lease: {other}"));
+                }
+                parsed.pane_ref = other.to_string();
+                pane_seen = true;
+            }
+        }
+        index += 1;
+    }
+    if parsed.verb != LeaseVerb::Take && (parsed.force || parsed.why.is_some()) {
+        return Err("--force/--why apply to `lease take`".to_string());
+    }
+    if parsed.verb == LeaseVerb::Release && parsed.note.is_none() {
+        return Err("lease release requires -m NOTE (the hand-back note is mandatory)".to_string());
+    }
+    if parsed.verb != LeaseVerb::Release && parsed.note.is_some() {
+        return Err("-m/--note applies to `lease release`".to_string());
+    }
+    Ok(parsed)
+}
+
+fn format_held_for(held_ms: Option<u64>) -> String {
+    match held_ms {
+        None => "-".to_string(),
+        Some(ms) => {
+            let secs = ms / 1000;
+            if secs >= 3600 {
+                format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+            } else if secs >= 60 {
+                format!("{}m{:02}s", secs / 60, secs % 60)
+            } else {
+                format!("{secs}s")
+            }
+        }
+    }
+}
+
+fn print_lease_info(info: &LeaseInfo, json_output: bool) -> Result<(), String> {
+    if json_output {
+        return write_json_stdout(info);
+    }
+    let mut stdout = std::io::stdout();
+    writeln!(
+        stdout,
+        "{}\t{}\t{}\t{}\twrites={}\trefused={}",
+        info.pane_id,
+        info.policy,
+        info.holder.as_deref().unwrap_or("-"),
+        format_held_for(info.held_ms),
+        info.writes,
+        info.refused_writes
+    )
+    .map_err(|error| format!("failed to write stdout: {error}"))
+}
+
+/// `ctl lease …` — show, take, or release a pane's keyboard lease. The
+/// dispatcher parses first (pure) so status can use a read-only connection.
+fn control_lease(
+    client: &DaemonClient,
+    parsed: LeaseArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let pane_id = resolve_pane_ref(client, &parsed.pane_ref)?;
+    let holder = parsed.holder.clone().unwrap_or_else(default_holder);
+    let info: LeaseInfo = match parsed.verb {
+        LeaseVerb::Status => client.request(DaemonRequest::LeaseStatus { pane_id })?,
+        LeaseVerb::Take => client.request(DaemonRequest::TakeLease {
+            pane_id,
+            holder,
+            force: parsed.force,
+            why: parsed.why,
+        })?,
+        LeaseVerb::Release => client.request(DaemonRequest::ReleaseLease {
+            pane_id,
+            holder,
+            note: parsed.note.unwrap_or_default(),
+        })?,
+    };
+    print_lease_info(&info, json_output)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LedgerArgs {
+    pane_ref: String,
+    limit: usize,
+    verify: bool,
+}
+
+/// `ledger [PANE] [-n N] [--verify]`.
+fn parse_ledger_args(args: &[String]) -> Result<LedgerArgs, String> {
+    let mut parsed = LedgerArgs {
+        pane_ref: "active".to_string(),
+        limit: 0,
+        verify: false,
+    };
+    let mut pane_seen = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--verify" => parsed.verify = true,
+            "-n" | "--lines" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "-n requires a count".to_string())?;
+                parsed.limit = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid -n count '{value}'"))?;
+                index += 1;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(format!("unexpected argument for ledger: {other}"));
+            }
+            other => {
+                if pane_seen {
+                    return Err(format!("unexpected argument for ledger: {other}"));
+                }
+                parsed.pane_ref = other.to_string();
+                pane_seen = true;
+            }
+        }
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+/// `ctl ledger …` — print or verify a pane's lease ledger. Reads the file
+/// from the workspace data dir directly, so a CLOSED pane's ledger (its id
+/// given literally) is still readable; only an open pane needs the daemon to
+/// resolve a title.
+fn control_ledger(
+    client: &DaemonClient,
+    parsed: LedgerArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let pane_id = match resolve_pane_ref(client, &parsed.pane_ref) {
+        Ok(pane_id) => pane_id,
+        Err(error) => {
+            if parsed.pane_ref.starts_with("pane-") {
+                parsed.pane_ref.clone()
+            } else {
+                return Err(error);
+            }
+        }
+    };
+    let path = ledger_path(&client.data_dir.join(LEDGER_DIR), &pane_id);
+    if parsed.verify {
+        return match ledger_verify(&path) {
+            Ok(summary) => {
+                if json_output {
+                    write_json_stdout(&json!({
+                        "pane_id": pane_id,
+                        "ok": true,
+                        "records": summary.records,
+                        "head": summary.head,
+                    }))
+                } else {
+                    let mut stdout = std::io::stdout();
+                    writeln!(
+                        stdout,
+                        "ok\t{}\t{} records\thead {}",
+                        pane_id,
+                        summary.records,
+                        if summary.head.is_empty() {
+                            "-"
+                        } else {
+                            summary.head.as_str()
+                        }
+                    )
+                    .map_err(|error| format!("failed to write stdout: {error}"))
+                }
+            }
+            Err(broken) => Err(format!(
+                "ledger break in {} at line {}{}: {}",
+                path.display(),
+                broken.line,
+                broken
+                    .seq
+                    .map(|seq| format!(" (seq {seq})"))
+                    .unwrap_or_default(),
+                broken.reason
+            )),
+        };
+    }
+    let records = read_ledger_tail(&path, parsed.limit);
+    if json_output {
+        return write_json_stdout(&records);
+    }
+    let mut stdout = std::io::stdout();
+    for record in &records {
+        writeln!(stdout, "{record}").map_err(|error| format!("failed to write stdout: {error}"))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KranzVerb {
+    Status,
+    Bind,
+    Unbind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KranzArgs {
+    verb: KranzVerb,
+    pane_ref: String,
+    repo: Option<String>,
+}
+
+/// `kranz [status|bind|unbind] [PANE] [--repo PATH]`.
+fn parse_kranz_args(args: &[String]) -> Result<KranzArgs, String> {
+    let mut parsed = KranzArgs {
+        verb: KranzVerb::Status,
+        pane_ref: "active".to_string(),
+        repo: None,
+    };
+    let mut index = 0;
+    match args.first().map(String::as_str) {
+        Some("status") => index = 1,
+        Some("bind") => {
+            parsed.verb = KranzVerb::Bind;
+            index = 1;
+        }
+        Some("unbind") => {
+            parsed.verb = KranzVerb::Unbind;
+            index = 1;
+        }
+        _ => {}
+    }
+    let mut pane_seen = false;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--repo" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--repo requires a PATH".to_string())?;
+                parsed.repo = Some(value.clone());
+                index += 1;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(format!("unexpected argument for kranz: {other}"));
+            }
+            other => {
+                if pane_seen {
+                    return Err(format!("unexpected argument for kranz: {other}"));
+                }
+                parsed.pane_ref = other.to_string();
+                pane_seen = true;
+            }
+        }
+        index += 1;
+    }
+    if parsed.verb != KranzVerb::Bind && parsed.repo.is_some() {
+        return Err("--repo applies to `kranz bind`".to_string());
+    }
+    if parsed.verb == KranzVerb::Status && pane_seen {
+        return Err("kranz status lists every binding; it takes no PANE".to_string());
+    }
+    Ok(parsed)
+}
+
+fn control_kranz(
+    client: &DaemonClient,
+    parsed: KranzArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let result: Value = match parsed.verb {
+        KranzVerb::Status => client.request(DaemonRequest::KranzBindings)?,
+        KranzVerb::Bind => {
+            let pane_id = resolve_pane_ref(client, &parsed.pane_ref)?;
+            client.request(DaemonRequest::KranzBind {
+                pane_id,
+                repo: parsed.repo,
+            })?
+        }
+        KranzVerb::Unbind => {
+            let pane_id = resolve_pane_ref(client, &parsed.pane_ref)?;
+            client.request(DaemonRequest::KranzUnbind { pane_id })?
+        }
+    };
+    if json_output {
+        return write_json_stdout(&result);
+    }
+    let mut stdout = std::io::stdout();
+    match parsed.verb {
+        KranzVerb::Status => {
+            let bindings: HashMap<String, KranzBinding> =
+                serde_json::from_value(result).unwrap_or_default();
+            let mut rows: Vec<_> = bindings.into_iter().collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            for (pane_id, binding) in rows {
+                writeln!(
+                    stdout,
+                    "{pane_id}\t{}\t{}",
+                    if binding.manual { "manual" } else { "auto" },
+                    binding.repo
+                )
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+            }
+            Ok(())
+        }
+        _ => writeln!(
+            stdout,
+            "{}\t{}",
+            result["pane_id"].as_str().unwrap_or("-"),
+            result["binding"]["repo"].as_str().unwrap_or("-")
+        )
+        .map_err(|error| format!("failed to write stdout: {error}")),
+    }
+}
+
 fn control_send_input(client: &DaemonClient, args: &[String]) -> Result<(), String> {
     // Help only as the FIRST token (L6): later positions are freeform payload
     // (`send active ls -h` must send "-h").
@@ -12336,6 +14924,7 @@ fn control_send_input(client: &DaemonClient, args: &[String]) -> Result<(), Stri
         return print_control_help();
     }
     let (literal_lf, args) = parse_lf_flag(args);
+    let (holder, args) = parse_as_flag(&args)?;
     if args.len() < 2 {
         return Err("send requires a pane and input".to_string());
     }
@@ -12354,10 +14943,17 @@ fn control_send_input(client: &DaemonClient, args: &[String]) -> Result<(), Stri
         return Ok(());
     }
     let input = decode_cli_text(&args[1..].join(" "), literal_lf);
-    client.request::<CommandOk>(DaemonRequest::SendInput {
-        pane_id: status.pane.id,
-        input,
-    })?;
+    match holder {
+        Some(holder) => client.request::<CommandOk>(DaemonRequest::SendInputAs {
+            pane_id: status.pane.id,
+            input,
+            holder,
+        })?,
+        None => client.request::<CommandOk>(DaemonRequest::SendInput {
+            pane_id: status.pane.id,
+            input,
+        })?,
+    };
     Ok(())
 }
 
@@ -13793,6 +16389,12 @@ struct AgentArgs {
     pane_ref: String,
     /// `None`: query. `Some(Some("claude"))`: mark. `Some(None)`: unmark.
     mark: Option<Option<String>>,
+    /// `--watch`: stream agent-state, lease and pane-end transitions
+    /// (docs/design/keyboard-lease-and-ledger.md §6 M3). With no PANE the
+    /// stream covers every pane; with one it ends when that pane closes.
+    watch: bool,
+    /// Whether a PANE was given (a bare `--watch` means every pane).
+    pane_given: bool,
 }
 
 /// (T1) `ctl agent [PANE] [on|off]` — `on`/`off` as the FIRST positional is
@@ -13800,6 +16402,13 @@ struct AgentArgs {
 /// on`); any other first positional is the PANE reference and the optional
 /// second positional is the operation.
 fn parse_agent_args(args: &[String]) -> Result<AgentArgs, String> {
+    let watch = args.iter().any(|arg| arg == "--watch");
+    let args: Vec<String> = args
+        .iter()
+        .filter(|arg| *arg != "--watch")
+        .cloned()
+        .collect();
+    let args = args.as_slice();
     let verb_first = matches!(args.first().map(String::as_str), Some("on" | "off"));
     let (pane_ref, op_index) = if verb_first {
         ("active".to_string(), 0)
@@ -13820,7 +16429,143 @@ fn parse_agent_args(args: &[String]) -> Result<AgentArgs, String> {
     if let Some(extra) = args.get(op_index + 1) {
         return Err(format!("unexpected argument for agent: {extra}"));
     }
-    Ok(AgentArgs { pane_ref, mark })
+    if watch && mark.is_some() {
+        return Err("--watch cannot be combined with on/off".to_string());
+    }
+    let pane_given = !verb_first && !args.is_empty();
+    Ok(AgentArgs {
+        pane_ref,
+        mark,
+        watch,
+        pane_given,
+    })
+}
+
+/// One line for `ctl agent --watch`: the agent-state, lease and pane-end
+/// transitions a script wants to react to; `None` for everything else.
+/// JSON is the daemon's own event shape (`{"event":"agent_state",...}`).
+fn format_watch_event(event: &DaemonEvent, json_output: bool) -> Option<String> {
+    fn enum_name<T: Serialize>(value: &T) -> String {
+        serde_json::to_value(value)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "-".to_string())
+    }
+    let text = match event {
+        DaemonEvent::AgentState {
+            pane_id,
+            agent,
+            attention,
+        } => format!(
+            "{pane_id}\tagent_state\t{}\t{}",
+            agent.as_deref().unwrap_or("-"),
+            attention
+                .map(|value| enum_name(&value))
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        DaemonEvent::LeaseState {
+            pane_id,
+            transition,
+            holder,
+            ..
+        } => format!(
+            "{pane_id}\tlease_{}\t{}",
+            enum_name(transition),
+            holder.as_deref().unwrap_or("-")
+        ),
+        DaemonEvent::PaneEnded { pane_id, exit_code } => format!(
+            "{pane_id}\tpane_ended\t{}",
+            exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ),
+        DaemonEvent::PaneClosed { pane_id } => format!("{pane_id}\tpane_closed"),
+        _ => return None,
+    };
+    if json_output {
+        serde_json::to_string(event).ok()
+    } else {
+        Some(text)
+    }
+}
+
+fn watch_event_pane(event: &DaemonEvent) -> Option<&str> {
+    match event {
+        DaemonEvent::AgentState { pane_id, .. }
+        | DaemonEvent::LeaseState { pane_id, .. }
+        | DaemonEvent::PaneEnded { pane_id, .. }
+        | DaemonEvent::PaneClosed { pane_id } => Some(pane_id),
+        _ => None,
+    }
+}
+
+/// `ctl agent --watch [PANE]` — print the current agent state as a baseline,
+/// then stream transitions until killed (or, with a PANE, until it closes).
+fn control_agent_watch(
+    client: &DaemonClient,
+    pane_filter: Option<String>,
+    json_output: bool,
+) -> Result<(), String> {
+    // Subscribe first so a transition between the baseline read and the loop
+    // is queued rather than missed.
+    let mut conn = client.connect()?;
+    conn.write_request(&DaemonRequest::Subscribe)?;
+    conn.await_subscribe_ack()?;
+    conn.set_read_timeout(None);
+
+    let entries: Value = client.request(DaemonRequest::Find {
+        command: None,
+        title: None,
+        cwd: None,
+        state: None,
+    })?;
+    let mut stdout = std::io::stdout();
+    for entry in entries.as_array().into_iter().flatten() {
+        let Some(pane_id) = entry["id"].as_str() else {
+            continue;
+        };
+        if pane_filter
+            .as_deref()
+            .is_some_and(|wanted| wanted != pane_id)
+        {
+            continue;
+        }
+        let baseline = DaemonEvent::AgentState {
+            pane_id: pane_id.to_string(),
+            agent: entry["agent"].as_str().map(str::to_string),
+            attention: serde_json::from_value(entry["attention"].clone()).ok(),
+        };
+        if let Some(line) = format_watch_event(&baseline, json_output) {
+            writeln!(stdout, "{line}")
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+        }
+    }
+    stdout
+        .flush()
+        .map_err(|error| format!("failed to write stdout: {error}"))?;
+
+    loop {
+        let Some(event) = conn.read_event()? else {
+            return Ok(());
+        };
+        let Some(pane_id) = watch_event_pane(&event) else {
+            continue;
+        };
+        if pane_filter
+            .as_deref()
+            .is_some_and(|wanted| wanted != pane_id)
+        {
+            continue;
+        }
+        if let Some(line) = format_watch_event(&event, json_output) {
+            writeln!(stdout, "{line}")
+                .and_then(|_| stdout.flush())
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+        }
+        if pane_filter.is_some() && matches!(event, DaemonEvent::PaneClosed { .. }) {
+            return Ok(());
+        }
+    }
 }
 
 /// (T1) Read a pane's agent state via `find` (which — unlike `snapshot` —
@@ -13854,6 +16599,14 @@ fn control_agent(client: &DaemonClient, args: &[String], json_output: bool) -> R
         return print_control_help();
     }
     let parsed = parse_agent_args(args)?;
+    if parsed.watch {
+        let filter = if parsed.pane_given {
+            Some(resolve_pane_ref(client, &parsed.pane_ref)?)
+        } else {
+            None
+        };
+        return control_agent_watch(client, filter, json_output);
+    }
     let pane_id = resolve_pane_ref(client, &parsed.pane_ref)?;
     let state = match parsed.mark {
         Some(agent) => client.request::<Value>(DaemonRequest::SetPaneAgent {
@@ -14727,13 +17480,37 @@ Commands (PANE is a pane id or title; defaults to the active pane):
   status --verbose              Show daemon-level runtime detail (subscribers,
                                 pane states, uptime, effective config summary)
   restart [PANE]                Restart a pane's shell (alias: pane restart)
-  send <PANE> [--lf|--raw] [--] <TEXT...>
+  send <PANE> [--lf|--raw] [--as HOLDER] [--] <TEXT...>
                                 Send text to a pane    (alias: pane send)
                                   By default \n and \r submit a line as Enter/CR.
                                   --lf / --raw sends a literal LF (0x0A) instead of CR.
+                                  --as HOLDER attributes the input to a lease holder
                                   -- ends flag parsing (send a literal "--lf" etc.)
                                   To an agent pane, send posts a chat message
                                   (verbatim; no Enter/CR translation, no --lf).
+  agent --watch [PANE]          Stream agent-state, lease and pane-end transitions
+                                  (one line each; --json prints the daemon events).
+                                  No PANE watches every pane; with one, exits on close.
+  lease [PANE]                  Show who holds a pane's keyboard (alias: lease status)
+  lease take [PANE] [--as HOLDER] [--force --why REASON]
+                                Claim the keyboard. While held, input from anyone
+                                  else is refused. --force revokes another holder
+                                  (REASON is ledgered). HOLDER defaults to
+                                  $SGIAN_HOLDER or user@host.
+  lease release [PANE] -m NOTE [--as HOLDER]
+                                Hand the keyboard back; the note is mandatory.
+  kranz status                  List panes bound to Kranz missions (auto: a
+                                  `kranz run` under the pane; manual: bind)
+  kranz bind [PANE] [--repo PATH]
+                                Bind a pane to the mission at PATH (default: the
+                                  pane's cwd). Hand-back notes are mirrored into
+                                  its inbox with `kranz msg`; `kranz status`
+                                  drives the pane's badge.
+  kranz unbind [PANE]           Remove a binding
+  ledger [PANE] [-n N] [--verify]
+                                Print a pane's hash-chained lease ledger (JSONL).
+                                  --verify walks the chain and names the first break.
+                                  A closed pane's ledger is readable by literal id.
   interrupt [PANE]              Interrupt an agent pane's current turn
                                   (agent panes only; for shells send a Ctrl-C)
   attach [PANE]                 Stream a pane's output (alias: pane attach)
@@ -14797,7 +17574,8 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   Pass a file path or an inline JSON string starting with {
   shutdown [--all]              Stop this workspace's daemon (or every daemon)
 
-Read-only commands (panes, status, attach, logs, wait, snapshot, find, agent, shutdown)
+Read-only commands (panes, status, attach, logs, wait, snapshot, find, agent, lease
+status, ledger, shutdown)
 need a running daemon; workspaces and daemons only inspect local state (they neither
 need nor start one); the other commands start a daemon on demand.
 
@@ -14989,6 +17767,10 @@ pub fn run() {
             send_agent_message,
             agent_approval,
             interrupt_agent,
+            client_holder,
+            take_lease,
+            release_lease,
+            lease_status,
             install_update,
             ui_smoke_enabled,
             complete_ui_smoke
@@ -16034,6 +18816,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             data_dir.join(WORKSPACE_FILE),
@@ -16385,6 +19168,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         let registry = PaneRegistry::from_persisted(persisted, "/tmp/x".to_string());
         let snapshot = registry.snapshot();
@@ -16421,6 +19205,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         let mut registry = PaneRegistry::from_persisted(persisted, "/tmp/x".to_string());
         let snapshot = registry.snapshot();
@@ -18549,6 +21334,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             dir.path().join(WORKSPACE_FILE),
@@ -20160,6 +22946,9 @@ mod tests {
             theme: Some(json!({ "name": "dark" })),
             idle_shutdown_secs: Some(30),
             restore_policy: Some("restore_on_demand".to_string()),
+            lease_policy: None,
+            agent_probe_interval_ms: None,
+            kranz_bin: None,
             agent_permission_mode: Some("manual".to_string()),
             agent_claude_bin: Some("/opt/claude/bin/claude".to_string()),
             agent_droid_bin: Some("/opt/factory/bin/droid".to_string()),
@@ -21957,7 +24746,12 @@ mod tests {
             Self::spawn_with_cwd(config, PathBuf::from("/tmp/sgian-itest"))
         }
 
-        fn spawn_with_cwd(config: Config, cwd: PathBuf) -> Self {
+        fn spawn_with_cwd(mut config: Config, cwd: PathBuf) -> Self {
+            // (M3b) Never run the real `claude agents --json` from a test
+            // daemon unless the test opts in explicitly.
+            if config.agent_probe_interval_ms.is_none() {
+                config.agent_probe_interval_ms = Some(0);
+            }
             // Reset the process-global shutdown flag: run_daemon's loop checks it,
             // and a prior integration test (or signal) may have left it set. The
             // per-server `shutdown` AtomicBool drives the actual exit; this static
@@ -25272,6 +28066,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -25903,9 +28698,23 @@ mod tests {
             .expect("acquire should return the lock file");
         assert!(daemon_lock_is_held(&socket_path));
 
-        // Released: free again.
+        // Released: free again. Another test thread may be mid-fork (a
+        // subprocess spawn): its child holds a duplicate of our lock fd until
+        // it execs, which keeps the flock alive for a few microseconds past
+        // the drop, so give the release a bounded moment.
         drop(lock);
-        assert!(!daemon_lock_is_held(&socket_path));
+        let released = (0..200).any(|_| {
+            if daemon_lock_is_held(&socket_path) {
+                thread::sleep(Duration::from_millis(5));
+                false
+            } else {
+                true
+            }
+        });
+        assert!(
+            released,
+            "the daemon lock must be free once its file is dropped"
+        );
     }
 
     /// H4: with the workspace flock HELD (a live-but-wedged daemon) and ping
@@ -26774,6 +29583,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -26823,6 +29633,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -26865,6 +29676,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -26919,6 +29731,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -27294,6 +30107,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             dir.path().join(WORKSPACE_FILE),
@@ -27323,6 +30137,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             dir.path().join(WORKSPACE_FILE),
@@ -27362,6 +30177,7 @@ mod tests {
             agents_v2: HashMap::new(),
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
+            leases: HashMap::new(),
         };
         fs::write(
             dir.path().join(WORKSPACE_FILE),
@@ -31436,5 +34252,1197 @@ exit 0
             agent_bin_display(&AgentBinPlan::NotFound),
             "claude (not found)"
         );
+    }
+
+    // ----- Keyboard lease predicates, ledger chain, ctl parsing, IPC round trip -----
+    // docs/design/keyboard-lease-and-ledger.md
+
+    fn held_by(holder: &str) -> HeldLease {
+        HeldLease::new(holder, 1_000)
+    }
+
+    #[test]
+    fn lease_take_is_fresh_when_unheld_and_idempotent_for_holder() {
+        assert_eq!(can_take(None, "alice", false, None), Ok(TakeOutcome::Fresh));
+        let held = held_by("alice");
+        assert_eq!(
+            can_take(Some(&held), "alice", false, None),
+            Ok(TakeOutcome::AlreadyHeld)
+        );
+        // Force from the current holder is still just idempotent.
+        assert_eq!(
+            can_take(Some(&held), "alice", true, Some("why")),
+            Ok(TakeOutcome::AlreadyHeld)
+        );
+    }
+
+    #[test]
+    fn lease_take_against_another_holder_needs_force_and_why() {
+        let held = held_by("alice");
+        let refused = can_take(Some(&held), "bob", false, None).expect_err("refused");
+        assert!(refused.contains("held by alice"), "{refused}");
+        assert!(refused.contains("--force"), "{refused}");
+        let no_why = can_take(Some(&held), "bob", true, None).expect_err("needs why");
+        assert!(no_why.contains("--why"), "{no_why}");
+        let blank_why = can_take(Some(&held), "bob", true, Some("  ")).expect_err("blank why");
+        assert!(blank_why.contains("--why"), "{blank_why}");
+        assert_eq!(
+            can_take(Some(&held), "bob", true, Some("alice is away")),
+            Ok(TakeOutcome::Revoking {
+                previous: "alice".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn lease_release_requires_the_holder() {
+        assert!(can_release(None, "alice").is_err());
+        let held = held_by("alice");
+        assert_eq!(can_release(Some(&held), "alice"), Ok(()));
+        let wrong = can_release(Some(&held), "bob").expect_err("not the holder");
+        assert!(wrong.contains("held by alice, not bob"), "{wrong}");
+    }
+
+    #[test]
+    fn lease_write_gate_by_policy() {
+        // open: unheld accepts anyone (attributed or not)
+        assert_eq!(can_write(LeasePolicy::Open, None, None), Ok(()));
+        assert_eq!(can_write(LeasePolicy::Open, None, Some("bob")), Ok(()));
+        // required: unheld refuses everyone
+        let refused = can_write(LeasePolicy::Required, None, Some("bob")).expect_err("unheld");
+        assert!(refused.contains("unheld"), "{refused}");
+        // held: only the holder, under either policy
+        let held = held_by("alice");
+        for policy in [LeasePolicy::Open, LeasePolicy::Required] {
+            assert_eq!(can_write(policy, Some(&held), Some("alice")), Ok(()));
+            assert!(can_write(policy, Some(&held), None).is_err());
+            let other = can_write(policy, Some(&held), Some("bob")).expect_err("other");
+            assert!(other.contains("held by alice"), "{other}");
+        }
+    }
+
+    #[test]
+    fn holder_and_note_validation() {
+        assert_eq!(validate_holder("  craig@mbp "), Ok("craig@mbp".to_string()));
+        assert!(validate_holder("").is_err());
+        assert!(validate_holder("two words").is_err());
+        assert!(validate_holder("tab\there").is_err());
+        assert!(validate_holder("ünïcode").is_err());
+        assert!(validate_holder(&"x".repeat(HOLDER_MAX_LEN + 1)).is_err());
+        assert_eq!(
+            validate_bounded_text(" done\nnext: run tests ", "note", 64),
+            Ok("done\nnext: run tests".to_string())
+        );
+        assert!(validate_bounded_text("   ", "note", 64).is_err());
+        assert!(validate_bounded_text("bell\u{7}", "note", 64).is_err());
+        assert!(validate_bounded_text(&"n".repeat(65), "note", 64).is_err());
+    }
+
+    #[test]
+    fn lease_policy_config_validation() {
+        let mut config = Config::default();
+        assert_eq!(config.lease_policy_effective(), LeasePolicy::Open);
+        config.lease_policy = Some("required".to_string());
+        assert!(config.validate().is_ok());
+        assert_eq!(config.lease_policy_effective(), LeasePolicy::Required);
+        config.lease_policy = Some("readonly".to_string());
+        let error = config.validate().expect_err("unknown policy");
+        assert!(error.contains("lease_policy"), "{error}");
+        // The workspace layer overrides the global one, like restore_policy.
+        let global = Config {
+            lease_policy: Some("open".to_string()),
+            ..Config::default()
+        };
+        let workspace = Config {
+            lease_policy: Some("required".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            global.overlay(workspace).lease_policy_effective(),
+            LeasePolicy::Required
+        );
+    }
+
+    #[test]
+    fn canonical_json_sorts_keys_recursively() {
+        let value = json!({"z": {"b": 1, "a": [{"y": 2, "x": 1}]}, "a": 0});
+        assert_eq!(
+            canonical_json(&value),
+            r#"{"a":0,"z":{"a":[{"x":1,"y":2}],"b":1}}"#
+        );
+    }
+
+    #[test]
+    fn ledger_chain_appends_verifies_and_detects_tampering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut heads = HashMap::new();
+        let first = ledger_append(
+            dir.path(),
+            &mut heads,
+            "pane-1",
+            "lease.taken",
+            json!({"holder": "alice"}),
+            true,
+        )
+        .expect("append 1");
+        assert_eq!(first.seq, 1);
+        assert_eq!(first.prev, "");
+        assert_eq!(first.h.len(), 64);
+        let second = ledger_append(
+            dir.path(),
+            &mut heads,
+            "pane-1",
+            "lease.released",
+            json!({"holder": "alice", "note": "done"}),
+            true,
+        )
+        .expect("append 2");
+        assert_eq!(second.seq, 2);
+        assert_eq!(second.prev, first.h);
+        // A fresh head cache re-seeds from disk and continues the chain.
+        let mut fresh_heads = HashMap::new();
+        let third = ledger_append(
+            dir.path(),
+            &mut fresh_heads,
+            "pane-1",
+            "lease.taken",
+            json!({"holder": "bob"}),
+            false,
+        )
+        .expect("append 3");
+        assert_eq!(third.seq, 3);
+        assert_eq!(third.prev, second.h);
+
+        let path = ledger_path(dir.path(), "pane-1");
+        let summary = ledger_verify(&path).expect("chain verifies");
+        assert_eq!(summary.records, 3);
+        assert_eq!(summary.head, third.h);
+
+        // Flip the note inside record 2: the hash no longer matches, and the
+        // verifier names that line.
+        let original = fs::read_to_string(&path).expect("read");
+        let tampered = original.replacen(r#""note":"done""#, r#""note":"dome""#, 1);
+        assert_ne!(original, tampered, "fixture must contain the note");
+        fs::write(&path, &tampered).expect("write tampered");
+        let broken = ledger_verify(&path).expect_err("tamper detected");
+        assert_eq!(broken.line, 2);
+        assert_eq!(broken.seq, Some(2));
+        assert!(broken.reason.contains("hash mismatch"), "{}", broken.reason);
+
+        // Deleting a middle record breaks the sequence at the next line.
+        let mut lines: Vec<&str> = original.lines().collect();
+        lines.remove(1);
+        fs::write(&path, format!("{}\n", lines.join("\n"))).expect("write gap");
+        let gap = ledger_verify(&path).expect_err("gap detected");
+        assert_eq!(gap.line, 2);
+        assert!(gap.reason.contains("sequence 3 where 2"), "{}", gap.reason);
+
+        // Tail reads are bounded and tolerate a torn last line.
+        fs::write(&path, format!("{original}{{\"seq\":4,\"tor")).expect("write torn");
+        let tail = read_ledger_tail(&path, 2);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0]["seq"], json!(2));
+        assert_eq!(tail[1]["seq"], json!(3));
+        assert_eq!(read_ledger_tail(&path, 0).len(), 3);
+    }
+
+    #[test]
+    fn ledger_hash_depends_on_version_prefix_and_prev() {
+        let body = r#"{"a":1}"#;
+        let genesis = ledger_hash("", body);
+        let chained = ledger_hash("abc", body);
+        assert_ne!(genesis, chained);
+        use sha2::Digest;
+        let mut plain = sha2::Sha256::new();
+        plain.update(format!("\n{body}").as_bytes());
+        assert_ne!(
+            genesis,
+            hex_encode(&plain.finalize()),
+            "the version prefix must be inside the hash input"
+        );
+    }
+
+    #[test]
+    fn parse_lease_args_shapes() {
+        let status = parse_lease_args(&[]).expect("bare");
+        assert_eq!(status.verb, LeaseVerb::Status);
+        assert_eq!(status.pane_ref, "active");
+        let take = parse_lease_args(&args(&[
+            "take", "pane-2", "--as", "ci", "--force", "--why", "stuck",
+        ]))
+        .expect("take");
+        assert_eq!(take.verb, LeaseVerb::Take);
+        assert_eq!(take.pane_ref, "pane-2");
+        assert_eq!(take.holder.as_deref(), Some("ci"));
+        assert!(take.force);
+        assert_eq!(take.why.as_deref(), Some("stuck"));
+        let release =
+            parse_lease_args(&args(&["release", "-m", "answered the prompt"])).expect("release");
+        assert_eq!(release.verb, LeaseVerb::Release);
+        assert_eq!(release.note.as_deref(), Some("answered the prompt"));
+        let missing_note =
+            parse_lease_args(&args(&["release", "pane-1"])).expect_err("note required");
+        assert!(missing_note.contains("-m NOTE"), "{missing_note}");
+        assert!(parse_lease_args(&args(&["take", "a", "b"])).is_err());
+        assert!(parse_lease_args(&args(&["status", "--force"])).is_err());
+        assert!(parse_lease_args(&args(&["take", "--as", "bad holder"])).is_err());
+    }
+
+    #[test]
+    fn parse_as_flag_stops_at_double_dash() {
+        let (holder, rest) =
+            parse_as_flag(&args(&["pane-1", "--as", "ci", "echo", "hi"])).expect("parse");
+        assert_eq!(holder.as_deref(), Some("ci"));
+        assert_eq!(rest, args(&["pane-1", "echo", "hi"]));
+        let (holder, rest) =
+            parse_as_flag(&args(&["pane-1", "--", "--as", "literal"])).expect("parse");
+        assert_eq!(holder, None);
+        assert_eq!(rest, args(&["pane-1", "--", "--as", "literal"]));
+        let (holder, _) = parse_as_flag(&args(&["--as=ops", "pane-1", "x"])).expect("parse");
+        assert_eq!(holder.as_deref(), Some("ops"));
+        assert!(parse_as_flag(&args(&["pane-1", "--as"])).is_err());
+    }
+
+    #[test]
+    fn parse_ledger_args_shapes() {
+        let parsed = parse_ledger_args(&args(&["pane-3", "-n", "5", "--verify"])).expect("parse");
+        assert_eq!(parsed.pane_ref, "pane-3");
+        assert_eq!(parsed.limit, 5);
+        assert!(parsed.verify);
+        assert!(parse_ledger_args(&args(&["-n", "x"])).is_err());
+        assert!(parse_ledger_args(&args(&["a", "b"])).is_err());
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn lease_round_trip_over_ipc_gates_input_and_writes_ledger() {
+        let daemon = TestDaemon::spawn(Config::default());
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        assert!(initial.leases.is_empty(), "fresh workspace has no leases");
+
+        // Unheld under `open`: the legacy unattributed write still works.
+        client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: "".to_string(),
+            })
+            .expect("unheld write accepted");
+
+        let taken: LeaseInfo = client
+            .request(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect("take");
+        assert_eq!(taken.holder.as_deref(), Some("alice"));
+        assert_eq!(taken.policy, "open");
+
+        // Unattributed and other-holder writes are refused; the holder's go through.
+        let refused = client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: "x".to_string(),
+            })
+            .expect_err("unattributed write refused while held");
+        assert!(refused.contains("held by alice"), "{refused}");
+        let refused = client
+            .request::<CommandOk>(DaemonRequest::SendInputAs {
+                pane_id: pane_id.clone(),
+                input: "x".to_string(),
+                holder: "bob".to_string(),
+            })
+            .expect_err("bob refused");
+        assert!(refused.contains("held by alice"), "{refused}");
+        client
+            .request::<CommandOk>(DaemonRequest::SendInputAs {
+                pane_id: pane_id.clone(),
+                input: "echo hi\r".to_string(),
+                holder: "alice".to_string(),
+            })
+            .expect("holder write accepted");
+        let broadcast: Value = client
+            .request(DaemonRequest::Broadcast {
+                input: "".to_string(),
+            })
+            .expect("broadcast");
+        assert!(
+            !broadcast["panes"]
+                .as_array()
+                .expect("panes array")
+                .iter()
+                .any(|id| id == &json!(pane_id)),
+            "broadcast skips a held pane: {broadcast}"
+        );
+
+        let status: LeaseInfo = client
+            .request(DaemonRequest::LeaseStatus {
+                pane_id: pane_id.clone(),
+            })
+            .expect("status");
+        assert_eq!(status.holder.as_deref(), Some("alice"));
+        assert_eq!(status.writes, 1);
+        assert_eq!(status.bytes_typed, "echo hi\r".len() as u64);
+        assert_eq!(status.refused_writes, 2);
+        let snapshot: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap while held");
+        assert_eq!(
+            snapshot
+                .leases
+                .get(&pane_id)
+                .and_then(|info| info.holder.clone()),
+            Some("alice".to_string())
+        );
+        let persisted: PersistedWorkspace = serde_json::from_str(
+            &fs::read_to_string(daemon.data_dir.path().join(WORKSPACE_FILE))
+                .expect("workspace.json"),
+        )
+        .expect("parse workspace.json");
+        assert_eq!(
+            persisted
+                .leases
+                .get(&pane_id)
+                .map(|held| held.holder.as_str()),
+            Some("alice")
+        );
+
+        // Contention: bob needs --force and a reason.
+        let contended = client
+            .request::<LeaseInfo>(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "bob".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect_err("contended take refused");
+        assert!(contended.contains("held by alice"), "{contended}");
+        let forced: LeaseInfo = client
+            .request(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "bob".to_string(),
+                force: true,
+                why: Some("alice went home".to_string()),
+            })
+            .expect("forced take");
+        assert_eq!(forced.holder.as_deref(), Some("bob"));
+        assert_eq!(forced.writes, 0, "counters restart with the new holder");
+
+        // Release: mandatory note, only the holder.
+        let empty_note = client
+            .request::<LeaseInfo>(DaemonRequest::ReleaseLease {
+                pane_id: pane_id.clone(),
+                holder: "bob".to_string(),
+                note: "   ".to_string(),
+            })
+            .expect_err("empty note refused");
+        assert!(empty_note.contains("hand-back note"), "{empty_note}");
+        let wrong_holder = client
+            .request::<LeaseInfo>(DaemonRequest::ReleaseLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                note: "not mine".to_string(),
+            })
+            .expect_err("alice no longer holds it");
+        assert!(
+            wrong_holder.contains("held by bob, not alice"),
+            "{wrong_holder}"
+        );
+        let released: LeaseInfo = client
+            .request(DaemonRequest::ReleaseLease {
+                pane_id: pane_id.clone(),
+                holder: "bob".to_string(),
+                note: "answered the y/N; agent can carry on".to_string(),
+            })
+            .expect("release");
+        assert_eq!(released.holder, None);
+        let after: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap after release");
+        assert!(
+            after.leases.is_empty(),
+            "released panes leave the snapshot map"
+        );
+
+        // The ledger has the whole story, in order, and verifies.
+        let path = ledger_path(&daemon.data_dir.path().join(LEDGER_DIR), &pane_id);
+        let summary = ledger_verify(&path).expect("ledger verifies");
+        assert_eq!(summary.records, 4);
+        let kinds: Vec<String> = read_ledger_tail(&path, 0)
+            .iter()
+            .map(|record| record["type"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "lease.taken",
+                "lease.revoked",
+                "lease.taken",
+                "lease.released"
+            ]
+        );
+        let records = read_ledger_tail(&path, 0);
+        assert_eq!(records[1]["payload"]["holder"], json!("alice"));
+        assert_eq!(records[1]["payload"]["by"], json!("bob"));
+        assert_eq!(records[1]["payload"]["why"], json!("alice went home"));
+        assert_eq!(records[1]["payload"]["refused_writes"], json!(2));
+        assert_eq!(records[2]["payload"]["previous_holder"], json!("alice"));
+        assert_eq!(
+            records[3]["payload"]["note"],
+            json!("answered the y/N; agent can carry on")
+        );
+
+        // Closing a held pane revokes the lease but keeps the ledger.
+        client
+            .request::<LeaseInfo>(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect("retake");
+        let created: Pane = client
+            .request(DaemonRequest::CreatePane {
+                title: None,
+                profile: None,
+            })
+            .expect("second pane so the first can close");
+        let _ = created;
+        client
+            .request::<Value>(DaemonRequest::ClosePane {
+                pane_id: pane_id.clone(),
+            })
+            .expect("close held pane");
+        let summary = ledger_verify(&path).expect("ledger survives close");
+        assert_eq!(summary.records, 6);
+        let last = read_ledger_tail(&path, 1).remove(0);
+        assert_eq!(last["type"], json!("lease.revoked"));
+        assert_eq!(last["payload"]["why"], json!("pane closed"));
+        daemon.shutdown();
+    }
+
+    #[test]
+    fn lease_required_policy_refuses_unheld_writes() {
+        let daemon = TestDaemon::spawn(Config {
+            lease_policy: Some("required".to_string()),
+            ..Config::default()
+        });
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        let refused = client
+            .request::<CommandOk>(DaemonRequest::SendInputAs {
+                pane_id: pane_id.clone(),
+                input: "x".to_string(),
+                holder: "alice".to_string(),
+            })
+            .expect_err("unheld write refused under required");
+        assert!(refused.contains("unheld"), "{refused}");
+        let status: LeaseInfo = client
+            .request(DaemonRequest::LeaseStatus {
+                pane_id: pane_id.clone(),
+            })
+            .expect("status");
+        assert_eq!(status.policy, "required");
+        assert_eq!(status.holder, None);
+        client
+            .request::<LeaseInfo>(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect("take");
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        client
+            .request::<CommandOk>(DaemonRequest::SendInputAs {
+                pane_id,
+                input: "".to_string(),
+                holder: "alice".to_string(),
+            })
+            .expect("holder write accepted");
+        daemon.shutdown();
+    }
+
+    #[test]
+    fn router_ledgers_attention_transitions_and_pane_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let router = OutputRouter::new(dir.path().join("scrollback"));
+        let ledger_dir = dir.path().join(LEDGER_DIR);
+        fs::create_dir_all(&ledger_dir).expect("ledger dir");
+        router.set_ledger(Arc::new(Mutex::new(LedgerSink::new(ledger_dir.clone()))));
+
+        router.apply_agent_classification("pane-7", CLAUDE_WORKING_SCREEN);
+        router.apply_agent_classification("pane-7", CLAUDE_WORKING_SCREEN);
+        router.apply_agent_classification("pane-7", CLAUDE_IDLE_SCREEN);
+        router.clear_agent_attention("pane-7");
+        router.emit_pane_ended("pane-7", Some(0));
+
+        let path = ledger_path(&ledger_dir, "pane-7");
+        let summary = ledger_verify(&path).expect("router notes chain");
+        assert_eq!(summary.records, 4);
+        let records = read_ledger_tail(&path, 0);
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|record| record["type"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "attention.changed",
+                "attention.changed",
+                "attention.changed",
+                "pane.ended"
+            ]
+        );
+        assert_eq!(records[0]["payload"]["from"], Value::Null);
+        assert_eq!(records[0]["payload"]["to"], json!("working"));
+        assert_eq!(records[0]["payload"]["evidence"], json!("screen"));
+        assert_eq!(records[1]["payload"]["from"], json!("working"));
+        assert_eq!(records[1]["payload"]["to"], json!("idle"));
+        assert_eq!(records[2]["payload"]["to"], Value::Null);
+        assert_eq!(records[2]["payload"]["evidence"], json!("process ended"));
+        assert_eq!(records[3]["payload"]["exit_code"], json!(0));
+        // A bare router (no sink) stays silent rather than failing.
+        let silent = OutputRouter::new(dir.path().join("scrollback2"));
+        silent.apply_agent_classification("pane-8", CLAUDE_WORKING_SCREEN);
+        assert!(!ledger_path(&ledger_dir, "pane-8").exists());
+    }
+
+    #[test]
+    fn parse_agent_args_watch_forms() {
+        let parsed = parse_agent_args(&agent_args(&["--watch"])).expect("bare watch");
+        assert!(parsed.watch);
+        assert!(!parsed.pane_given);
+        assert_eq!(parsed.mark, None);
+        let parsed = parse_agent_args(&agent_args(&["pane-3", "--watch"])).expect("pane watch");
+        assert!(parsed.watch);
+        assert!(parsed.pane_given);
+        assert_eq!(parsed.pane_ref, "pane-3");
+        let parsed = parse_agent_args(&agent_args(&["--watch", "pane-3"])).expect("flag first");
+        assert!(parsed.pane_given);
+        assert_eq!(parsed.pane_ref, "pane-3");
+        let err = parse_agent_args(&agent_args(&["pane-3", "on", "--watch"]))
+            .expect_err("watch excludes marks");
+        assert!(err.contains("--watch"), "{err}");
+        let plain = parse_agent_args(&agent_args(&["pane-3"])).expect("plain");
+        assert!(!plain.watch);
+        assert!(plain.pane_given);
+    }
+
+    #[test]
+    fn format_watch_event_lines_and_json() {
+        let state = DaemonEvent::AgentState {
+            pane_id: "pane-1".to_string(),
+            agent: Some("claude".to_string()),
+            attention: Some(AgentAttention::NeedsInput),
+        };
+        assert_eq!(
+            format_watch_event(&state, false).as_deref(),
+            Some("pane-1\tagent_state\tclaude\tneeds_input")
+        );
+        let json_line = format_watch_event(&state, true).expect("json");
+        let parsed: Value = serde_json::from_str(&json_line).expect("valid json");
+        assert_eq!(parsed["event"], json!("agent_state"));
+        assert_eq!(parsed["attention"], json!("needs_input"));
+        let lease = DaemonEvent::LeaseState {
+            pane_id: "pane-1".to_string(),
+            transition: LeaseTransition::Taken,
+            holder: Some("alice".to_string()),
+            since_ms: Some(1),
+            note: None,
+        };
+        assert_eq!(
+            format_watch_event(&lease, false).as_deref(),
+            Some("pane-1\tlease_taken\talice")
+        );
+        let ended = DaemonEvent::PaneEnded {
+            pane_id: "pane-1".to_string(),
+            exit_code: None,
+        };
+        assert_eq!(
+            format_watch_event(&ended, false).as_deref(),
+            Some("pane-1\tpane_ended\t-")
+        );
+        let output = DaemonEvent::PtyOutput {
+            pane_id: "pane-1".to_string(),
+            data: "x".to_string(),
+        };
+        assert_eq!(format_watch_event(&output, false), None);
+        assert_eq!(watch_event_pane(&output), None);
+        assert_eq!(watch_event_pane(&ended), Some("pane-1"));
+    }
+
+    #[test]
+    fn probe_attention_mapping_and_parent_walk() {
+        let entry = |status: &str, waiting: Option<&str>, state: Option<&str>| AgentProbeEntry {
+            pid: Some(1),
+            status: Some(status.to_string()),
+            waiting_for: waiting.map(str::to_string),
+            state: state.map(str::to_string),
+        };
+        assert_eq!(
+            attention_from_probe(&entry("busy", None, None)),
+            Some(AgentAttention::Working)
+        );
+        assert_eq!(
+            attention_from_probe(&entry("idle", None, None)),
+            Some(AgentAttention::Idle)
+        );
+        assert_eq!(
+            attention_from_probe(&entry("busy", Some("permission prompt"), None)),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(
+            attention_from_probe(&entry("waiting", None, None)),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(
+            attention_from_probe(&entry("", None, Some("blocked"))),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(attention_from_probe(&entry("weird", None, None)), None);
+        let parsed: Vec<AgentProbeEntry> = serde_json::from_str(
+            r#"[{"pid":300,"cwd":"/w","kind":"interactive","sessionId":"s","name":"n","status":"busy","extra":1}]"#,
+        )
+        .expect("tolerant parse");
+        assert_eq!(parsed[0].pid, Some(300));
+        assert_eq!(parsed[0].status.as_deref(), Some("busy"));
+
+        let parents = parse_process_table("  300   200\n200 100\n999 1\nbad line\n").parent;
+        assert_eq!(parents.get(&300), Some(&200));
+        assert_eq!(parents.len(), 3);
+        let pane_pids = vec![
+            ("pane-1".to_string(), 100u32),
+            ("pane-2".to_string(), 500u32),
+        ];
+        let entries = vec![
+            AgentProbeEntry {
+                pid: Some(300),
+                status: Some("busy".to_string()),
+                ..AgentProbeEntry::default()
+            },
+            AgentProbeEntry {
+                pid: Some(999),
+                status: Some("busy".to_string()),
+                ..AgentProbeEntry::default()
+            },
+            AgentProbeEntry {
+                pid: Some(500),
+                status: Some("idle".to_string()),
+                ..AgentProbeEntry::default()
+            },
+        ];
+        let mapped = map_probe_entries(&entries, &parents, &pane_pids);
+        assert_eq!(mapped.get("pane-1"), Some(&AgentAttention::Working));
+        assert_eq!(mapped.get("pane-2"), Some(&AgentAttention::Idle));
+        assert_eq!(mapped.len(), 2, "an unrelated session maps nowhere");
+        // Two sessions in one pane: the louder state wins.
+        let two = vec![
+            AgentProbeEntry {
+                pid: Some(300),
+                status: Some("idle".to_string()),
+                ..AgentProbeEntry::default()
+            },
+            AgentProbeEntry {
+                pid: Some(200),
+                status: Some("busy".to_string()),
+                waiting_for: Some("input needed".to_string()),
+                ..AgentProbeEntry::default()
+            },
+        ];
+        assert_eq!(
+            map_probe_entries(&two, &parents, &pane_pids).get("pane-1"),
+            Some(&AgentAttention::NeedsInput)
+        );
+    }
+
+    #[test]
+    fn official_attention_outranks_the_screen_until_it_expires() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let router = OutputRouter::new(dir.path().join("scrollback"));
+        let ledger_dir = dir.path().join(LEDGER_DIR);
+        fs::create_dir_all(&ledger_dir).expect("ledger dir");
+        router.set_ledger(Arc::new(Mutex::new(LedgerSink::new(ledger_dir.clone()))));
+
+        router.apply_official_attention(
+            "pane-9",
+            "claude",
+            AgentAttention::NeedsInput,
+            Duration::from_millis(120),
+        );
+        assert_eq!(
+            router.agent_state("pane-9").attention,
+            Some(AgentAttention::NeedsInput)
+        );
+        // The screen says working, but the official reading is fresh.
+        router.apply_agent_classification("pane-9", CLAUDE_WORKING_SCREEN);
+        assert_eq!(
+            router.agent_state("pane-9").attention,
+            Some(AgentAttention::NeedsInput)
+        );
+        thread::sleep(Duration::from_millis(150));
+        router.apply_agent_classification("pane-9", CLAUDE_WORKING_SCREEN);
+        assert_eq!(
+            router.agent_state("pane-9").attention,
+            Some(AgentAttention::Working),
+            "the heuristic resumes once the official reading expires"
+        );
+        let records = read_ledger_tail(&ledger_path(&ledger_dir, "pane-9"), 0);
+        assert_eq!(records[0]["payload"]["evidence"], json!("claude-agents"));
+        assert_eq!(records[1]["payload"]["evidence"], json!("screen"));
+        // The session vanishing from the listing clears the badge (not manual marks).
+        assert!(router.apply_official_attention(
+            "pane-9",
+            "claude",
+            AgentAttention::Idle,
+            Duration::from_secs(1),
+        ));
+        assert!(!router.apply_official_attention(
+            "pane-9",
+            "claude",
+            AgentAttention::Idle,
+            Duration::from_secs(1),
+        ));
+        router.clear_official_attention("pane-9");
+        assert_eq!(router.agent_state("pane-9").agent, None);
+        let last = read_ledger_tail(&ledger_path(&ledger_dir, "pane-9"), 1).remove(0);
+        assert_eq!(
+            last["payload"]["evidence"],
+            json!("claude-agents: session gone")
+        );
+        router.set_manual_agent("pane-9", Some("claude".to_string()));
+        router.apply_official_attention(
+            "pane-9",
+            "claude",
+            AgentAttention::Working,
+            Duration::from_secs(1),
+        );
+        router.clear_official_attention("pane-9");
+        assert_eq!(
+            router.agent_state("pane-9").agent.as_deref(),
+            Some("claude"),
+            "a manual mark survives the session going away"
+        );
+        router.set_manual_agent("pane-9", None);
+        // An ended pane ignores official readings (a dead process has no state).
+        router.clear_agent_attention("pane-9");
+        router.apply_official_attention(
+            "pane-9",
+            "claude",
+            AgentAttention::Working,
+            Duration::from_secs(1),
+        );
+        assert_eq!(router.agent_state("pane-9").attention, None);
+    }
+
+    #[test]
+    fn reconcile_probe_rounds_clears_after_two_misses_or_close() {
+        let mut previous = HashMap::new();
+        let mut mapped = HashMap::new();
+        mapped.insert("pane-1".to_string(), AgentAttention::Idle);
+        let live = vec!["pane-1".to_string(), "pane-2".to_string()];
+        assert!(reconcile_probe_rounds(&mut previous, &mapped, &live).is_empty());
+        assert_eq!(previous.get("pane-1"), Some(&0));
+        // One miss: keep, count it.
+        let none = HashMap::new();
+        assert!(reconcile_probe_rounds(&mut previous, &none, &live).is_empty());
+        assert_eq!(previous.get("pane-1"), Some(&1));
+        // Reappearing resets the count.
+        assert!(reconcile_probe_rounds(&mut previous, &mapped, &live).is_empty());
+        assert_eq!(previous.get("pane-1"), Some(&0));
+        // Two misses in a row: clear.
+        assert!(reconcile_probe_rounds(&mut previous, &none, &live).is_empty());
+        assert_eq!(
+            reconcile_probe_rounds(&mut previous, &none, &live),
+            vec!["pane-1".to_string()]
+        );
+        assert!(previous.is_empty());
+        // A pane that is no longer live clears immediately.
+        reconcile_probe_rounds(&mut previous, &mapped, &live);
+        assert_eq!(
+            reconcile_probe_rounds(&mut previous, &none, &["pane-2".to_string()]),
+            vec!["pane-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn kranz_worker_detection_and_state_mapping() {
+        let table = parse_process_table(
+            "  300   200 /usr/local/bin/kranz --repo /w run\n200 100 -zsh\n400 100 kranz status\n500 1 /x/kranz.exe work\n999 1 kranz\n",
+        );
+        assert_eq!(table.parent.get(&300), Some(&200));
+        assert_eq!(table.args.get(&200).map(String::as_str), Some("-zsh"));
+        assert!(is_kranz_worker_command(
+            "/usr/local/bin/kranz --repo /w run"
+        ));
+        assert!(is_kranz_worker_command("kranz.exe work"));
+        assert!(!is_kranz_worker_command("kranz status"));
+        assert!(!is_kranz_worker_command("/bin/kranzy run"));
+        assert!(!is_kranz_worker_command(""));
+        let pane_pids = vec![
+            ("pane-1".to_string(), 100u32),
+            ("pane-2".to_string(), 500u32),
+        ];
+        let workers = find_kranz_panes(&table, &pane_pids);
+        assert_eq!(workers.get("pane-1"), Some(&300));
+        assert_eq!(workers.get("pane-2"), Some(&500));
+        assert_eq!(workers.len(), 2);
+
+        assert_eq!(
+            kranz_attention_from_state(&json!({"status": "running"})),
+            Some(AgentAttention::Working)
+        );
+        assert_eq!(
+            kranz_attention_from_state(
+                &json!({"status": "running", "pendingQuestions": [{"id": "q1"}]})
+            ),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(
+            kranz_attention_from_state(
+                &json!({"status": "running", "pendingGrantRequest": {"id": "g1"}})
+            ),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(
+            kranz_attention_from_state(&json!({"status": "paused"})),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(
+            kranz_attention_from_state(&json!({"status": "complete", "pendingQuestions": []})),
+            Some(AgentAttention::Idle)
+        );
+        assert_eq!(
+            kranz_attention_from_state(&json!({"status": "weird"})),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_kranz_args_shapes() {
+        let status = parse_kranz_args(&[]).expect("bare");
+        assert_eq!(status.verb, KranzVerb::Status);
+        let bind = parse_kranz_args(&args(&["bind", "pane-2", "--repo", "/repo"])).expect("bind");
+        assert_eq!(bind.verb, KranzVerb::Bind);
+        assert_eq!(bind.pane_ref, "pane-2");
+        assert_eq!(bind.repo.as_deref(), Some("/repo"));
+        let unbind = parse_kranz_args(&args(&["unbind"])).expect("unbind");
+        assert_eq!(unbind.verb, KranzVerb::Unbind);
+        assert_eq!(unbind.pane_ref, "active");
+        assert!(parse_kranz_args(&args(&["status", "pane-1"])).is_err());
+        assert!(parse_kranz_args(&args(&["unbind", "--repo", "/x"])).is_err());
+        assert!(parse_kranz_args(&args(&["bind", "--repo"])).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn released_note_is_mirrored_to_a_bound_kranz_mission() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("kranz-args.txt");
+        let script = dir.path().join("kranz");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                record.display()
+            ),
+        )
+        .expect("write fake kranz");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let daemon = TestDaemon::spawn(Config {
+            kranz_bin: Some(script.to_string_lossy().into_owned()),
+            ..Config::default()
+        });
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        let bound: Value = client
+            .request(DaemonRequest::KranzBind {
+                pane_id: pane_id.clone(),
+                repo: Some("/tmp/mission-repo".to_string()),
+            })
+            .expect("bind");
+        assert_eq!(bound["binding"]["manual"], json!(true));
+        let listed: HashMap<String, KranzBinding> = client
+            .request(DaemonRequest::KranzBindings)
+            .expect("bindings");
+        assert_eq!(listed[&pane_id].repo, "/tmp/mission-repo");
+
+        client
+            .request::<LeaseInfo>(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect("take");
+        client
+            .request::<LeaseInfo>(DaemonRequest::ReleaseLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                note: "answered the grant; carry on".to_string(),
+            })
+            .expect("release");
+        let recorded = fs::read_to_string(&record).expect("fake kranz was invoked");
+        let argv: Vec<&str> = recorded.lines().collect();
+        assert_eq!(argv[0..3], ["--repo", "/tmp/mission-repo", "msg"]);
+        assert!(
+            argv[3].contains("alice handed back the keyboard: answered the grant; carry on"),
+            "{recorded}"
+        );
+
+        let path = ledger_path(&daemon.data_dir.path().join(LEDGER_DIR), &pane_id);
+        let kinds: Vec<String> = read_ledger_tail(&path, 0)
+            .iter()
+            .map(|record| record["type"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "kranz.bound",
+                "lease.taken",
+                "lease.released",
+                "kranz.mirrored"
+            ]
+        );
+        let mirrored = read_ledger_tail(&path, 1).remove(0);
+        assert_eq!(mirrored["payload"]["ok"], json!(true));
+        assert_eq!(mirrored["payload"]["repo"], json!("/tmp/mission-repo"));
+
+        // Unbinding stops the mirror; the ledger says so.
+        client
+            .request::<Value>(DaemonRequest::KranzUnbind {
+                pane_id: pane_id.clone(),
+            })
+            .expect("unbind");
+        let listed: HashMap<String, KranzBinding> = client
+            .request(DaemonRequest::KranzBindings)
+            .expect("bindings");
+        assert!(listed.is_empty());
+        assert_eq!(
+            read_ledger_tail(&path, 1).remove(0)["type"],
+            json!("kranz.unbound")
+        );
+        daemon.shutdown();
+    }
+
+    #[test]
+    fn inherited_session_markers_are_dropped_unless_explicit() {
+        let inherited = HashMap::from([
+            ("CLAUDECODE".to_string(), "1".to_string()),
+            ("CLAUDE_CODE_CHILD_SESSION".to_string(), "abc".to_string()),
+            ("PATH".to_string(), "/bin".to_string()),
+        ]);
+        let env = compute_spawn_env(&inherited, &[], &HashMap::new());
+        assert!(!env.contains_key("CLAUDECODE"));
+        assert!(!env.contains_key("CLAUDE_CODE_CHILD_SESSION"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+        let explicit = HashMap::from([("CLAUDECODE".to_string(), "1".to_string())]);
+        let env = compute_spawn_env(&inherited, &[], &explicit);
+        assert_eq!(env.get("CLAUDECODE").map(String::as_str), Some("1"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn process_parent_snapshot_reads_the_kernel_without_forking() {
+        let parents = process_parent_snapshot().expect("snapshot available");
+        let me = std::process::id();
+        // SAFETY: getppid has no preconditions.
+        let ppid = unsafe { libc::getppid() } as u32;
+        assert_eq!(parents.get(&me), Some(&ppid), "own pid maps to own parent");
+        assert!(parents.len() > 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_descendants_walks_the_whole_subtree() {
+        let table = parse_process_table("10 1\n20 10\n30 20\n40 10\n99 1\n");
+        let mut found = process_descendants(10, &table);
+        found.sort_unstable();
+        assert_eq!(found, vec![20, 30, 40]);
+        assert!(process_descendants(99, &table).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_pane_terminates_its_grandchildren() {
+        let daemon = TestDaemon::spawn(Config::default());
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        let marker = daemon.data_dir.path().join("grandchild.pid");
+        // A background job in an interactive shell lands in its own process
+        // group, exactly the case a shell-only kill orphans.
+        client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: format!("sleep 300 &\necho $! > '{}'\n", marker.display()),
+            })
+            .expect("start grandchild");
+        let mut grandchild: Option<u32> = None;
+        for _ in 0..200 {
+            if let Ok(text) = fs::read_to_string(&marker) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    grandchild = Some(pid);
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let grandchild = grandchild.expect("the shell reported the sleep pid");
+        // SAFETY: probing a pid we were just handed.
+        assert_eq!(unsafe { libc::kill(grandchild as libc::pid_t, 0) }, 0);
+
+        let _: Pane = client
+            .request(DaemonRequest::CreatePane {
+                title: None,
+                profile: None,
+            })
+            .expect("a second pane so the first can close");
+        client
+            .request::<Value>(DaemonRequest::ClosePane {
+                pane_id: pane_id.clone(),
+            })
+            .expect("close");
+        let mut gone = false;
+        for _ in 0..200 {
+            // SAFETY: existence probe; ESRCH (or a zombie already reaped by
+            // init) means the grandchild is gone.
+            if unsafe { libc::kill(grandchild as libc::pid_t, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !gone {
+            // SAFETY: cleanup of our own test process.
+            unsafe {
+                libc::kill(grandchild as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        daemon.shutdown();
+        assert!(gone, "the grandchild sleep must die with its pane");
+    }
+
+    #[test]
+    fn transient_pty_errors_are_classified() {
+        assert!(is_transient_pty_error(
+            "failed to openpty: Os { code: 6, kind: Uncategorized, message: \"Device not configured\" }"
+        ));
+        assert!(is_transient_pty_error(
+            "Resource temporarily unavailable (os error 35)"
+        ));
+        assert!(!is_transient_pty_error("Permission denied (os error 13)"));
+        assert!(!is_transient_pty_error(
+            "No such file or directory (os error 2)"
+        ));
+    }
+
+    #[test]
+    fn agent_probe_interval_config() {
+        let mut config = Config::default();
+        assert_eq!(
+            config.agent_probe_interval(),
+            Some(Duration::from_millis(2000))
+        );
+        config.agent_probe_interval_ms = Some(0);
+        assert_eq!(config.agent_probe_interval(), None);
+        config.agent_probe_interval_ms = Some(10);
+        assert_eq!(
+            config.agent_probe_interval(),
+            Some(Duration::from_millis(250)),
+            "a floor keeps the probe from spinning"
+        );
+        let global = Config {
+            agent_probe_interval_ms: Some(5000),
+            ..Config::default()
+        };
+        let workspace = Config {
+            agent_probe_interval_ms: Some(0),
+            ..Config::default()
+        };
+        assert_eq!(global.overlay(workspace).agent_probe_interval(), None);
+    }
+
+    #[test]
+    fn lease_survives_daemon_restart_via_workspace_json() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let cwd = PathBuf::from("/tmp/sgian-lease-restart");
+        {
+            let server = DaemonServer::with_config(
+                cwd.clone(),
+                data_dir.path().to_path_buf(),
+                Config::default(),
+            )
+            .expect("server");
+            let pane = server.lock_registry().expect("registry").create_pane(None);
+            server
+                .handle(DaemonRequest::TakeLease {
+                    pane_id: pane.id.clone(),
+                    holder: "alice".to_string(),
+                    force: false,
+                    why: None,
+                })
+                .expect("take");
+        }
+        let server =
+            DaemonServer::with_config(cwd, data_dir.path().to_path_buf(), Config::default())
+                .expect("server restarted");
+        let leases = server.lease_infos();
+        assert_eq!(leases.len(), 1);
+        let info = leases.values().next().expect("one lease");
+        assert_eq!(info.holder.as_deref(), Some("alice"));
+        // A lease for a pane that is not in the registry is not resurrected.
+        let mut persisted: PersistedWorkspace = serde_json::from_str(
+            &fs::read_to_string(data_dir.path().join(WORKSPACE_FILE)).expect("workspace.json"),
+        )
+        .expect("parse");
+        persisted
+            .leases
+            .insert("pane-999".to_string(), HeldLease::new("ghost", 1));
+        fs::write(
+            data_dir.path().join(WORKSPACE_FILE),
+            serde_json::to_string(&persisted).expect("encode"),
+        )
+        .expect("write");
+        drop(server);
+        let server = DaemonServer::with_config(
+            PathBuf::from("/tmp/sgian-lease-restart"),
+            data_dir.path().to_path_buf(),
+            Config::default(),
+        )
+        .expect("server restarted again");
+        assert_eq!(server.lease_infos().len(), 1, "ghost lease filtered");
     }
 }

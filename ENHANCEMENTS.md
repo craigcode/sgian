@@ -65,6 +65,79 @@ Shipped:
   pane/agent state, denylist-scrubbed log tail) without prompts, scrollback, or
   environment values. Scrubbing is best-effort, not a cryptographic guarantee.
 
+## 3a. Keyboard lease and session ledger
+
+Design and milestones: [docs/design/keyboard-lease-and-ledger.md](docs/design/keyboard-lease-and-ledger.md).
+
+Shipped (M1, 2026-09-13):
+
+- **Per-pane write lease in the daemon.** `take_lease` / `release_lease` /
+  `lease_status` requests, `send_input_as` for attributed input, a
+  `lease-state` event, `leases` in the bootstrap snapshot, persistence in
+  `workspace.json`, and `lease_policy` (`open` default / `required`) in config.
+- **Hash-chained ledger** at `ledger/<pane-id>.jsonl` (SHA-256 over
+  sorted-key JSON with a version prefix), fsynced per record, kept across
+  pane close. `ctl ledger --verify` names the first broken line.
+- **ctl surface**: `lease`, `lease take`, `lease release -m`, `ledger`,
+  `send --as`.
+
+Shipped (M2, 2026-09-14):
+
+- **Clients.** All three clients write as `user@host` (the `ctl` default, so
+  the operator is one principal across surfaces) via `send_input_as`, with a
+  fallback to `write_to_pane` against a pre-lease daemon. The pane header
+  shows the holder (`you` when it is this client), a refused keystroke shows a
+  transient read-only notice instead of an error, `Ctrl/Cmd+Shift+T` takes
+  (opening a why prompt when someone else holds it) and `Ctrl/Cmd+Shift+L`
+  releases with a mandatory note. Tauri: vitest; macOS: `swift test` plus the
+  live daemon round trip; Windows: compiled and exercised only by the Windows
+  CI job (no .NET toolchain on the development Mac).
+
+Shipped (M3a, 2026-09-14):
+
+- **Attention in the ledger.** Every agent-attention transition is appended
+  as `attention.changed { agent, from, to, evidence }` (`screen` today,
+  `process ended` when the pane's process exits) and every pane exit as
+  `pane.ended { exit_code }`, best-effort and unsynced (lease events stay
+  fsynced). A closed pane's ledger is its full session record.
+- **`ctl agent --watch [PANE] [--json]`.** Streams agent-state, lease and
+  pane-end transitions after a baseline line per pane, so CI, notification
+  glue, or a mission orchestrator can react to needs-input without polling.
+
+Shipped (M3b, 2026-09-14):
+
+- **Official agent signals.** On Unix the daemon polls `claude agents --json`
+  (every `agent_probe_interval_ms`, default 2000; `0` disables) and maps each
+  session to the shell pane whose child process is its ancestor. While a
+  reading is fresh it outranks screen classification, transitions are
+  ledgered with evidence `claude-agents`, and a session that disappears from
+  the listing for two rounds clears the badge (evidence
+  `claude-agents: session gone`) instead of leaving a stale "claude · idle"
+  over the shell prompt. Manual marks are untouched. Verified live against
+  an interactive Claude Code session inside a pane.
+
+Shipped (M4, lean, 2026-09-14):
+
+- **Kranz-bound panes.** A shell pane whose process tree contains a Kranz
+  worker loop (`kranz run` / `exec` / `work`) is bound to the mission at the
+  pane's cwd; `ctl kranz bind [PANE] [--repo PATH]` binds by hand and
+  `ctl kranz status` lists bindings. While bound, `kranz status --json`
+  (read-only, no lock) drives the pane's badge as an official reading
+  (`needs input` for a pending question, grant or revision, or a paused or
+  blocked mission), and a released lease's hand-back note is mirrored into
+  the mission inbox with `kranz msg`; `kranz.bound` / `kranz.mirrored` land
+  in the ledger with the outcome. This uses the Kranz CLI in the sibling
+  checkout rather than an HTTP client, so the daemon gains no async runtime;
+  the WebSocket transcript tail and message mode from the draft remain open.
+
+Open, in order:
+
+- **Notification-hook ingestion** (`agent_needs_input`, `permission_prompt`,
+  `idle_prompt`) for sub-second needs-input without polling, and the relay
+  to Kranz's hook-status lane for bound panes.
+- **M4 Kranz target**, **M5 SSM / ECS Exec target**, **M6 per-client
+  identity** (the lease becomes a boundary).
+
 ## 4. Workbench UX
 
 Shipped:

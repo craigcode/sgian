@@ -30,11 +30,18 @@ const KNOWN_COMMANDS = [
   "send_agent_message",
   "agent_approval",
   "interrupt_agent",
+  "client_holder",
+  "take_lease",
+  "release_lease",
+  "lease_status",
   "install_update",
   "ui_smoke_enabled",
   "complete_ui_smoke",
 ];
 const KNOWN_COMMAND_SET = new Set(KNOWN_COMMANDS);
+// Registered by the backend and invoked only from the React controller
+// (app-controller.js; covered by react-app.test.jsx), never by main.js.
+const REACT_ONLY_COMMANDS = new Set(["client_holder", "take_lease", "release_lease", "lease_status"]);
 
 // --- DOM skeleton (the ids main.js queries, mirroring ui/index.html) ---
 
@@ -2058,6 +2065,7 @@ describe("invoke boundary", () => {
     // Every backend command is exercised by the app at least once in this run.
     const used = new Set(invoked.map((call) => call.command));
     for (const command of KNOWN_COMMANDS) {
+      if (REACT_ONLY_COMMANDS.has(command)) continue;
       expect(used.has(command), `command never invoked: ${command}`).toBe(true);
     }
   });

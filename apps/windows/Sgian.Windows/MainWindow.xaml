@@ -106,8 +106,12 @@
                 <RowDefinition Height="*" />
             </Grid.RowDefinitions>
 
-            <InfoBar x:Name="ErrorBar" Grid.Row="0" Severity="Error" IsClosable="True"
-                     IsOpen="False" Title="Sgian couldn’t complete that action" />
+            <StackPanel Grid.Row="0">
+                <InfoBar x:Name="ErrorBar" Severity="Error" IsClosable="True"
+                         IsOpen="False" Title="Sgian couldn’t complete that action" />
+                <InfoBar x:Name="LeaseBar" Severity="Informational" IsClosable="False"
+                         IsOpen="False" Title="Keyboard lease" />
+            </StackPanel>
 
             <Grid Grid.Row="1" Height="50" Padding="14,0" Background="{ThemeResource LayerFillColorDefaultBrush}"
                   BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,0,0,1">
@@ -126,6 +130,8 @@
                     <Button Content="Zoom" Click="Zoom_Click" ToolTipService.ToolTip="Zoom pane (Ctrl+Shift+Z)" />
                     <Button Content="Find" Click="Search_Click" ToolTipService.ToolTip="Find in terminal (Ctrl+Shift+F)" />
                     <Button Content="Commands" Click="Commands_Click" ToolTipService.ToolTip="Commands (Ctrl+Shift+P)" />
+                    <Button x:Name="LeaseButton" Content="Take keyboard" Click="Lease_Click"
+                            ToolTipService.ToolTip="Take or release the pane's keyboard (Ctrl+Shift+T / Ctrl+Shift+L)" />
                     <Button x:Name="RestartButton" Content="Restart" Visibility="Collapsed" Click="Restart_Click" />
                     <Button x:Name="RenameButton" Content="Rename" Visibility="Collapsed" Click="Rename_Click" />
                     <Button x:Name="CloseButton" Visibility="Collapsed" Click="Close_Click"

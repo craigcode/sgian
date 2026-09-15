@@ -78,6 +78,14 @@ export function resolveKeyAction(event) {
   if (event.key.toLowerCase() === "r") {
     return { type: "rename" };
   }
+  // Keyboard lease (docs/design/keyboard-lease-and-ledger.md): T takes the
+  // active pane's keyboard, L lets it go (R is already rename).
+  if (event.key.toLowerCase() === "t") {
+    return { type: "lease-take" };
+  }
+  if (event.key.toLowerCase() === "l") {
+    return { type: "lease-release" };
+  }
   if (event.key.toLowerCase() === "f") {
     return { type: "search-open" };
   }

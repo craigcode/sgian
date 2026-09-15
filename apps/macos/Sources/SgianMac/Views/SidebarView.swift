@@ -60,7 +60,9 @@ struct SidebarView: View {
             pane: pane,
             runtime: model.paneStates[pane.id] ?? .live,
             attention: model.attention(for: pane.id),
-            spec: model.agentSpecs[pane.id]
+            spec: model.agentSpecs[pane.id],
+            leaseHolder: model.lease(for: pane.id)?.holder,
+            ownLease: model.isOwnLease(model.lease(for: pane.id))
         )
         .tag(pane.id)
         .contextMenu {
@@ -106,6 +108,8 @@ private struct PaneRow: View {
     let runtime: PaneRuntimeState
     let attention: AgentAttention?
     let spec: AgentPaneSpec?
+    var leaseHolder: String? = nil
+    var ownLease = false
 
     var body: some View {
         HStack(spacing: 9) {
@@ -123,6 +127,12 @@ private struct PaneRow: View {
                 }
             }
             Spacer(minLength: 4)
+            if let leaseHolder {
+                Image(systemName: "keyboard")
+                    .font(.caption2)
+                    .foregroundStyle(ownLease ? Color.green : Color.orange)
+                    .help(ownLease ? "You hold the keyboard" : "Keyboard held by \(leaseHolder)")
+            }
             if runtime == .ended {
                 Image(systemName: "stop.circle.fill")
                     .font(.caption)

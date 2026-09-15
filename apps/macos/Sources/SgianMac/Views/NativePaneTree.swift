@@ -24,6 +24,19 @@ struct NativePaneTree: View {
                         }
                     }
                     .overlay(Rectangle().strokeBorder(model.selectedPaneID == id ? Color.accentColor : Color.clear, lineWidth: 2).allowsHitTesting(false))
+                    .overlay(alignment: .bottom) {
+                        if let notice = model.leaseNotice, notice.paneID == id {
+                            Text(notice.message)
+                                .font(.caption)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 6))
+                                .foregroundStyle(.white)
+                                .padding(.bottom, 14)
+                                .allowsHitTesting(false)
+                                .accessibilityIdentifier("lease-notice")
+                        }
+                    }
                     .simultaneousGesture(TapGesture().onEnded {
                         if model.selectedPaneID != id { model.select(id) }
                     })
@@ -132,6 +145,8 @@ struct NativeCommandPalette: View {
             ("Find in terminal", { model.showingSearch = true }),
             ("Open workspace…", { model.chooseWorkspace() }),
             ("Reconnect", { model.connect(to: model.workspaceURL) }),
+            ("Take keyboard for active pane", { model.takeLease() }),
+            ("Release keyboard (with hand-back note)…", { model.openReleaseDialog() }),
             ("Close active pane…", { model.requestClose() }),
         ]
         items += model.panes.map { pane in ("Focus: \(pane.title) [\(pane.id)]", { model.select(pane.id) }) }

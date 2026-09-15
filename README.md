@@ -93,12 +93,32 @@ A single binary runs in three modes:
 - Workspace identity is canonical: `/a/b`, `/a/b/`, and symlinks to the same
   directory share one workspace and one daemon.
 - Env scrubbing: vars in `scrub_env` are removed before spawning PTYs; explicit
-  `env` values take precedence over the scrub list.
+  `env` values take precedence over the scrub list. Claude Code's own
+  child-session markers (`CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`,
+  `CLAUDE_CODE_ENTRYPOINT`) are always dropped, so a daemon started from
+  inside a Claude Code session does not make every pane's `claude` a child
+  session with transcripts off.
+- Closing a pane (or the daemon exiting) terminates the pane's whole process
+  tree, not just its shell: descendants are found without forking (libproc on
+  macOS, /proc on Linux) and signalled (SIGTERM, then SIGKILL after a grace
+  period); on Windows the child is held in a kill-on-close Job Object.
 - Config file-watch with live reload.
 - Bounded log rotation so logs do not grow unbounded.
 - Agent awareness (shell panes): the daemon classifies a pane's screen for known
   agent TUIs (Claude Code) and broadcasts `agent-state` transitions
-  (working / needs input / idle), badged on the pane's tab.
+  (working / needs input / idle), badged on the pane's tab. On Unix it also
+  polls `claude agents --json` (`agent_probe_interval_ms`, default 2000) and
+  maps sessions to panes through the process tree, so Claude Code's own
+  state outranks screen scraping while fresh and a finished session clears
+  the badge.
+- Keyboard lease: one holder per pane. While a pane is held, input from
+  anyone else is refused (`lease_policy: "open"`, the default) or every write
+  needs the lease (`"required"`). Takeovers, forced revocations, and releases
+  are appended to a per-pane hash-chained ledger with a mandatory hand-back
+  note; keystrokes are never recorded, only counts. The lease is a
+  coordination and audit record: every client still shares one workspace
+  token, so it is not yet a security boundary. See
+  [docs/design/keyboard-lease-and-ledger.md](docs/design/keyboard-lease-and-ledger.md).
 - Agent panes: a daemon-owned Claude stream-json or Factory Droid JSON-RPC
   process per pane, selected when the pane is created. Both feed a normalized
   event stream with permission round-trips, bounded conversation logs, and
@@ -118,6 +138,18 @@ A single binary runs in three modes:
 - `ctl new --profile NAME` to create a pane from a named shell/agent profile.
 - Batched multi-pane exec via `--all` / `--panes`.
 - `--lf` / `--raw` literal LF flag for precise input control.
+- `ctl lease take|release|status` to claim, hand back (with a note), or show a
+  pane's keyboard lease; `ctl send --as HOLDER` attributes input to a holder.
+  In the clients: `Ctrl/Cmd+Shift+T` takes the active pane's keyboard,
+  `Ctrl/Cmd+Shift+L` releases it with a note.
+- `ctl ledger [PANE] [--verify]` to print or verify a pane's hash-chained
+  ledger (lease handovers, attention transitions, pane exits); a closed
+  pane's ledger stays readable by id.
+- `ctl agent --watch [PANE] --json` to stream agent-state, lease and pane-end
+  transitions to a script instead of polling.
+- `ctl kranz status|bind|unbind` for panes bound to a Kranz mission: the
+  mission's pending questions and grants drive the badge, and a hand-back
+  note is mirrored into the mission inbox with `kranz msg`.
 - `ctl logs` to tail daemon logs.
 - `ctl status --verbose` for detailed daemon state.
 - `ctl write-config` to persist config changes.

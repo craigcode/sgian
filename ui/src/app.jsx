@@ -54,6 +54,145 @@ function AgentBadge({ info }) {
   );
 }
 
+function LeaseBadge({ info, holder }) {
+  if (!info) return null;
+  const mine = Boolean(holder) && info.holder === holder;
+  const title = mine ? "You hold this pane's keyboard" : `Keyboard held by ${info.holder}`;
+  return (
+    <span
+      className={`lease-badge${mine ? " lease-badge-mine" : ""}`}
+      title={title}
+      data-holder={info.holder}
+    >
+      ⌨ {mine ? "you" : info.holder}
+    </span>
+  );
+}
+
+/**
+ * Keyboard lease dialog (docs/design/keyboard-lease-and-ledger.md §6 M2):
+ * `release` asks for the mandatory hand-back note; `take` asks for the
+ * reason when the pane is held by someone else. An empty field cannot submit.
+ */
+function LeaseDialog({ state, controller }) {
+  const dialog = state.leaseDialog;
+  const modalRef = useRef(null);
+  const fieldRef = useRef(null);
+  const [text, setText] = useState("");
+  useEffect(() => {
+    setText("");
+    if (dialog) queueMicrotask(() => fieldRef.current?.focus());
+  }, [dialog?.mode, dialog?.paneId]);
+  if (!dialog) return null;
+  const release = dialog.mode === "release";
+  const pane = state.panes.get(dialog.paneId);
+  const paneName = pane?.title || dialog.paneId;
+  const trimmed = text.trim();
+  const submit = () => {
+    if (!trimmed) return;
+    if (release) void controller.releaseLease(dialog.paneId, trimmed);
+    else void controller.takeLease(dialog.paneId, { force: true, why: trimmed });
+  };
+  const trapFocus = (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      controller.closeLeaseDialog();
+      return;
+    }
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      submit();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = Array.from(
+      modalRef.current.querySelectorAll(
+        'button, input, textarea, select, [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((element) => !element.disabled);
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  return (
+    <div
+      id="lease-overlay"
+      className="modal-overlay"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) controller.closeLeaseDialog();
+      }}
+    >
+      <div
+        ref={modalRef}
+        id="lease-dialog"
+        className="modal lease-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="lease-dialog-title"
+        onKeyDown={trapFocus}
+      >
+        <header className="modal-header">
+          <h2 id="lease-dialog-title">
+            {release
+              ? `Hand back the keyboard for ${paneName}`
+              : `Take the keyboard for ${paneName} from ${dialog.heldBy || "its holder"}`}
+          </h2>
+          <button
+            className="modal-close"
+            type="button"
+            title="Close"
+            aria-label="Close lease dialog"
+            onClick={controller.closeLeaseDialog}
+          >
+            ×
+          </button>
+        </header>
+        <form
+          className="lease-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            submit();
+          }}
+        >
+          <label className="lease-label" htmlFor="lease-text">
+            {release
+              ? "Hand-back note (required): what you did, what the agent should do next"
+              : "Why are you taking it over? (required, recorded in the ledger)"}
+          </label>
+          <textarea
+            id="lease-text"
+            ref={fieldRef}
+            className="lease-text"
+            rows={release ? 4 : 2}
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+          />
+          {dialog.error ? (
+            <p className="lease-error" role="alert">
+              {dialog.error}
+            </p>
+          ) : null}
+          <div className="lease-actions">
+            <button type="button" className="secondary" onClick={controller.closeLeaseDialog}>
+              Cancel
+            </button>
+            <button type="submit" className="primary" disabled={!trimmed}>
+              {release ? "Release keyboard" : "Take keyboard"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function UpdateBanner({ version, controller }) {
   if (!version) return null;
   return (
@@ -623,10 +762,16 @@ function Pane({ paneId, state, controller }) {
           ✎
         </button>
         <AgentBadge info={state.agentStates.get(paneId)} />
+        <LeaseBadge info={state.leases.get(paneId)} holder={state.holder} />
         <span className="pane-meta">
           {runtime === "ended" ? `ended · ${paneMeta}` : paneMeta}
         </span>
       </header>
+      {state.leaseToast?.paneId === paneId ? (
+        <div className="lease-toast" role="status">
+          {state.leaseToast.message}
+        </div>
+      ) : null}
       {pane.kind === "agent" ? (
         <div className="chat-container" data-pane-id={paneId}>
           <AgentChat paneId={paneId} state={state} controller={controller} />
@@ -1334,6 +1479,7 @@ export function App({ controller }) {
       <CommandPalette state={state} controller={controller} />
       <SessionOverview state={state} controller={controller} />
       <SettingsDialog state={state} controller={controller} />
+      <LeaseDialog state={state} controller={controller} />
     </>
   );
 }

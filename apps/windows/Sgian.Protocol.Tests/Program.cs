@@ -27,6 +27,7 @@ var tests = new (string Name, Action Body)[]
     ("Bounded IPC messages", BoundedMessages),
     ("Terminal bridge rejects foreign documents", TerminalBridgeOrigins),
     ("Native layout restoration and pane reconciliation", NativeLayouts),
+    ("Keyboard lease model", KeyboardLease),
 };
 
 var failures = new List<string>();
@@ -157,6 +158,31 @@ static void PermissionLifecycle()
     Equal("Bash", state.PendingPermission?.ToolName);
     state.Apply(Json("""{"kind":"permission_resolved","seq":2,"request_id":"r1","reason":"user"}"""));
     Equal<PendingPermission?>(null, state.PendingPermission);
+}
+
+static void KeyboardLease()
+{
+    var snapshot = JsonSerializer.Deserialize<WorkspaceSnapshot>("""
+        {"panes":[],"cwd":"C:\\w","leases":{"pane-1":{"holder":"bob","since_ms":42}}}
+        """) ?? throw new Exception("snapshot did not deserialize");
+    Equal("bob", snapshot.Leases["pane-1"].Holder);
+    Equal<ulong?>(42, snapshot.Leases["pane-1"].SinceMilliseconds);
+    Equal(0, JsonSerializer.Deserialize<WorkspaceSnapshot>("""{"panes":[],"cwd":"C:\\w"}""")!.Leases.Count);
+    var leases = new Dictionary<string, LeaseInfo>(StringComparer.Ordinal);
+    Equal("pane-1", LeaseState.Apply(Json("""{"pane_id":"pane-1","transition":"taken","holder":"amy","since_ms":7}"""), leases));
+    Equal("amy", leases["pane-1"].Holder);
+    Equal("pane-1", LeaseState.Apply(Json("""{"pane_id":"pane-1","transition":"released","holder":null,"note":"done"}"""), leases));
+    Equal(0, leases.Count);
+    Equal(true, LeaseState.Apply(Json("""{"event":"lease_state"}"""), leases) is null);
+    Equal(true, LeaseState.IsValidHolder("craig@pc"));
+    Equal(false, LeaseState.IsValidHolder("two words"));
+    Equal(false, LeaseState.IsValidHolder(new string('x', 65)));
+    Equal(true, LeaseState.IsValidHolder(LeaseState.DefaultHolder()));
+    Equal("Read-only: keyboard held by bob. Ctrl+Shift+T to take it.", LeaseState.NoticeText("pane keyboard is held by bob (pane-2)"));
+    Equal(true, LeaseState.NoticeText("pane keyboard is unheld and lease_policy is required; take it first (pane-2)").Contains("take the keyboard"));
+    Equal(true, LeaseState.NeedsForce("pane keyboard is held by bob; use --force --why REASON to revoke it"));
+    Equal(true, LeaseState.IsRefusal("pane keyboard is held by bob (pane-2)"));
+    Equal(false, LeaseState.IsRefusal("terminal session ended: pane-2"));
 }
 
 static void WorkspaceDefaults()
