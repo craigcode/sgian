@@ -249,8 +249,12 @@ Ranked by leverage against effort. None are committed beyond M1.
    for a GUI. But scrollback appends and the vt100 model are on the read
    path, and `local:yes` for a minute is the draft's torture test worth
    running before M5 adds a network producer.
-2. **Scrollback search and permalinks.** `Find` filters metadata only. A
-   substring search over the scrollback file with `ctl lines <pane> a:b`
+2. **Scrollback search and permalinks (shipped 2026-09-15).** `ctl search`
+   and `ctl lines` over the scrollback file with control sequences stripped;
+   line numbers are relative to the current file and the 16 MiB cap
+   renumbers, which `total_lines` lets a script notice. Originally: `Find`
+   filters metadata only. A substring search over the scrollback file with
+   `ctl lines <pane> a:b`
    is small and makes the ledger's `seq` range citable.
 3. **Terminal-output injection guard.** ATR-2026-00259 documents agents
    hiding content from human review with OSC and cursor moves. Agent panes

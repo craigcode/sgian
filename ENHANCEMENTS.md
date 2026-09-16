@@ -140,6 +140,14 @@ Shipped (2026-09-15):
   `UNATTENDED`, and mode transitions are ledgered as `mode.changed`.
   Verified live by cycling modes with Shift+Tab in a real session.
 
+Shipped (2026-09-15):
+
+- **Scrollback search and citations.** `search_scrollback` and
+  `scrollback_lines` requests, `ctl search <PANE> [-i] [-n N] <NEEDLE>` and
+  `ctl lines <PANE> A:B`, over the whole scrollback file with CSI/OSC/DCS and
+  other control sequences stripped so search sees what a person saw.
+- **Output-flood regression test** with a measured 1.7 MB/s baseline (#18).
+
 Open, in order:
 
 - **Notification-hook ingestion** (`agent_needs_input`, `permission_prompt`,

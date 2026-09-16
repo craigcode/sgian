@@ -2313,6 +2313,25 @@ enum DaemonRequest {
     GetScrollback {
         pane_id: String,
     },
+    /// Substring search over a pane's whole scrollback file with terminal
+    /// control sequences stripped. Line numbers are 1-based and relative to
+    /// the current file: the 16 MiB cap drops the oldest half and renumbers,
+    /// which `total_lines` lets a script notice.
+    SearchScrollback {
+        pane_id: String,
+        needle: String,
+        #[serde(default)]
+        ignore_case: bool,
+        #[serde(default)]
+        limit: usize,
+    },
+    /// Lines `from..=to` (1-based, inclusive) of a pane's scrollback, control
+    /// sequences stripped — the range a ledger record or a search hit cites.
+    ScrollbackLines {
+        pane_id: String,
+        from: usize,
+        to: usize,
+    },
     UpdateWorkspaceLayout {
         layout: Value,
     },
@@ -8762,6 +8781,64 @@ impl DaemonServer {
                     read_scrollback(&self.scrollback_dir, &pane_id).unwrap_or_default();
                 Ok(json!({ "pane_id": pane_id, "scrollback": scrollback }))
             }
+            DaemonRequest::SearchScrollback {
+                pane_id,
+                needle,
+                ignore_case,
+                limit,
+            } => {
+                self.ensure_pane_exists(&pane_id)?;
+                let needle = needle.trim();
+                if needle.is_empty() {
+                    return Err("search needle must not be empty".to_string());
+                }
+                if needle.len() > SCROLLBACK_SEARCH_NEEDLE_MAX_BYTES {
+                    return Err(format!(
+                        "search needle is longer than {SCROLLBACK_SEARCH_NEEDLE_MAX_BYTES} bytes"
+                    ));
+                }
+                let limit = match limit {
+                    0 => SCROLLBACK_SEARCH_DEFAULT_LIMIT,
+                    n => n.min(SCROLLBACK_SEARCH_MAX_LIMIT),
+                };
+                let lines = scrollback_text_lines(&self.scrollback_dir, &pane_id);
+                let matches = search_lines(&lines, needle, ignore_case, limit);
+                Ok(json!({
+                    "pane_id": pane_id,
+                    "total_lines": lines.len(),
+                    "truncated": matches.len() >= limit,
+                    "matches": matches
+                        .into_iter()
+                        .map(|(line, text)| json!({ "line": line, "text": text }))
+                        .collect::<Vec<_>>(),
+                }))
+            }
+            DaemonRequest::ScrollbackLines { pane_id, from, to } => {
+                self.ensure_pane_exists(&pane_id)?;
+                if from == 0 || to < from {
+                    return Err("line range must be 1-based with from <= to".to_string());
+                }
+                if to - from + 1 > SCROLLBACK_LINES_MAX_PER_REQUEST {
+                    return Err(format!(
+                        "at most {SCROLLBACK_LINES_MAX_PER_REQUEST} lines per request"
+                    ));
+                }
+                let lines = scrollback_text_lines(&self.scrollback_dir, &pane_id);
+                let total = lines.len();
+                let end = to.min(total);
+                let slice: Vec<&str> = if from <= total {
+                    lines[from - 1..end].iter().map(String::as_str).collect()
+                } else {
+                    Vec::new()
+                };
+                Ok(json!({
+                    "pane_id": pane_id,
+                    "total_lines": total,
+                    "from": from,
+                    "to": end,
+                    "lines": slice,
+                }))
+            }
             DaemonRequest::UpdateWorkspaceLayout { layout } => {
                 let encoded = serde_json::to_vec(&layout)
                     .map_err(|error| format!("invalid layout: {error}"))?;
@@ -13283,6 +13360,91 @@ fn read_scrollback(scrollback_dir: &Path, pane_id: &str) -> Option<String> {
     read_scrollback_tail(scrollback_dir, pane_id, SCROLLBACK_REPLAY_LIMIT_BYTES)
 }
 
+const SCROLLBACK_SEARCH_NEEDLE_MAX_BYTES: usize = 512;
+const SCROLLBACK_SEARCH_DEFAULT_LIMIT: usize = 100;
+const SCROLLBACK_SEARCH_MAX_LIMIT: usize = 1000;
+const SCROLLBACK_LINES_MAX_PER_REQUEST: usize = 2000;
+
+/// Remove terminal control sequences so search and citation see what a
+/// person saw: CSI (`ESC [ … final`), OSC/DCS/APC/PM/SOS strings (to BEL or
+/// `ESC \`), two-byte `ESC x` escapes, carriage returns and other C0 bytes
+/// (tabs and newlines kept). Malformed sequences are dropped to end of text.
+fn strip_terminal_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    // CSI: parameter/intermediate bytes 0x20..=0x3F, final 0x40..=0x7E.
+                    for next in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') | Some('P') | Some('_') | Some('^') | Some('X') => {
+                    // String sequences end at BEL or ST (ESC \).
+                    let mut previous_esc = false;
+                    for next in chars.by_ref() {
+                        if next == '\u{7}' || (previous_esc && next == '\\') {
+                            break;
+                        }
+                        previous_esc = next == '\u{1b}';
+                    }
+                }
+                Some(intermediate) if ('\u{20}'..='\u{2f}').contains(&intermediate) => {
+                    // nF escapes such as charset designation `ESC ( B`: intermediates
+                    // 0x20..=0x2F, then one final 0x30..=0x7E.
+                    for next in chars.by_ref() {
+                        if ('\u{30}'..='\u{7e}').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(_) | None => {}
+            },
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A pane's whole scrollback as plain-text lines (see `strip_terminal_controls`).
+fn scrollback_text_lines(scrollback_dir: &Path, pane_id: &str) -> Vec<String> {
+    let raw = read_scrollback_tail(scrollback_dir, pane_id, SCROLLBACK_MAX_BYTES as usize)
+        .unwrap_or_default();
+    let plain = strip_terminal_controls(&raw);
+    let mut lines: Vec<String> = plain.split('\n').map(str::to_string).collect();
+    if lines.last().is_some_and(|last| last.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+/// Case-sensitive (or folded) substring search; returns `(line, text)` with
+/// 1-based line numbers, at most `limit` hits.
+fn search_lines(
+    lines: &[String],
+    needle: &str,
+    ignore_case: bool,
+    limit: usize,
+) -> Vec<(usize, String)> {
+    let folded_needle = ignore_case.then(|| needle.to_lowercase());
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| match &folded_needle {
+            Some(folded) => line.to_lowercase().contains(folded.as_str()),
+            None => line.contains(needle),
+        })
+        .map(|(index, line)| (index + 1, line.clone()))
+        .take(limit)
+        .collect()
+}
+
 /// Read at most the last `limit` bytes of a pane's scrollback, seeking to the tail
 /// instead of reading the whole (up to SCROLLBACK_MAX_BYTES) file into memory, and
 /// starting on a UTF-8 boundary.
@@ -14008,6 +14170,22 @@ fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
                 DaemonClient::connect_or_spawn(options.workspace)?
             };
             control_kranz(&client, parsed, options.json)
+        }
+        "search" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_search_args(&options.args[1..])?;
+            let client = DaemonClient::connect_existing(options.workspace)?;
+            control_search(&client, parsed, options.json)
+        }
+        "lines" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_lines_args(&options.args[1..])?;
+            let client = DaemonClient::connect_existing(options.workspace)?;
+            control_lines(&client, parsed, options.json)
         }
         "ledger" => {
             if has_help_flag(&options.args[1..]) {
@@ -14931,6 +15109,149 @@ fn control_ledger(
     let mut stdout = std::io::stdout();
     for record in &records {
         writeln!(stdout, "{record}").map_err(|error| format!("failed to write stdout: {error}"))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchArgs {
+    pane_ref: String,
+    needle: String,
+    ignore_case: bool,
+    limit: usize,
+}
+
+/// `search <PANE> [-i] [-n N] [--] <NEEDLE...>` — flags before the needle;
+/// `--` ends flag parsing so a needle can start with `-`.
+fn parse_search_args(args: &[String]) -> Result<SearchArgs, String> {
+    let mut parsed = SearchArgs {
+        pane_ref: String::new(),
+        needle: String::new(),
+        ignore_case: false,
+        limit: 0,
+    };
+    let mut index = 0;
+    let mut needle_parts: Vec<String> = Vec::new();
+    let mut passthrough = false;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if passthrough
+            || !needle_parts.is_empty()
+            || (arg != "--" && !arg.starts_with('-') && !parsed.pane_ref.is_empty())
+        {
+            needle_parts.push(arg.to_string());
+        } else if arg == "--" {
+            passthrough = true;
+        } else if arg == "-i" || arg == "--ignore-case" {
+            parsed.ignore_case = true;
+        } else if arg == "-n" || arg == "--limit" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| "-n requires a count".to_string())?;
+            parsed.limit = value
+                .parse::<usize>()
+                .map_err(|_| format!("invalid -n count '{value}'"))?;
+            index += 1;
+        } else if arg.starts_with('-') && arg.len() > 1 {
+            return Err(format!("unexpected argument for search: {arg}"));
+        } else {
+            parsed.pane_ref = arg.to_string();
+        }
+        index += 1;
+    }
+    if parsed.pane_ref.is_empty() {
+        return Err("search requires a pane and a needle".to_string());
+    }
+    parsed.needle = needle_parts.join(" ");
+    if parsed.needle.trim().is_empty() {
+        return Err("search requires a needle".to_string());
+    }
+    Ok(parsed)
+}
+
+fn control_search(
+    client: &DaemonClient,
+    parsed: SearchArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let pane_id = resolve_pane_ref(client, &parsed.pane_ref)?;
+    let result: Value = client.request(DaemonRequest::SearchScrollback {
+        pane_id,
+        needle: parsed.needle,
+        ignore_case: parsed.ignore_case,
+        limit: parsed.limit,
+    })?;
+    if json_output {
+        return write_json_stdout(&result);
+    }
+    let mut stdout = std::io::stdout();
+    for hit in result["matches"].as_array().into_iter().flatten() {
+        writeln!(
+            stdout,
+            "{}\t{}",
+            hit["line"].as_u64().unwrap_or(0),
+            hit["text"].as_str().unwrap_or("")
+        )
+        .map_err(|error| format!("failed to write stdout: {error}"))?;
+    }
+    if result["truncated"].as_bool().unwrap_or(false) {
+        writeln!(stdout, "(more hits; raise -n)")
+            .map_err(|error| format!("failed to write stdout: {error}"))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinesArgs {
+    pane_ref: String,
+    from: usize,
+    to: usize,
+}
+
+/// `lines <PANE> <A>[:<B>]`.
+fn parse_lines_args(args: &[String]) -> Result<LinesArgs, String> {
+    let [pane_ref, range] = args else {
+        return Err("lines requires a pane and a line range A[:B]".to_string());
+    };
+    let (from, to) = match range.split_once(':') {
+        Some((a, b)) => (a, b),
+        None => (range.as_str(), range.as_str()),
+    };
+    let from: usize = from
+        .parse()
+        .map_err(|_| format!("invalid line number '{from}'"))?;
+    let to: usize = to
+        .parse()
+        .map_err(|_| format!("invalid line number '{to}'"))?;
+    if from == 0 || to < from {
+        return Err("line range must be 1-based with A <= B".to_string());
+    }
+    Ok(LinesArgs {
+        pane_ref: pane_ref.clone(),
+        from,
+        to,
+    })
+}
+
+fn control_lines(
+    client: &DaemonClient,
+    parsed: LinesArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let pane_id = resolve_pane_ref(client, &parsed.pane_ref)?;
+    let result: Value = client.request(DaemonRequest::ScrollbackLines {
+        pane_id,
+        from: parsed.from,
+        to: parsed.to,
+    })?;
+    if json_output {
+        return write_json_stdout(&result);
+    }
+    let mut stdout = std::io::stdout();
+    let from = result["from"].as_u64().unwrap_or(1) as usize;
+    for (offset, line) in result["lines"].as_array().into_iter().flatten().enumerate() {
+        writeln!(stdout, "{}\t{}", from + offset, line.as_str().unwrap_or(""))
+            .map_err(|error| format!("failed to write stdout: {error}"))?;
     }
     Ok(())
 }
@@ -17658,6 +17979,14 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   its inbox with `kranz msg`; `kranz status`
                                   drives the pane's badge.
   kranz unbind [PANE]           Remove a binding
+  search <PANE> [-i] [-n N] [--] <NEEDLE...>
+                                Substring search over a pane's whole scrollback
+                                  (control sequences stripped): `line<TAB>text`.
+                                  -i ignores case; -n caps hits (default 100).
+  lines <PANE> <A>[:<B>]        Print scrollback lines A..B (1-based, inclusive):
+                                  the range a ledger record or search hit cites.
+                                  Numbers are relative to the current file; the
+                                  16 MiB cap drops the oldest half and renumbers.
   ledger [PANE] [-n N] [--verify]
                                 Print a pane's hash-chained lease ledger (JSONL).
                                   --verify walks the chain and names the first break.
@@ -35613,6 +35942,144 @@ exit 0
         assert_eq!(records[1]["payload"]["unattended"], json!(true));
         assert_eq!(records[3]["payload"]["from"], json!("auto"));
         assert_eq!(records[3]["payload"]["to"], json!("bypass"));
+    }
+
+    #[test]
+    fn terminal_controls_are_stripped_for_search() {
+        assert_eq!(
+            strip_terminal_controls("\u{1b}[32mgreen\u{1b}[0m plain\r\n"),
+            "green plain\n"
+        );
+        assert_eq!(
+            strip_terminal_controls("\u{1b}]0;title\u{7}after \u{1b}]8;;http://x\u{1b}\\link"),
+            "after link"
+        );
+        assert_eq!(strip_terminal_controls("a\u{1b}Pdcs stuff\u{1b}\\b"), "ab");
+        assert_eq!(strip_terminal_controls("x\u{1b}(By\ttab\u{8}"), "xy\ttab");
+        assert_eq!(
+            strip_terminal_controls("unterminated \u{1b}[31"),
+            "unterminated "
+        );
+        let lines = vec![
+            "Alpha".to_string(),
+            "beta needle".to_string(),
+            "NEEDLE".to_string(),
+        ];
+        assert_eq!(
+            search_lines(&lines, "needle", false, 10),
+            vec![(2, "beta needle".to_string())]
+        );
+        assert_eq!(search_lines(&lines, "needle", true, 10).len(), 2);
+        assert_eq!(search_lines(&lines, "needle", true, 1).len(), 1);
+    }
+
+    #[test]
+    fn parse_search_and_lines_args() {
+        let parsed = parse_search_args(&args(&["pane-1", "-i", "-n", "5", "hello", "world"]))
+            .expect("parse");
+        assert_eq!(parsed.pane_ref, "pane-1");
+        assert_eq!(parsed.needle, "hello world");
+        assert!(parsed.ignore_case);
+        assert_eq!(parsed.limit, 5);
+        let dashed =
+            parse_search_args(&args(&["pane-1", "--", "-x", "flag"])).expect("dashed needle");
+        assert_eq!(dashed.needle, "-x flag");
+        assert!(parse_search_args(&args(&["pane-1"])).is_err());
+        assert!(parse_search_args(&args(&["pane-1", "-q", "x"])).is_err());
+        let lines = parse_lines_args(&args(&["pane-1", "3:9"])).expect("range");
+        assert_eq!((lines.from, lines.to), (3, 9));
+        let single = parse_lines_args(&args(&["pane-1", "7"])).expect("single");
+        assert_eq!((single.from, single.to), (7, 7));
+        assert!(parse_lines_args(&args(&["pane-1", "0:2"])).is_err());
+        assert!(parse_lines_args(&args(&["pane-1", "5:2"])).is_err());
+        assert!(parse_lines_args(&args(&["pane-1"])).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scrollback_search_and_lines_over_ipc() {
+        let daemon = TestDaemon::spawn(Config::default());
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        // The command line echoes "needle" too; only the printed rows carry "row-needle".
+        client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: "printf 'row-%s\\n' one two needle three\n".to_string(),
+            })
+            .expect("print rows");
+        let mut result = Value::Null;
+        for _ in 0..200 {
+            result = client
+                .request(DaemonRequest::SearchScrollback {
+                    pane_id: pane_id.clone(),
+                    needle: "row-three".to_string(),
+                    ignore_case: false,
+                    limit: 0,
+                })
+                .expect("search");
+            if result["matches"]
+                .as_array()
+                .is_some_and(|hits| !hits.is_empty())
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let hits = result["matches"].as_array().expect("matches").clone();
+        assert_eq!(hits.len(), 1, "{result}");
+        let three_line = hits[0]["line"].as_u64().expect("line") as usize;
+        let needle: Value = client
+            .request(DaemonRequest::SearchScrollback {
+                pane_id: pane_id.clone(),
+                needle: "ROW-NEEDLE".to_string(),
+                ignore_case: true,
+                limit: 0,
+            })
+            .expect("search folded");
+        let needle_hits = needle["matches"].as_array().expect("matches");
+        assert_eq!(needle_hits.len(), 1, "{needle}");
+        assert_eq!(needle_hits[0]["text"], json!("row-needle"));
+        let needle_line = needle_hits[0]["line"].as_u64().expect("line") as usize;
+        assert_eq!(three_line, needle_line + 1);
+
+        let cited: Value = client
+            .request(DaemonRequest::ScrollbackLines {
+                pane_id: pane_id.clone(),
+                from: needle_line,
+                to: three_line,
+            })
+            .expect("lines");
+        assert_eq!(cited["lines"], json!(["row-needle", "row-three"]));
+        assert_eq!(cited["from"], json!(needle_line));
+        assert!(cited["total_lines"].as_u64().unwrap_or(0) as usize >= three_line);
+
+        let empty = client
+            .request::<Value>(DaemonRequest::SearchScrollback {
+                pane_id: pane_id.clone(),
+                needle: "   ".to_string(),
+                ignore_case: false,
+                limit: 0,
+            })
+            .expect_err("blank needle");
+        assert!(empty.contains("empty"), "{empty}");
+        let bad = client
+            .request::<Value>(DaemonRequest::ScrollbackLines {
+                pane_id: pane_id.clone(),
+                from: 1,
+                to: 5000,
+            })
+            .expect_err("range too wide");
+        assert!(bad.contains("at most"), "{bad}");
+        daemon.shutdown();
     }
 
     #[test]
