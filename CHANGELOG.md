@@ -7,6 +7,11 @@ follow SemVer once the first public tag exists.
 
 ### Added
 
+- `ctl hook`: the command a Claude Code hook runs. Finds the pane that
+  owns the calling process and sets its badge from the hook (Notification →
+  needs input, `UserPromptSubmit`/`PreToolUse` → working, `Stop` → idle)
+  with evidence `hook`; Notifications are ledgered as `hook.received` with
+  their message. The README shows the settings snippet.
 - Project board in the native clients: the macOS sidebar groups panes by
   project with the roll-up in each section header and marks output-guard
   hits with an eye-slash icon; the Windows sidebar shows one roll-up line

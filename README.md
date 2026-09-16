@@ -154,6 +154,29 @@ A single binary runs in three modes:
   pane's ledger stays readable by id.
 - `ctl agent --watch [PANE] --json` to stream agent-state, lease and pane-end
   transitions to a script instead of polling.
+- `ctl hook`: the command a Claude Code hook runs. It reads the hook payload
+  from stdin, finds the pane that owns the calling process (this workspace
+  first, then every running daemon) and sets the badge from the hook in
+  well under a second: Notification (`permission_prompt`, `idle_prompt`,
+  `elicitation_dialog`) → needs input, `UserPromptSubmit`/`PreToolUse` →
+  working, `Stop` → idle. Ledgered as `attention.changed` with evidence
+  `hook`, plus `hook.received` with the message for Notifications. Always
+  exits 0. Add it to `~/.claude/settings.json` (use the full path to the
+  binary if `sgian` is not on `PATH`):
+
+  ```json
+  {
+    "hooks": {
+      "Notification":     [{ "hooks": [{ "type": "command", "command": "sgian ctl hook" }] }],
+      "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "sgian ctl hook" }] }],
+      "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "sgian ctl hook" }] }],
+      "Stop":             [{ "hooks": [{ "type": "command", "command": "sgian ctl hook" }] }]
+    }
+  }
+  ```
+
+  A pane bound to a Kranz run needs no relay from Sgian: the run registers
+  its own `kranz hook-status` hooks, so both lanes see the same signal.
 - `ctl project new|list|show|add|rm|delete|ledger|dossier` for projects: a
   named group of panes serving one goal, persisted with the workspace, with an
   attention roll-up (needs input / working / idle / unattended / keyboard
