@@ -56,6 +56,8 @@ function createHarness({
   panes = [{ id: "pane-a", title: "term-a", kind: "shell", created_at_ms: 1 }],
   activePaneId = panes[0]?.id ?? null,
   leases = {},
+  projects = {},
+  outputWarnings = {},
   writeError = null,
 } = {}) {
   const listeners = new Map();
@@ -75,6 +77,8 @@ function createHarness({
         agent_states: {},
         agent_events: {},
         leases,
+        projects,
+        output_warnings: outputWarnings,
       };
     }
     if (command === "client_holder") return "me@test";
@@ -548,5 +552,82 @@ describe("unattended agent badge", () => {
     });
     await waitFor(() => expect(view.container.querySelector(".agent-badge-unattended")).toBeNull());
     view.unmount();
+  });
+});
+
+describe("project board and output guard", () => {
+  it("groups the overview by project with a roll-up heading and follows projects-changed", async () => {
+    const panes = [
+      { id: "pane-a", title: "term-a", kind: "shell", created_at_ms: 1 },
+      { id: "pane-b", title: "term-b", kind: "shell", created_at_ms: 2 },
+      { id: "pane-c", title: "term-c", kind: "shell", created_at_ms: 3 },
+    ];
+    const { controller, listeners } = createHarness({
+      panes,
+      leases: { "pane-b": { holder: "alice", since_ms: 1 } },
+      projects: { feat: { name: "feat", goal: "ship it", panes: ["pane-b", "pane-a"] } },
+    });
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    const user = userEvent.setup();
+    await user.click(view.getByRole("button", { name: "Session overview" }));
+    const overview = await view.findByRole("dialog", { name: "Session overview" });
+
+    const groups = Array.from(overview.querySelectorAll("tbody.overview-group"));
+    expect(groups.map((group) => group.dataset.project ?? null)).toEqual(["feat", null]);
+    const heading = groups[0].querySelector(".overview-group-row th");
+    expect(heading.querySelector(".overview-group-name").textContent).toBe("feat");
+    expect(heading.querySelector(".overview-group-goal").textContent).toBe("ship it");
+    expect(heading.querySelector(".overview-group-rollup").textContent).toBe("2 panes · ⌨ alice");
+    // Members in project order, then the unassigned pane under its own heading.
+    expect(
+      Array.from(groups[0].querySelectorAll("tr[data-pane-id]")).map((row) => row.dataset.paneId),
+    ).toEqual(["pane-b", "pane-a"]);
+    expect(groups[1].querySelector(".overview-group-name").textContent).toBe("No project");
+    expect(groups[1].querySelector("tr[data-pane-id]").dataset.paneId).toBe("pane-c");
+    // The keyboard column names the holder.
+    expect(groups[0].querySelector('tr[data-pane-id="pane-b"] .overview-keyboard').textContent).toBe("alice");
+    expect(groups[0].querySelector('tr[data-pane-id="pane-a"] .overview-keyboard').textContent).toBe("—");
+
+    // The daemon moves pane-c in and drops pane-a: the board follows.
+    listeners.get("projects-changed")({
+      payload: { projects: { feat: { name: "feat", panes: ["pane-b", "pane-c"] } } },
+    });
+    await waitFor(() => {
+      const rows = Array.from(
+        overview.querySelectorAll('tbody[data-project="feat"] tr[data-pane-id]'),
+      ).map((row) => row.dataset.paneId);
+      expect(rows).toEqual(["pane-b", "pane-c"]);
+    });
+    expect(overview.querySelector('tbody[data-project="feat"] .overview-group-goal')).toBeNull();
+    // Every project deleted: a single group with no heading, like before.
+    listeners.get("projects-changed")({ payload: { projects: {} } });
+    await waitFor(() => expect(overview.querySelectorAll("tbody.overview-group")).toHaveLength(1));
+    expect(overview.querySelector(".overview-group-row")).toBeNull();
+    expect(overview.querySelector("td")?.textContent).toBe("term-a");
+  });
+
+  it("shows the output-guard badge from the snapshot and grows it on output-warning", async () => {
+    const { controller, listeners } = createHarness({
+      outputWarnings: { "pane-a": { conceal: 2 } },
+    });
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    const badge = view.container.querySelector('.pane .output-badge[data-total="2"]');
+    expect(badge).toBeTruthy();
+    expect(badge.title).toBe("Output hid something: 2 concealed text");
+    listeners.get("output-warning")({
+      payload: { pane_id: "pane-a", added: { clipboard: 1 }, total: { conceal: 2, clipboard: 1 } },
+    });
+    await waitFor(() =>
+      expect(view.container.querySelector('.pane .output-badge[data-total="3"]')).toBeTruthy(),
+    );
+    const user = userEvent.setup();
+    await user.click(view.getByRole("button", { name: "Session overview" }));
+    const overview = await view.findByRole("dialog", { name: "Session overview" });
+    expect(overview.querySelector(".overview-output-warning").textContent).toBe(
+      "⚠ 2 concealed text, 1 clipboard writes",
+    );
+    expect(overview.querySelector(".overview-group-rollup")).toBeNull();
   });
 });

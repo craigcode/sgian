@@ -32,7 +32,15 @@ import {
   handleLeaseState,
   normalizeLeaseInfo,
   leaseEquals,
+  handleOutputWarning,
+  handleProjectsChanged,
 } from "./events.js";
+import {
+  normalizeOutputWarning,
+  outputWarningEquals,
+  normalizeProjects,
+  projectsEqual,
+} from "./projects.js";
 import {
   createAgentChat,
   replayAgentEvents,
@@ -98,6 +106,11 @@ function initialState() {
     holder: null,
     leaseToast: null,
     leaseDialog: null,
+    // Output guard (docs/design/keyboard-lease-and-ledger.md §7): pane_id →
+    // { counts, total } for panes whose output hid something, else absent.
+    outputWarnings: new Map(),
+    // Projects (name → { name, goal, repo, panes }) for the overview board.
+    projects: new Map(),
     agentSpecs: new Map(),
     newAgentBackend: "claude",
     newAgentModel: "",
@@ -505,6 +518,22 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
       if (leaseEquals(existing, next)) continue;
       if (next) state.leases.set(paneId, next);
       else state.leases.delete(paneId);
+      changed = true;
+    }
+
+    const snapshotWarnings = snapshot.output_warnings || {};
+    for (const paneId of snapshotIds) {
+      const next = normalizeOutputWarning(snapshotWarnings[paneId]);
+      const existing = state.outputWarnings.get(paneId) ?? null;
+      if (outputWarningEquals(existing, next)) continue;
+      if (next) state.outputWarnings.set(paneId, next);
+      else state.outputWarnings.delete(paneId);
+      changed = true;
+    }
+
+    const snapshotProjects = normalizeProjects(snapshot.projects);
+    if (!projectsEqual(state.projects, snapshotProjects)) {
+      state.projects = snapshotProjects;
       changed = true;
     }
 
@@ -931,6 +960,7 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     state.paneStates.delete(paneId);
     state.agentStates.delete(paneId);
     state.leases.delete(paneId);
+    state.outputWarnings.delete(paneId);
     state.agentSpecs.delete(paneId);
     state.lastActivityMs.delete(paneId);
     state.layout = pruneLeaf(state.layout, paneId);
@@ -1419,6 +1449,12 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     });
     await listen("lease-state", (event) => {
       handleLeaseState(state, event.payload || {}, callbacks);
+    });
+    await listen("output-warning", (event) => {
+      handleOutputWarning(state, event.payload || {}, callbacks);
+    });
+    await listen("projects-changed", (event) => {
+      handleProjectsChanged(state, event.payload || {}, callbacks);
     });
     await listen("agent-event", (event) => {
       const payload = event.payload || {};

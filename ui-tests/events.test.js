@@ -10,6 +10,8 @@ import {
   handleAgentState,
   handleAgentEvent,
   handleLeaseState,
+  handleOutputWarning,
+  handleProjectsChanged,
   normalizeLeaseInfo,
   leaseEquals,
   normalizeAgentState,
@@ -635,5 +637,52 @@ describe("agent permission mode", () => {
     );
     expect(callbacks.calls.render).toBe(2);
     expect(state.agentStates.get("pane-1").unattended).toBe(true);
+  });
+});
+
+describe("output warnings and projects", () => {
+  it("records a pane's output-guard total and ignores unknown panes and repeats", () => {
+    const state = makeState([{ id: "pane-1" }]);
+    const callbacks = makeCallbacks();
+    handleOutputWarning(
+      state,
+      { pane_id: "pane-1", added: { conceal: 1 }, total: { conceal: 1 } },
+      callbacks,
+    );
+    expect(state.outputWarnings.get("pane-1")).toEqual({
+      counts: { conceal: 1, clipboard: 0, hyperlink_mismatch: 0, string_controls: 0, c1_controls: 0 },
+      total: 1,
+    });
+    expect(callbacks.calls.render).toBe(1);
+    handleOutputWarning(state, { pane_id: "pane-1", total: { conceal: 1 } }, callbacks);
+    expect(callbacks.calls.render).toBe(1);
+    handleOutputWarning(state, { pane_id: "pane-1", total: { conceal: 1, clipboard: 2 } }, callbacks);
+    expect(state.outputWarnings.get("pane-1").total).toBe(3);
+    expect(callbacks.calls.render).toBe(2);
+    handleOutputWarning(state, { pane_id: "ghost", total: { conceal: 5 } }, callbacks);
+    expect(state.outputWarnings.has("ghost")).toBe(false);
+    expect(callbacks.calls.render).toBe(2);
+    // Closing the pane drops its warning with the rest of its state.
+    handlePaneClosed(state, { pane_id: "pane-1" }, callbacks);
+    expect(state.outputWarnings.has("pane-1")).toBe(false);
+  });
+
+  it("replaces the project table on projects-changed and skips no-op repeats", () => {
+    const state = makeState([{ id: "pane-1" }]);
+    const callbacks = makeCallbacks();
+    handleProjectsChanged(
+      state,
+      { projects: { feat: { name: "feat", goal: "ship", panes: ["pane-1"] } } },
+      callbacks,
+    );
+    expect(state.projects.get("feat")).toEqual({ name: "feat", goal: "ship", repo: null, panes: ["pane-1"] });
+    expect(callbacks.calls.render).toBe(1);
+    handleProjectsChanged(state, { projects: { feat: { goal: "ship", panes: ["pane-1"] } } }, callbacks);
+    expect(callbacks.calls.render).toBe(1);
+    handleProjectsChanged(state, { projects: {} }, callbacks);
+    expect(state.projects.size).toBe(0);
+    expect(callbacks.calls.render).toBe(2);
+    handleProjectsChanged(state, {}, callbacks);
+    expect(callbacks.calls.render).toBe(2);
   });
 });
