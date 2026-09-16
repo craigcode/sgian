@@ -2580,6 +2580,12 @@ enum DaemonEvent {
         added: OutputTricks,
         total: OutputTricks,
     },
+    /// The project table after a change (create, delete, assign, unassign,
+    /// or a member pane closing): the whole map, small and idempotent, so a
+    /// client renders a board without diffing. Old clients skip the tag.
+    ProjectsChanged {
+        projects: HashMap<String, Project>,
+    },
     /// Keyboard lease transition (docs/design/keyboard-lease-and-ledger.md).
     /// `holder`/`since_ms` describe the lease AFTER the transition (null once
     /// released or revoked); `note` rides a release. Old clients skip the
@@ -8843,6 +8849,7 @@ impl DaemonServer {
                 .map(|mut projects| projects.remove(&name));
             return Err(error);
         }
+        self.broadcast_projects();
         Ok(json!(project))
     }
 
@@ -8860,6 +8867,7 @@ impl DaemonServer {
                 .map(|mut projects| projects.insert(name.to_string(), project.clone()));
             return Err(error);
         }
+        self.broadcast_projects();
         Ok(json!(project))
     }
 
@@ -8895,6 +8903,7 @@ impl DaemonServer {
         }
         let _ = self.ledger_record(pane_id, "project.assigned", json!({ "project": name }));
         self.persist()?;
+        self.broadcast_projects();
         Ok(json!({ "pane_id": pane_id, "project": name, "previous": previous }))
     }
 
@@ -8912,17 +8921,30 @@ impl DaemonServer {
         if let Some(name) = &left {
             let _ = self.ledger_record(pane_id, "project.unassigned", json!({ "project": name }));
             self.persist()?;
+            self.broadcast_projects();
         }
         Ok(json!({ "pane_id": pane_id, "project": left }))
     }
 
-    /// Drop a closed pane from its project (the caller persists).
-    fn forget_pane_in_projects(&self, pane_id: &str) {
+    /// Drop a closed pane from its project (the caller persists). Returns
+    /// whether any project changed so the caller can announce it.
+    fn forget_pane_in_projects(&self, pane_id: &str) -> bool {
+        let mut changed = false;
         if let Ok(mut projects) = self.lock_projects() {
             for project in projects.values_mut() {
+                let before = project.panes.len();
                 project.panes.retain(|id| id != pane_id);
+                changed |= project.panes.len() != before;
             }
         }
+        changed
+    }
+
+    /// Tell subscribers the project table changed. Called with no lock held.
+    fn broadcast_projects(&self) {
+        self.router.broadcast(&DaemonEvent::ProjectsChanged {
+            projects: self.projects_snapshot(),
+        });
     }
 
     fn project_summaries(&self) -> Result<Vec<ProjectSummary>, String> {
@@ -9514,7 +9536,7 @@ impl DaemonServer {
                 // So does its keyboard lease (ledgered as revoked; the ledger
                 // file itself is kept).
                 self.revoke_lease_on_close(&pane_id);
-                self.forget_pane_in_projects(&pane_id);
+                let project_changed = self.forget_pane_in_projects(&pane_id);
                 self.router.remove_output_guard(&pane_id);
                 self.lock_terminals()?.close_pane(&pane_id);
                 self.router.invalidate_append_handle(&pane_id);
@@ -9527,6 +9549,9 @@ impl DaemonServer {
                 self.router.broadcast(&DaemonEvent::PaneClosed {
                     pane_id: pane_id.clone(),
                 });
+                if project_changed {
+                    self.broadcast_projects();
+                }
                 // Return the daemon-enriched snapshot (runtime + provider
                 // identity), not PaneRegistry's structural-only snapshot.
                 // Otherwise closing any pane makes surviving Droid panes look
@@ -14121,6 +14146,10 @@ fn emit_daemon_event(app: &AppHandle, event: DaemonEvent) {
                 "output-warning",
                 json!({ "pane_id": pane_id, "added": added, "total": total }),
             );
+        }
+        // The whole project table after a change; the overview groups by it.
+        DaemonEvent::ProjectsChanged { projects } => {
+            let _ = app.emit("projects-changed", json!({ "projects": projects }));
         }
         // Keyboard lease transitions ride to the frontend as `lease-state`
         // (docs/design/keyboard-lease-and-ledger.md); the M2 client work
@@ -37851,6 +37880,97 @@ exit 0
             })
             .expect_err("unknown project");
         assert!(missing.contains("unknown project"), "{missing}");
+        daemon.shutdown();
+    }
+
+    #[test]
+    fn projects_changed_is_broadcast_on_every_mutation() {
+        let daemon = TestDaemon::spawn(Config::default());
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        let mut stream = client
+            .authenticated_stream()
+            .expect("subscribe stream should connect");
+        write_json_line(&mut stream, &DaemonRequest::Subscribe).expect("subscribe should write");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("read timeout should apply");
+
+        client
+            .request::<Project>(DaemonRequest::ProjectCreate {
+                name: "feat".to_string(),
+                goal: None,
+                repo: None,
+            })
+            .expect("create");
+        client
+            .request::<Value>(DaemonRequest::ProjectAssign {
+                name: "feat".to_string(),
+                pane_id: pane_id.clone(),
+            })
+            .expect("assign");
+        let extra: Pane = client
+            .request(DaemonRequest::CreatePane {
+                title: None,
+                profile: None,
+            })
+            .expect("second pane");
+        client
+            .request::<Value>(DaemonRequest::ProjectUnassign {
+                pane_id: pane_id.clone(),
+            })
+            .expect("unassign");
+        client
+            .request::<Value>(DaemonRequest::ProjectUnassign {
+                pane_id: extra.id.clone(),
+            })
+            .expect("unassign of a non-member is a quiet no-op");
+        client
+            .request::<Value>(DaemonRequest::ProjectAssign {
+                name: "feat".to_string(),
+                pane_id: extra.id.clone(),
+            })
+            .expect("assign extra");
+        client
+            .request::<Value>(DaemonRequest::ClosePane {
+                pane_id: extra.id.clone(),
+            })
+            .expect("close member");
+        client
+            .request::<Project>(DaemonRequest::ProjectDelete {
+                name: "feat".to_string(),
+            })
+            .expect("delete");
+
+        // create, assign, unassign, assign, close (member), delete: six tables.
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        let mut tables: Vec<HashMap<String, Project>> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && tables.len() < 6 {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Ok(DaemonEvent::ProjectsChanged { projects }) =
+                        serde_json::from_str::<DaemonEvent>(&line)
+                    {
+                        tables.push(projects);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        assert_eq!(tables.len(), 6, "one ProjectsChanged per mutation");
+        assert_eq!(tables[0]["feat"].panes, Vec::<String>::new());
+        assert_eq!(tables[1]["feat"].panes, vec![pane_id.clone()]);
+        assert_eq!(tables[2]["feat"].panes, Vec::<String>::new());
+        assert_eq!(tables[3]["feat"].panes, vec![extra.id.clone()]);
+        assert_eq!(tables[4]["feat"].panes, Vec::<String>::new());
+        assert!(tables[5].is_empty());
         daemon.shutdown();
     }
 

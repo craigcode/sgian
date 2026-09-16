@@ -7,6 +7,11 @@ follow SemVer once the first public tag exists.
 
 ### Added
 
+- Project board in the Tauri client: the session overview groups panes by
+  project with the attention roll-up in each heading (needs input, working,
+  unattended, keyboard holders, output warnings) plus keyboard and output
+  columns, and follows a new `projects_changed` daemon event. Output-guard
+  hits show as an amber `⚠ N` badge on the pane tab and header.
 - `ctl project dossier NAME [--lines N] [--out FILE]`: one JSON document per
   project (roll-up, each pane's state, full ledger with the chain verified,
   last N scrollback lines with citable numbers) for a reviewer or a Kranz

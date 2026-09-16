@@ -1005,6 +1005,42 @@ h1 {
   cursor: not-allowed;
 }
 
+/* Project board: one tbody per project with a heading row carrying the
+   attention roll-up (docs/design/keyboard-lease-and-ledger.md §7). */
+.overview-group-row th {
+  padding-top: 14px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.overview-group-name {
+  margin-right: 10px;
+}
+
+.overview-group-goal {
+  margin-right: 10px;
+  color: var(--muted);
+  font-weight: 400;
+  font-style: italic;
+}
+
+.overview-group-rollup {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.overview-keyboard,
+.overview-output {
+  white-space: nowrap;
+}
+
+.overview-output-warning {
+  color: var(--amber);
+}
+
 @media (max-width: 760px) {
   .app-shell {
     grid-template:
@@ -1600,4 +1636,20 @@ h3.md-heading {
 .agent-badge-unattended {
   color: var(--amber);
   font-weight: 600;
+}
+
+/* Output guard (docs/design/keyboard-lease-and-ledger.md §7): the pane's
+   output used a trick that hides something from a person. Rides the same
+   right cluster as the agent and lease badges. */
+.output-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--amber);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
 }

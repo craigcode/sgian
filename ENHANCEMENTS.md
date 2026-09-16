@@ -162,7 +162,10 @@ Shipped (2026-09-16):
   live, needs input, working, idle, unattended, keyboard holders), a
   per-pane detail view, and the members' ledgers merged in time order —
   the project-level "who did what" Cursor does not record. Daemon requests
-  plus `ctl project …` and `ctl new --project`; client rendering follows.
+  plus `ctl project …` and `ctl new --project`; a `projects_changed` event
+  carries the whole table after any change, and the Tauri session overview
+  is the board: one group per project with the roll-up in its heading,
+  keyboard-holder and output-guard columns.
 - **Output guard.** Per-pane counts of output tricks that hide content from
   a human (conceal, clipboard write, mismatched hyperlink, string controls,
   C1), rate-limited into the ledger (`output.suspicious`) and an
@@ -180,9 +183,10 @@ Open, in order:
 
 - **Execution grants** (`docs/design/execution-grants.md`): the Sgian half
   once `kranz-acp` and Kranz's `TerminalProvider` seam exist.
-- **Output-guard badges in the clients**, and stripping for agent panes.
-- **Project rendering in the clients** (sidebar grouping, roll-up counts,
-  the "listening" summary) and per-project shared context notes under git.
+- **Output-guard badges and project rendering in the native clients**
+  (the Tauri client has both: `⚠ N` badge, overview grouped by project with
+  the roll-up); stripping for agent panes; per-project shared context notes
+  under git.
 - **Notification-hook ingestion** (`agent_needs_input`, `permission_prompt`,
   `idle_prompt`) for sub-second needs-input without polling, and the relay
   to Kranz's hook-status lane for bound panes.

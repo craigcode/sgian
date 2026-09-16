@@ -10,6 +10,12 @@ import { flushSync } from "react-dom";
 import { renderMarkdown } from "./markdown.js";
 import { resolveSearchKeyAction } from "./search.js";
 import { zoomedPaneId } from "./zoom.js";
+import {
+  groupPanesByProject,
+  projectRollup,
+  rollupText,
+  outputWarningSummary,
+} from "./projects.js";
 import { buildPaletteCommands, filterPaletteCommands } from "./palette.js";
 
 function paneLabel(pane, index) {
@@ -73,6 +79,25 @@ function LeaseBadge({ info, holder }) {
       data-holder={info.holder}
     >
       ⌨ {mine ? "you" : info.holder}
+    </span>
+  );
+}
+
+/**
+ * Output-guard badge (docs/design/keyboard-lease-and-ledger.md §7): the pane's
+ * output used a trick that hides something from a person (concealed text,
+ * clipboard writes, mismatched links, opaque control strings, C1 controls).
+ * Counts only ever grow for a pane's life; the title lists them.
+ */
+function OutputBadge({ warning }) {
+  if (!warning) return null;
+  return (
+    <span
+      className="output-badge"
+      title={`Output hid something: ${outputWarningSummary(warning)}`}
+      data-total={warning.total}
+    >
+      ⚠ {warning.total}
     </span>
   );
 }
@@ -367,6 +392,7 @@ function PaneTabs({ state, controller }) {
           <span className="pane-tab-number">{index + 1}</span>
           <strong>{paneLabel(pane, index)}</strong>
           <AgentBadge info={state.agentStates.get(pane.id)} />
+          <OutputBadge warning={state.outputWarnings?.get(pane.id)} />
         </button>
       ))}
     </div>
@@ -770,6 +796,7 @@ function Pane({ paneId, state, controller }) {
           ✎
         </button>
         <AgentBadge info={state.agentStates.get(paneId)} />
+        <OutputBadge warning={state.outputWarnings?.get(paneId)} />
         <LeaseBadge info={state.leases.get(paneId)} holder={state.holder} />
         <span className="pane-meta">
           {runtime === "ended" ? `ended · ${paneMeta}` : paneMeta}
@@ -1163,6 +1190,77 @@ function SessionOverview({ state, controller }) {
   };
 
   const panes = Array.from(state.panes.values());
+  const groups = groupPanesByProject(state.panes, state.projects ?? new Map());
+  const paneIndex = new Map(panes.map((pane, index) => [pane.id, index]));
+  const holderText = (lease) => {
+    if (!lease) return "—";
+    return state.holder && lease.holder === state.holder ? "you" : lease.holder;
+  };
+  const renderPaneRow = (pane) => {
+    const index = paneIndex.get(pane.id) ?? 0;
+    const runtime = controller.paneRuntimeState(pane.id);
+    const agentInfo = state.agentStates.get(pane.id);
+    const lastActivity = state.lastActivityMs.get(pane.id);
+    const warning = state.outputWarnings?.get(pane.id);
+    const canClose = state.panes.size > 1;
+    return (
+      <tr
+        key={pane.id}
+        data-pane-id={pane.id}
+        data-active={pane.id === state.activePaneId ? "true" : undefined}
+      >
+        <td>{paneLabel(pane, index)}</td>
+        <td>{pane.kind}</td>
+        <td>{runtime}</td>
+        <td>{agentAttentionLabel(agentInfo)}</td>
+        <td className="overview-keyboard">{holderText(state.leases.get(pane.id))}</td>
+        <td className={warning ? "overview-output overview-output-warning" : "overview-output"}>
+          {warning ? `⚠ ${outputWarningSummary(warning)}` : "—"}
+        </td>
+        <td>{formatLastActivity(lastActivity, now)}</td>
+        <td className="overview-actions">
+          <button
+            type="button"
+            className="overview-action"
+            onClick={() => {
+              controller.focusPane(pane.id);
+              controller.closeOverview();
+            }}
+          >
+            Focus
+          </button>
+          {pane.kind !== "agent" && (
+            <button
+              type="button"
+              className="overview-action"
+              onClick={() => void controller.restartPane(pane.id)}
+            >
+              Restart
+            </button>
+          )}
+          <button
+            type="button"
+            className="overview-action danger"
+            disabled={!canClose}
+            onClick={() => {
+              void controller.closePane(pane.id).then(() => {
+                queueMicrotask(() => {
+                  if (!controller.state.overviewOpen) return;
+                  modalRef.current
+                    ?.querySelector(
+                      'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+                    )
+                    ?.focus();
+                });
+              });
+            }}
+          >
+            Close
+          </button>
+        </td>
+      </tr>
+    );
+  };
 
   return (
     <div
@@ -1206,70 +1304,41 @@ function SessionOverview({ state, controller }) {
                   <th scope="col">Kind</th>
                   <th scope="col">Runtime</th>
                   <th scope="col">Agent</th>
+                  <th scope="col">Keyboard</th>
+                  <th scope="col">Output</th>
                   <th scope="col">Activity (this attach)</th>
                   <th scope="col">Actions</th>
                 </tr>
               </thead>
-              <tbody>
-                {panes.map((pane, index) => {
-                  const runtime = controller.paneRuntimeState(pane.id);
-                  const agentInfo = state.agentStates.get(pane.id);
-                  const lastActivity = state.lastActivityMs.get(pane.id);
-                  const canClose = state.panes.size > 1;
-                  return (
-                    <tr
-                      key={pane.id}
-                      data-active={pane.id === state.activePaneId ? "true" : undefined}
-                    >
-                      <td>{paneLabel(pane, index)}</td>
-                      <td>{pane.kind}</td>
-                      <td>{runtime}</td>
-                      <td>{agentAttentionLabel(agentInfo)}</td>
-                      <td>{formatLastActivity(lastActivity, now)}</td>
-                      <td className="overview-actions">
-                        <button
-                          type="button"
-                          className="overview-action"
-                          onClick={() => {
-                            controller.focusPane(pane.id);
-                            controller.closeOverview();
-                          }}
-                        >
-                          Focus
-                        </button>
-                        {pane.kind !== "agent" && (
-                          <button
-                            type="button"
-                            className="overview-action"
-                            onClick={() => void controller.restartPane(pane.id)}
-                          >
-                            Restart
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          className="overview-action danger"
-                          disabled={!canClose}
-                          onClick={() => {
-                            void controller.closePane(pane.id).then(() => {
-                              queueMicrotask(() => {
-                                if (!controller.state.overviewOpen) return;
-                                modalRef.current
-                                  ?.querySelector(
-                                    'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-                                  )
-                                  ?.focus();
-                              });
-                            });
-                          }}
-                        >
-                          Close
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
+              {groups.map((group) => {
+                const rollup = projectRollup(group.panes, state);
+                const key = group.name ?? "\u0000unassigned";
+                const showHeading = group.name !== null || groups.length > 1;
+                return (
+                  <tbody
+                    key={key}
+                    className="overview-group"
+                    data-project={group.name ?? undefined}
+                  >
+                    {showHeading && (
+                      <tr className="overview-group-row">
+                        <th scope="rowgroup" colSpan={8}>
+                          <span className="overview-group-name">
+                            {group.name ?? "No project"}
+                          </span>
+                          {group.goal && (
+                            <span className="overview-group-goal" title={group.goal}>
+                              {group.goal}
+                            </span>
+                          )}
+                          <span className="overview-group-rollup">{rollupText(rollup)}</span>
+                        </th>
+                      </tr>
+                    )}
+                    {group.panes.map(renderPaneRow)}
+                  </tbody>
+                );
+              })}
             </table>
           )}
         </div>

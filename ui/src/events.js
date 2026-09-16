@@ -14,6 +14,12 @@ import {
   applyAgentEvent,
   clampAgentChatToPaneEnded,
 } from "./agent.js";
+import {
+  normalizeOutputWarning,
+  outputWarningEquals,
+  normalizeProjects,
+  projectsEqual,
+} from "./projects.js";
 
 /**
  * Set a pane's runtime state ("live" or "ended") in the state map.
@@ -154,6 +160,38 @@ export function handleLeaseState(state, payload, callbacks) {
 }
 
 /**
+ * Handle an `output-warning` event (docs/design/keyboard-lease-and-ledger.md
+ * §7): the daemon's output guard counted a trick an agent can use to hide
+ * something from a person. `total` is the pane's running count and is what
+ * the badge shows; `added` is informational. Same unknown-pane guard.
+ */
+export function handleOutputWarning(state, payload, callbacks) {
+  const paneId = payload.pane_id || payload.paneId;
+  if (!paneId) return;
+  if (!state.panes.has(paneId)) return;
+  if (!state.outputWarnings) state.outputWarnings = new Map();
+  const next = normalizeOutputWarning(payload.total);
+  const existing = state.outputWarnings.get(paneId) ?? null;
+  if (outputWarningEquals(existing, next)) return;
+  if (next) state.outputWarnings.set(paneId, next);
+  else state.outputWarnings.delete(paneId);
+  callbacks.render();
+}
+
+/**
+ * Handle a `projects-changed` event: the daemon sends the whole project
+ * table after any change, so this replaces rather than diffs. Member pane
+ * ids the client does not know are kept (the pane-created event may still
+ * be in flight); the board skips them at render time.
+ */
+export function handleProjectsChanged(state, payload, callbacks) {
+  const next = normalizeProjects(payload?.projects);
+  if (projectsEqual(state.projects, next)) return;
+  state.projects = next;
+  callbacks.render();
+}
+
+/**
  * Handle an `agent-event` (T2): fold one normalized agent event into the
  * pane's chat state and schedule a (rAF-throttled) chat re-render. Same
  * unknown-pane guard as the other handlers: a trailing event for a deleted
@@ -227,6 +265,8 @@ export function handlePaneClosed(state, payload, callbacks) {
   state.agentStates.delete(paneId);
   state.agentSpecs?.delete(paneId);
   state.lastActivityMs?.delete(paneId);
+  state.outputWarnings?.delete(paneId);
+  state.leases?.delete(paneId);
   // (T2) The pane's chat goes with it (mirrors the agentStates drop).
   state.chats?.delete(paneId);
   callbacks.disposeChatView?.(paneId);
