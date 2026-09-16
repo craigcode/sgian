@@ -1,0 +1,14 @@
+[package]
+name = "sgian-pty"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Reserved: Sgian's ConPTY and POSIX PTY layer, to be published once it is split out of the daemon."
+repository = "https://github.com/craigcode/sgian"
+homepage = "https://github.com/craigcode/sgian"
+readme = "README.md"
+keywords = ["pty", "conpty", "terminal", "agent"]
+categories = ["os", "command-line-utilities"]
+
+[dependencies]
