@@ -157,6 +157,13 @@ A single binary runs in three modes:
   roll-up (needs input / working / idle / unattended / keyboard holders) and
   the member panes' ledgers merged in time order. `ctl new --project NAME`
   creates a pane straight into one.
+- Output guard: every pane's output is scanned for the tricks an agent can
+  use to hide things from the person watching (SGR 8 conceal, OSC 52
+  clipboard writes, OSC 8 hyperlinks whose visible text is a URL on another
+  host, DCS/APC/PM/SOS strings, raw C1 controls). Counts are per pane, land
+  in the ledger as `output.suspicious` (rate-limited), ride an
+  `output_warning` event, and show as `HIDDEN-OUTPUT` in `ctl agent`.
+  Ordinary redraws are never counted.
 - `ctl search <PANE> [-i] [-n N] <NEEDLE>` for a substring search over a pane's
   whole scrollback with control sequences stripped, and `ctl lines <PANE> A:B`
   to print the cited range, so a ledger record or a search hit can point at

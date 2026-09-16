@@ -158,9 +158,15 @@ Shipped (2026-09-16):
   per-pane detail view, and the members' ledgers merged in time order —
   the project-level "who did what" Cursor does not record. Daemon requests
   plus `ctl project …` and `ctl new --project`; client rendering follows.
+- **Output guard.** Per-pane counts of output tricks that hide content from
+  a human (conceal, clipboard write, mismatched hyperlink, string controls,
+  C1), rate-limited into the ledger (`output.suspicious`) and an
+  `output_warning` event, in `find --json` and `ctl agent`
+  (`HIDDEN-OUTPUT …`), and in the bootstrap snapshot's `output_warnings`.
 
 Open, in order:
 
+- **Output-guard badges in the clients**, and stripping for agent panes.
 - **Project rendering in the clients** (sidebar grouping, roll-up counts,
   the "listening" summary) and per-project shared context notes under git.
 - **Notification-hook ingestion** (`agent_needs_input`, `permission_prompt`,
