@@ -1609,6 +1609,9 @@ pub struct WorkspaceSnapshot {
     /// Additive: old daemons omit it, old clients ignore it.
     #[serde(default)]
     pub leases: HashMap<String, LeaseInfo>,
+    /// Output-guard counters for panes with at least one hit. Additive.
+    #[serde(default)]
+    pub output_warnings: HashMap<String, OutputTricks>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2520,6 +2523,13 @@ enum DaemonEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
     },
+    /// Output-guard hit: `added` since the last announcement, `total` so far
+    /// (docs/design/keyboard-lease-and-ledger.md §7). Rate-limited per pane.
+    OutputWarning {
+        pane_id: String,
+        added: OutputTricks,
+        total: OutputTricks,
+    },
     /// Keyboard lease transition (docs/design/keyboard-lease-and-ledger.md).
     /// `holder`/`since_ms` describe the lease AFTER the transition (null once
     /// released or revoked); `note` rides a release. Old clients skip the
@@ -2646,6 +2656,9 @@ struct FindEntry {
     mode: Option<String>,
     #[serde(default)]
     unattended: bool,
+    /// Output-guard counters; absent when nothing was flagged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_warnings: Option<OutputTricks>,
     group: Option<String>,
     cols: u16,
     rows: u16,
@@ -2823,6 +2836,7 @@ impl PaneRegistry {
             agent_events: HashMap::new(),
             agent_specs: HashMap::new(),
             leases: HashMap::new(),
+            output_warnings: HashMap::new(),
         }
     }
 
@@ -3472,6 +3486,8 @@ struct OutputRouter {
     /// once by `DaemonServer::with_config`; `None` in unit tests that build a
     /// bare router. Attention transitions and pane ends are noted here.
     ledger: Arc<std::sync::OnceLock<Arc<Mutex<LedgerSink>>>>,
+    /// Per-pane output-guard counters (see `scan_output_tricks`). Leaf lock.
+    output_guard: Arc<Mutex<HashMap<String, OutputGuardState>>>,
 }
 
 /// Cached append state for one pane's scrollback file (M11): the open handle
@@ -3495,6 +3511,78 @@ impl OutputRouter {
             append_handles: Arc::new(Mutex::new(HashMap::new())),
             agents: Arc::new(Mutex::new(AgentTracker::default())),
             ledger: Arc::new(std::sync::OnceLock::new()),
+            output_guard: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Count hiding tricks in one output chunk; announce (ledger + event) on
+    /// the first hit and then at most every `OUTPUT_WARNING_ANNOUNCE_INTERVAL`.
+    fn record_output_tricks(&self, pane_id: &str, data: &str) {
+        // Cheap pre-check: nothing to find without an ESC or a non-ASCII byte.
+        if !data.bytes().any(|byte| byte == 0x1b || byte >= 0x80) {
+            return;
+        }
+        let found = scan_output_tricks(data);
+        if found.total() == 0 {
+            return;
+        }
+        let announce = {
+            let Ok(mut guard) = self.output_guard.lock() else {
+                return;
+            };
+            let entry = guard.entry(pane_id.to_string()).or_default();
+            entry.total.add(&found);
+            let due = entry
+                .last_announced
+                .is_none_or(|at| at.elapsed() >= OUTPUT_WARNING_ANNOUNCE_INTERVAL);
+            if due {
+                entry.last_announced = Some(Instant::now());
+                let added = entry.total.minus(&entry.announced);
+                entry.announced = entry.total;
+                Some((added, entry.total))
+            } else {
+                None
+            }
+        };
+        if let Some((added, total)) = announce {
+            self.ledger_note(
+                pane_id,
+                "output.suspicious",
+                json!({ "added": added, "total": total, "evidence": "scan" }),
+            );
+            self.broadcast(&DaemonEvent::OutputWarning {
+                pane_id: pane_id.to_string(),
+                added,
+                total,
+            });
+        }
+    }
+
+    fn output_tricks(&self, pane_id: &str) -> OutputTricks {
+        self.output_guard
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(pane_id).map(|entry| entry.total))
+            .unwrap_or_default()
+    }
+
+    /// Every pane with at least one counted trick.
+    fn output_warnings(&self) -> HashMap<String, OutputTricks> {
+        self.output_guard
+            .lock()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter(|(_, entry)| entry.total.total() > 0)
+                    .map(|(pane_id, entry)| (pane_id.clone(), entry.total))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn remove_output_guard(&self, pane_id: &str) {
+        if let Ok(mut guard) = self.output_guard.lock() {
+            guard.remove(pane_id);
         }
     }
 
@@ -4326,6 +4414,7 @@ impl OutputRouter {
             return;
         }
         let _ = self.append_scrollback(pane_id, &data);
+        self.record_output_tricks(pane_id, &data);
 
         let event = DaemonEvent::PtyOutput {
             pane_id: pane_id.to_string(),
@@ -7280,6 +7369,192 @@ impl SubscriptionBackoff {
 }
 
 // ---------------------------------------------------------------------------
+// Output guard (docs/design/keyboard-lease-and-ledger.md §7): count the
+// terminal tricks an agent can use to hide output from the person watching.
+// ---------------------------------------------------------------------------
+
+/// Per-pane counts of output that hides something from a human reader.
+/// Ordinary TUI redraws (cursor moves, erase-line) are deliberately NOT
+/// counted: agents repaint constantly and that would be all noise.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutputTricks {
+    /// SGR 8 (conceal): text present but invisible.
+    #[serde(default)]
+    pub conceal: u32,
+    /// OSC 52: writing the clipboard from output (exfiltration vector).
+    #[serde(default)]
+    pub clipboard: u32,
+    /// OSC 8 hyperlink whose visible text is a URL on a different host.
+    #[serde(default)]
+    pub hyperlink_mismatch: u32,
+    /// DCS / APC / PM / SOS strings: opaque payloads the emulator swallows.
+    #[serde(default)]
+    pub string_controls: u32,
+    /// Raw C1 control characters (U+0080..U+009F) in the text stream.
+    #[serde(default)]
+    pub c1_controls: u32,
+}
+
+impl OutputTricks {
+    fn total(&self) -> u32 {
+        self.conceal
+            + self.clipboard
+            + self.hyperlink_mismatch
+            + self.string_controls
+            + self.c1_controls
+    }
+
+    fn add(&mut self, other: &OutputTricks) {
+        self.conceal = self.conceal.saturating_add(other.conceal);
+        self.clipboard = self.clipboard.saturating_add(other.clipboard);
+        self.hyperlink_mismatch = self
+            .hyperlink_mismatch
+            .saturating_add(other.hyperlink_mismatch);
+        self.string_controls = self.string_controls.saturating_add(other.string_controls);
+        self.c1_controls = self.c1_controls.saturating_add(other.c1_controls);
+    }
+
+    fn minus(&self, other: &OutputTricks) -> OutputTricks {
+        OutputTricks {
+            conceal: self.conceal.saturating_sub(other.conceal),
+            clipboard: self.clipboard.saturating_sub(other.clipboard),
+            hyperlink_mismatch: self
+                .hyperlink_mismatch
+                .saturating_sub(other.hyperlink_mismatch),
+            string_controls: self.string_controls.saturating_sub(other.string_controls),
+            c1_controls: self.c1_controls.saturating_sub(other.c1_controls),
+        }
+    }
+}
+
+/// The host of a URL-ish string (`scheme://host[:port]/…` or `www.host…`),
+/// lowercased; None when it does not look like a URL.
+fn url_host(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let rest = if let Some((_, rest)) = trimmed.split_once("://") {
+        rest
+    } else if trimmed.starts_with("www.") {
+        trimmed
+    } else {
+        return None;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Scan one output chunk. Sequences split across chunks are missed, which is
+/// acceptable for a counter meant to raise a flag, not to censor.
+fn scan_output_tricks(text: &str) -> OutputTricks {
+    let mut tricks = OutputTricks::default();
+    let mut chars = text.chars().peekable();
+    // The open OSC 8 target host while inside a hyperlink, and the visible
+    // text collected under it.
+    let mut link_host: Option<String> = None;
+    let mut link_text = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    let mut params = String::new();
+                    let mut final_byte = None;
+                    for next in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            final_byte = Some(next);
+                            break;
+                        }
+                        params.push(next);
+                    }
+                    if final_byte == Some('m') {
+                        // SGR: a standalone `8` conceals; `38;5;8` (a colour
+                        // index) does not.
+                        let mut parts = params.split(';');
+                        while let Some(part) = parts.next() {
+                            match part {
+                                "8" => tricks.conceal += 1,
+                                "38" | "48" | "58" => match parts.next() {
+                                    Some("5") => {
+                                        parts.next();
+                                    }
+                                    Some("2") => {
+                                        for _ in 0..3 {
+                                            parts.next();
+                                        }
+                                    }
+                                    _ => {}
+                                },
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Some(']') => {
+                    let mut body = String::new();
+                    let mut previous_esc = false;
+                    for next in chars.by_ref() {
+                        if next == '\u{7}' || (previous_esc && next == '\\') {
+                            break;
+                        }
+                        previous_esc = next == '\u{1b}';
+                        if !previous_esc {
+                            body.push(next);
+                        }
+                    }
+                    if body.starts_with("52;") {
+                        tricks.clipboard += 1;
+                    } else if let Some(rest) = body.strip_prefix("8;") {
+                        let target = rest.split_once(';').map(|(_, t)| t).unwrap_or("");
+                        if target.is_empty() {
+                            // Closing the link: compare what was shown with where it went.
+                            if let (Some(host), Some(shown)) =
+                                (link_host.take(), url_host(&link_text))
+                            {
+                                if shown != host {
+                                    tricks.hyperlink_mismatch += 1;
+                                }
+                            }
+                            link_text.clear();
+                        } else {
+                            link_host = url_host(target);
+                            link_text.clear();
+                        }
+                    }
+                }
+                Some('P') | Some('_') | Some('^') | Some('X') => {
+                    tricks.string_controls += 1;
+                    let mut previous_esc = false;
+                    for next in chars.by_ref() {
+                        if next == '\u{7}' || (previous_esc && next == '\\') {
+                            break;
+                        }
+                        previous_esc = next == '\u{1b}';
+                    }
+                }
+                _ => {}
+            },
+            '\u{80}'..='\u{9f}' => tricks.c1_controls += 1,
+            c => {
+                if link_host.is_some() {
+                    link_text.push(c);
+                }
+            }
+        }
+    }
+    tricks
+}
+
+/// Announce at most this often per pane (ledger + event); counts always accumulate.
+const OUTPUT_WARNING_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Default)]
+struct OutputGuardState {
+    total: OutputTricks,
+    announced: OutputTricks,
+    last_announced: Option<Instant>,
+}
+
+// ---------------------------------------------------------------------------
 // Keyboard lease and session ledger (docs/design/keyboard-lease-and-ledger.md)
 //
 // Pure state, predicates, and the hash-chained ledger writer/verifier. The
@@ -8672,6 +8947,7 @@ impl DaemonServer {
                 // So does its keyboard lease (ledgered as revoked; the ledger
                 // file itself is kept).
                 self.revoke_lease_on_close(&pane_id);
+                self.router.remove_output_guard(&pane_id);
                 self.lock_terminals()?.close_pane(&pane_id);
                 self.router.invalidate_append_handle(&pane_id);
                 let _ = fs::remove_file(scrollback_path(&self.scrollback_dir, &pane_id));
@@ -9485,6 +9761,10 @@ impl DaemonServer {
                 attention: agent_info.attention,
                 mode: agent_info.mode,
                 unattended: agent_info.unattended,
+                output_warnings: {
+                    let tricks = self.router.output_tricks(&pane.id);
+                    (tricks.total() > 0).then_some(tricks)
+                },
                 group: None,
                 cols,
                 rows,
@@ -10000,6 +10280,7 @@ impl DaemonServer {
         // Held keyboard leases ride alongside so a client can render the
         // holder without a second request.
         snapshot.leases = self.lease_infos();
+        snapshot.output_warnings = self.router.output_warnings();
         // (T2) Bounded conversation replay for agent panes, read back from the
         // per-pane JSONL log (covers live, ended, and not-yet-respawned panes).
         for pane in &snapshot.panes {
@@ -13210,6 +13491,16 @@ fn emit_daemon_event(app: &AppHandle, event: DaemonEvent) {
                     "mode": mode,
                     "unattended": unattended,
                 }),
+            );
+        }
+        DaemonEvent::OutputWarning {
+            pane_id,
+            added,
+            total,
+        } => {
+            let _ = app.emit(
+                "output-warning",
+                json!({ "pane_id": pane_id, "added": added, "total": total }),
             );
         }
         // Keyboard lease transitions ride to the frontend as `lease-state`
@@ -16940,6 +17231,10 @@ fn format_watch_event(event: &DaemonEvent, json_output: bool) -> Option<String> 
                 .unwrap_or_else(|| "-".to_string())
         ),
         DaemonEvent::PaneClosed { pane_id } => format!("{pane_id}\tpane_closed"),
+        DaemonEvent::OutputWarning { pane_id, total, .. } => format!(
+            "{pane_id}\toutput_warning{}",
+            format_output_warning(&serde_json::to_value(total).unwrap_or(Value::Null))
+        ),
         _ => return None,
     };
     if json_output {
@@ -16949,9 +17244,27 @@ fn format_watch_event(event: &DaemonEvent, json_output: bool) -> Option<String> 
     }
 }
 
+/// `\tHIDDEN-OUTPUT conceal=2 clipboard=1` for a non-empty counter object, else "".
+fn format_output_warning(tricks: &Value) -> String {
+    let Some(map) = tricks.as_object() else {
+        return String::new();
+    };
+    let parts: Vec<String> = map
+        .iter()
+        .filter(|(_, count)| count.as_u64().unwrap_or(0) > 0)
+        .map(|(kind, count)| format!("{kind}={}", count.as_u64().unwrap_or(0)))
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("\tHIDDEN-OUTPUT {}", parts.join(" "))
+    }
+}
+
 fn watch_event_pane(event: &DaemonEvent) -> Option<&str> {
     match event {
-        DaemonEvent::AgentState { pane_id, .. }
+        DaemonEvent::OutputWarning { pane_id, .. }
+        | DaemonEvent::AgentState { pane_id, .. }
         | DaemonEvent::LeaseState { pane_id, .. }
         | DaemonEvent::PaneEnded { pane_id, .. }
         | DaemonEvent::PaneClosed { pane_id } => Some(pane_id),
@@ -17053,6 +17366,10 @@ fn query_agent_state(client: &DaemonClient, pane_id: &str) -> Result<Value, Stri
             .and_then(|entry| entry.get("unattended"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        "output_warnings": entry
+            .and_then(|entry| entry.get("output_warnings"))
+            .cloned()
+            .unwrap_or(Value::Null),
     }))
 }
 
@@ -17086,6 +17403,15 @@ fn control_agent(client: &DaemonClient, args: &[String], json_output: bool) -> R
         write_json_stdout(&state)
     } else {
         let mut stdout = std::io::stdout();
+        let suffix = format!(
+            "{}{}",
+            if state["unattended"].as_bool().unwrap_or(false) {
+                "\tUNATTENDED"
+            } else {
+                ""
+            },
+            format_output_warning(&state["output_warnings"])
+        );
         writeln!(
             stdout,
             "{}\t{}\t{}\t{}{}",
@@ -17093,11 +17419,7 @@ fn control_agent(client: &DaemonClient, args: &[String], json_output: bool) -> R
             state["agent"].as_str().unwrap_or("-"),
             state["attention"].as_str().unwrap_or("-"),
             state["mode"].as_str().unwrap_or("-"),
-            if state["unattended"].as_bool().unwrap_or(false) {
-                "\tUNATTENDED"
-            } else {
-                ""
-            }
+            suffix
         )
         .map_err(|error| format!("failed to write stdout: {error}"))
     }
@@ -36189,6 +36511,80 @@ exit 0
             .expect_err("range too wide");
         assert!(bad.contains("at most"), "{bad}");
         daemon.shutdown();
+    }
+
+    #[test]
+    fn output_guard_counts_hiding_tricks_not_redraws() {
+        let none =
+            scan_output_tricks("plain text \u{1b}[32mgreen\u{1b}[0m \u{1b}[2K\u{1b}[A redraw\r\n");
+        assert_eq!(none, OutputTricks::default());
+        assert_eq!(scan_output_tricks("\u{1b}[38;5;8mgrey\u{1b}[0m").conceal, 0);
+        assert_eq!(
+            scan_output_tricks("\u{1b}[8mhidden\u{1b}[28m \u{1b}[1;8mx").conceal,
+            2
+        );
+        assert_eq!(scan_output_tricks("\u{1b}]52;c;aGVsbG8=\u{7}").clipboard, 1);
+        assert_eq!(scan_output_tricks("\u{1b}]0;title\u{7}").total(), 0);
+        let phish =
+            "\u{1b}]8;;https://evil.example/x\u{7}https://github.com/org/repo\u{1b}]8;;\u{7}";
+        assert_eq!(scan_output_tricks(phish).hyperlink_mismatch, 1);
+        let honest =
+            "\u{1b}]8;;https://github.com/org/repo\u{1b}\\github.com/org/repo\u{1b}]8;;\u{1b}\\";
+        assert_eq!(scan_output_tricks(honest).hyperlink_mismatch, 0);
+        let labelled = "\u{1b}]8;;https://docs.example/a\u{7}the docs\u{1b}]8;;\u{7}";
+        assert_eq!(scan_output_tricks(labelled).hyperlink_mismatch, 0);
+        assert_eq!(
+            scan_output_tricks("\u{1b}Pq payload\u{1b}\\ \u{1b}_apc\u{7}").string_controls,
+            2
+        );
+        assert_eq!(scan_output_tricks("a\u{85}b\u{9b}c").c1_controls, 2);
+        assert_eq!(
+            url_host("https://user@Example.com:8443/path"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            url_host("www.example.com/x"),
+            Some("www.example.com".to_string())
+        );
+        assert_eq!(url_host("just words"), None);
+    }
+
+    #[test]
+    fn output_guard_accumulates_and_rate_limits_announcements() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let router = OutputRouter::new(dir.path().join("scrollback"));
+        let ledger_dir = dir.path().join(LEDGER_DIR);
+        fs::create_dir_all(&ledger_dir).expect("ledger dir");
+        router.set_ledger(Arc::new(Mutex::new(LedgerSink::new(ledger_dir.clone()))));
+        fs::create_dir_all(dir.path().join("scrollback")).expect("scrollback dir");
+        router.ensure_model("pane-5", 80, 24);
+
+        router.emit("pane-5", "\u{1b}[8msecret\u{1b}[0m\n".to_string());
+        router.emit("pane-5", "\u{1b}]52;c;Zm9v\u{7}\n".to_string());
+        router.emit("pane-5", "nothing to see\n".to_string());
+        let total = router.output_tricks("pane-5");
+        assert_eq!(total.conceal, 1);
+        assert_eq!(total.clipboard, 1);
+        let records = read_ledger_tail(&ledger_path(&ledger_dir, "pane-5"), 0);
+        let suspicious: Vec<&Value> = records
+            .iter()
+            .filter(|record| record["type"] == json!("output.suspicious"))
+            .collect();
+        assert_eq!(
+            suspicious.len(),
+            1,
+            "a second hit inside the interval is not re-announced"
+        );
+        assert_eq!(suspicious[0]["payload"]["added"]["conceal"], json!(1));
+        assert_eq!(router.output_warnings().len(), 1);
+        assert_eq!(router.output_tricks("pane-9"), OutputTricks::default());
+        router.remove_output_guard("pane-5");
+        assert!(router.output_warnings().is_empty());
+        assert_eq!(
+            format_output_warning(&json!({"conceal": 2, "clipboard": 0})),
+            "\tHIDDEN-OUTPUT conceal=2"
+        );
+        assert_eq!(format_output_warning(&Value::Null), "");
     }
 
     #[test]

@@ -148,8 +148,17 @@ Shipped (2026-09-15):
   other control sequences stripped so search sees what a person saw.
 - **Output-flood regression test** with a measured 1.7 MB/s baseline (#18).
 
+Shipped (2026-09-16):
+
+- **Output guard.** Per-pane counts of output tricks that hide content from
+  a human (conceal, clipboard write, mismatched hyperlink, string controls,
+  C1), rate-limited into the ledger (`output.suspicious`) and an
+  `output_warning` event, in `find --json` and `ctl agent`
+  (`HIDDEN-OUTPUT …`), and in the bootstrap snapshot's `output_warnings`.
+
 Open, in order:
 
+- **Output-guard badges in the clients**, and stripping for agent panes.
 - **Notification-hook ingestion** (`agent_needs_input`, `permission_prompt`,
   `idle_prompt`) for sub-second needs-input without polling, and the relay
   to Kranz's hook-status lane for bound panes.

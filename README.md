@@ -152,6 +152,13 @@ A single binary runs in three modes:
   pane's ledger stays readable by id.
 - `ctl agent --watch [PANE] --json` to stream agent-state, lease and pane-end
   transitions to a script instead of polling.
+- Output guard: every pane's output is scanned for the tricks an agent can
+  use to hide things from the person watching (SGR 8 conceal, OSC 52
+  clipboard writes, OSC 8 hyperlinks whose visible text is a URL on another
+  host, DCS/APC/PM/SOS strings, raw C1 controls). Counts are per pane, land
+  in the ledger as `output.suspicious` (rate-limited), ride an
+  `output_warning` event, and show as `HIDDEN-OUTPUT` in `ctl agent`.
+  Ordinary redraws are never counted.
 - `ctl search <PANE> [-i] [-n N] <NEEDLE>` for a substring search over a pane's
   whole scrollback with control sequences stripped, and `ctl lines <PANE> A:B`
   to print the cited range, so a ledger record or a search hit can point at

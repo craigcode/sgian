@@ -260,10 +260,15 @@ Ranked by leverage against effort. None are committed beyond M1.
    filters metadata only. A substring search over the scrollback file with
    `ctl lines <pane> a:b`
    is small and makes the ledger's `seq` range citable.
-3. **Terminal-output injection guard.** ATR-2026-00259 documents agents
-   hiding content from human review with OSC and cursor moves. Agent panes
-   should strip or flag OSC/DCS from model output before rendering; shell
-   panes badged as agents should at least surface a warning counter.
+3. **Terminal-output injection guard (shipped 2026-09-16).** ATR-2026-00259
+   documents agents hiding content from human review with OSC and cursor
+   moves. The daemon now counts, per pane, SGR 8 conceal, OSC 52 clipboard
+   writes, OSC 8 hyperlinks whose visible text names another host,
+   DCS/APC/PM/SOS strings and raw C1 controls; ordinary redraws are not
+   counted, since agents repaint constantly. Hits are ledgered as
+   `output.suspicious` at most every five seconds per pane, broadcast as
+   `output_warning`, and shown by `ctl agent`. Stripping (rather than
+   flagging) and client badges are still open.
 4. **Unattended-mode badge.** Any pane running under `auto`, `dontAsk`, or
    `bypassPermissions` must be visibly marked. Warp shipped auto-approve
    that bypassed its own denylist; the Claude Code deny-rule skip after 50

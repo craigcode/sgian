@@ -81,6 +81,12 @@ while a pane is held, so a client that wants to type into a held pane must
 take the lease and use `send_input_as`. See
 `docs/design/keyboard-lease-and-ledger.md`.
 
+The bootstrap snapshot may carry `output_warnings` (pane_id → per-kind
+counts of output that hides content: `conceal`, `clipboard`,
+`hyperlink_mismatch`, `string_controls`, `c1_controls`), and subscribers may
+receive `output_warning` events with `added` and `total`; both additive, and a
+client should mark such a pane.
+
 `agent_states` entries and `agent_state` events may carry `mode` (the
 agent's observed permission mode) and `unattended` (true when tools run
 without a person approving them); both are additive and clients must mark an
