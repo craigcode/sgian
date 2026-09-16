@@ -530,3 +530,23 @@ describe("keyboard lease UI", () => {
     view.unmount();
   });
 });
+
+describe("unattended agent badge", () => {
+  it("marks a pane whose agent runs without approval", async () => {
+    const { controller, listeners } = createHarness();
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    listeners.get("agent-state")({
+      payload: { pane_id: "pane-a", agent: "claude", attention: "idle", mode: "auto", unattended: true },
+    });
+    await waitFor(() => expect(view.container.querySelector(".agent-badge-unattended")).toBeTruthy());
+    const badge = view.container.querySelector(".agent-badge-unattended");
+    expect(badge.getAttribute("title")).toContain("without your approval");
+    expect(badge.dataset.mode).toBe("auto");
+    listeners.get("agent-state")({
+      payload: { pane_id: "pane-a", agent: "claude", attention: "idle", mode: "plan", unattended: false },
+    });
+    await waitFor(() => expect(view.container.querySelector(".agent-badge-unattended")).toBeNull());
+    view.unmount();
+  });
+});

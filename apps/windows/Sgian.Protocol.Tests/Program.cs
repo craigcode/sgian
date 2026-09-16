@@ -28,6 +28,7 @@ var tests = new (string Name, Action Body)[]
     ("Terminal bridge rejects foreign documents", TerminalBridgeOrigins),
     ("Native layout restoration and pane reconciliation", NativeLayouts),
     ("Keyboard lease model", KeyboardLease),
+    ("Agent permission mode", AgentPermissionMode),
 };
 
 var failures = new List<string>();
@@ -158,6 +159,16 @@ static void PermissionLifecycle()
     Equal("Bash", state.PendingPermission?.ToolName);
     state.Apply(Json("""{"kind":"permission_resolved","seq":2,"request_id":"r1","reason":"user"}"""));
     Equal<PendingPermission?>(null, state.PendingPermission);
+}
+
+static void AgentPermissionMode()
+{
+    var flagged = JsonSerializer.Deserialize<AgentPaneInfo>("""{"agent":"claude","attention":"idle","mode":"auto","unattended":true}""")!;
+    Equal("auto", flagged.Mode);
+    Equal(true, flagged.Unattended);
+    var legacy = JsonSerializer.Deserialize<AgentPaneInfo>("""{"agent":"claude","attention":"working"}""")!;
+    Equal(null, legacy.Mode);
+    Equal(false, legacy.Unattended);
 }
 
 static void KeyboardLease()

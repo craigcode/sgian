@@ -58,6 +58,14 @@ public sealed record AgentPaneInfo
 
     [JsonPropertyName("attention")]
     public string? Attention { get; init; }
+
+    /// <summary>The agent's observed permission mode (auto, bypass, …); null when unknown.</summary>
+    [JsonPropertyName("mode")]
+    public string? Mode { get; init; }
+
+    /// <summary>True when tools run without a person approving them (auto / bypass).</summary>
+    [JsonPropertyName("unattended")]
+    public bool Unattended { get; init; }
 }
 
 public sealed record AgentPaneSpec

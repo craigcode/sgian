@@ -7,6 +7,8 @@ public sealed class PaneViewModel : ObservableObject
     private string _title;
     private string _state = "live";
     private string? _attention;
+    private string? _mode;
+    private bool _unattended;
     private string? _leaseHolder;
     private bool _leaseIsMine;
     private AgentPaneSpec? _agentSpec;
@@ -49,6 +51,32 @@ public sealed class PaneViewModel : ObservableObject
         set
         {
             if (Set(ref _attention, value))
+            {
+                Raise(nameof(Subtitle));
+            }
+        }
+    }
+
+    /// <summary>The agent's observed permission mode, or null when unknown.</summary>
+    public string? Mode
+    {
+        get => _mode;
+        set
+        {
+            if (Set(ref _mode, value))
+            {
+                Raise(nameof(Subtitle));
+            }
+        }
+    }
+
+    /// <summary>True when the agent runs tools without approval; the pane must show it.</summary>
+    public bool Unattended
+    {
+        get => _unattended;
+        set
+        {
+            if (Set(ref _unattended, value))
             {
                 Raise(nameof(Subtitle));
             }
@@ -102,7 +130,8 @@ public sealed class PaneViewModel : ObservableObject
     {
         get
         {
-            var lease = LeaseHolder is null ? "" : $" · {LeaseLabel}";
+            var mode = Mode is null ? "" : Unattended ? $" · \u26A0 {Mode} (unattended)" : $" · {Mode}";
+            var lease = (LeaseHolder is null ? "" : $" · {LeaseLabel}") + mode;
             if (State == "ended")
             {
                 return "Ended" + lease;

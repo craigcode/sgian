@@ -33,23 +33,31 @@ function formatLastActivity(ms, now = Date.now()) {
 function agentAttentionLabel(info) {
   if (!info) return "—";
   const attention = info.attention ?? "idle";
-  if (attention === "needs_input") return `${info.agent} · needs input`;
-  if (attention === "working") return `${info.agent} · working`;
-  return info.agent;
+  const mode = info.unattended ? ` · ${info.mode} (unattended)` : info.mode ? ` · ${info.mode}` : "";
+  if (attention === "needs_input") return `${info.agent} · needs input${mode}`;
+  if (attention === "working") return `${info.agent} · working${mode}`;
+  return `${info.agent}${mode}`;
 }
 
 function AgentBadge({ info }) {
   if (!info) return null;
   const attention = info.attention ?? "idle";
-  const title =
+  const base =
     attention === "needs_input"
       ? `${info.agent} needs input`
       : attention === "working"
         ? `${info.agent} is working`
         : info.agent;
+  const title = info.unattended
+    ? `${base} · ${info.mode}: tools run without your approval`
+    : base;
   return (
-    <span className={`agent-badge agent-badge-${attention}`} title={title}>
-      ◆
+    <span
+      className={`agent-badge agent-badge-${attention}${info.unattended ? " agent-badge-unattended" : ""}`}
+      title={title}
+      data-mode={info.mode ?? undefined}
+    >
+      ◆{info.unattended ? " ⚠" : ""}
     </span>
   );
 }
