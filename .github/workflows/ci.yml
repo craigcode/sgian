@@ -130,7 +130,7 @@ jobs:
             apps/macos/build/Sgian.app \
             apps/macos/build/Sgian-native-macos.zip
       - name: Upload native macOS artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sgian-macos-native-${{ runner.arch }}
           path: apps/macos/build/Sgian-native-macos.zip
@@ -253,7 +253,7 @@ jobs:
           xvfb-run -a bash scripts/ui-smoke.sh "$exe" "$ws" "$marker"
       - name: Upload Linux artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sgian-linux
           path: |
@@ -440,13 +440,13 @@ jobs:
       # for manual debugging on real hardware.
       - name: Upload installer artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sgian-windows-nsis
           path: src-tauri/target/release/bundle/nsis/*.exe
       - name: Upload native Windows artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sgian-windows-native-${{ runner.arch }}
           path: |
