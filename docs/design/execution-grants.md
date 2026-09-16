@@ -84,7 +84,8 @@ Sgian ledgers, on the pane the command ran in:
 
 - `grant.exec { grant, mission, run, argv, cwd }` when accepted (durable);
 - `grant.refused { grant?, reason }` when refused;
-- `pane.ended { exit_code }` as today, which closes the receipt;
+- `pane.ended { exit_code, agent, attention, mode, unattended, holder,
+  output_tricks? }` as today, which closes the receipt;
 - `output.suspicious` as today if the command's output hides anything.
 
 Kranz records the grant it issued and the terminal id it received. The two

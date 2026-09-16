@@ -2346,6 +2346,15 @@ enum DaemonRequest {
         #[serde(default)]
         limit: usize,
     },
+    /// Everything about a project in one document: the roll-up, each member
+    /// pane's state, its full ledger with the chain verified, and the tail of
+    /// its scrollback with controls stripped. `lines` = scrollback lines per
+    /// pane (0 = default). The receipt half of docs/design/execution-grants.md.
+    ProjectDossier {
+        name: String,
+        #[serde(default)]
+        lines: usize,
+    },
     ResizePaneTerminal {
         pane_id: String,
         cols: u16,
@@ -3440,6 +3449,10 @@ struct AgentPaneState {
     official_until: Option<Instant>,
     /// The permission mode read off the screen (see `classify_agent_mode`).
     mode: Option<String>,
+    /// The attention state the agent had when its process ended (taken by
+    /// `clear_agent_attention`), so `pane.ended` can say whether the agent
+    /// was still waiting on a person. Reset on the next spawn.
+    last_attention: Option<AgentAttention>,
 }
 
 impl AgentPaneState {
@@ -3530,7 +3543,14 @@ struct OutputRouter {
     ledger: Arc<std::sync::OnceLock<Arc<Mutex<LedgerSink>>>>,
     /// Per-pane output-guard counters (see `scan_output_tricks`). Leaf lock.
     output_guard: Arc<Mutex<HashMap<String, OutputGuardState>>>,
+    /// The daemon's lease table, shared so a `pane.ended` record can name the
+    /// keyboard holder at exit. Read only here; set once by
+    /// `DaemonServer::with_config`; `None` in unit tests. Leaf lock.
+    leases: Arc<std::sync::OnceLock<SharedLeases>>,
 }
+
+/// The daemon's lease table as shared with the output router.
+type SharedLeases = Arc<Mutex<HashMap<String, HeldLease>>>;
 
 /// Cached append state for one pane's scrollback file (M11): the open handle
 /// and the byte count as tracked by appends (a `stat` happens only when the
@@ -3553,6 +3573,7 @@ impl OutputRouter {
             append_handles: Arc::new(Mutex::new(HashMap::new())),
             agents: Arc::new(Mutex::new(AgentTracker::default())),
             ledger: Arc::new(std::sync::OnceLock::new()),
+            leases: Arc::new(std::sync::OnceLock::new()),
             output_guard: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -3630,6 +3651,18 @@ impl OutputRouter {
 
     fn set_ledger(&self, sink: Arc<Mutex<LedgerSink>>) {
         let _ = self.ledger.set(sink);
+    }
+
+    fn set_leases(&self, leases: SharedLeases) {
+        let _ = self.leases.set(leases);
+    }
+
+    /// The keyboard holder of a pane right now, if the lease table is wired.
+    fn lease_holder(&self, pane_id: &str) -> Option<String> {
+        self.leases
+            .get()
+            .and_then(|table| table.lock().ok())
+            .and_then(|table| table.get(pane_id).map(|held| held.holder.clone()))
     }
 
     /// Best-effort, non-durable ledger note from the output path. Called with
@@ -3883,6 +3916,7 @@ impl OutputRouter {
         if let Ok(mut tracker) = self.agents.lock() {
             if let Some(entry) = tracker.panes.get_mut(pane_id) {
                 entry.ended = false;
+                entry.last_attention = None;
             }
         }
     }
@@ -4323,10 +4357,9 @@ impl OutputRouter {
         let cleared = self.agents.lock().ok().and_then(|mut tracker| {
             let entry = tracker.panes.get_mut(pane_id)?;
             entry.ended = true;
-            entry
-                .attention
-                .take()
-                .map(|previous| (entry.agent.clone(), previous, entry.mode.clone()))
+            let previous = entry.attention.take()?;
+            entry.last_attention = Some(previous);
+            Some((entry.agent.clone(), previous, entry.mode.clone()))
         });
         if let Some((Some(agent), previous, mode)) = cleared {
             self.ledger_note(
@@ -4476,12 +4509,53 @@ impl OutputRouter {
             event = "pane_end",
             "pane ended"
         );
-        self.ledger_note(pane_id, "pane.ended", json!({ "exit_code": exit_code }));
+        self.ledger_note(
+            pane_id,
+            "pane.ended",
+            self.pane_exit_record(pane_id, exit_code),
+        );
         let event = DaemonEvent::PaneEnded {
             pane_id: pane_id.to_string(),
             exit_code,
         };
         self.broadcast(&event);
+    }
+
+    /// The `pane.ended` payload: the exit code plus what a reviewer (or a
+    /// Kranz gate) classifies the run on. `attention` is the state the agent
+    /// was in when its process ended (`needs_input` = it was still waiting on
+    /// a person), `holder` the keyboard holder at exit, `output_tricks` the
+    /// guard's totals when any fired. Every key beyond `exit_code` is
+    /// additive; older readers ignore them.
+    fn pane_exit_record(&self, pane_id: &str, exit_code: Option<i32>) -> Value {
+        let (agent, attention, mode, unattended) = self
+            .agents
+            .lock()
+            .ok()
+            .and_then(|tracker| {
+                tracker.panes.get(pane_id).map(|entry| {
+                    (
+                        entry.agent.clone(),
+                        entry.last_attention.or(entry.attention),
+                        entry.mode.clone(),
+                        is_unattended_mode(entry.mode.as_deref()),
+                    )
+                })
+            })
+            .unwrap_or((None, None, None, false));
+        let mut payload = json!({
+            "exit_code": exit_code,
+            "agent": agent,
+            "attention": attention,
+            "mode": mode,
+            "unattended": unattended,
+            "holder": self.lease_holder(pane_id),
+        });
+        let tricks = self.output_tricks(pane_id);
+        if tricks.total() > 0 {
+            payload["output_tricks"] = json!(tricks);
+        }
+        payload
     }
 
     fn broadcast(&self, event: &DaemonEvent) {
@@ -8233,6 +8307,10 @@ const MAX_PROJECTS: usize = 64;
 const PROJECT_NAME_MAX_LEN: usize = 64;
 const PROJECT_LEDGER_DEFAULT_LIMIT: usize = 50;
 const PROJECT_LEDGER_MAX_LIMIT: usize = 500;
+/// Scrollback lines per pane in a dossier when the caller does not say.
+const PROJECT_DOSSIER_DEFAULT_LINES: usize = 40;
+/// The dossier document's format tag; bump when a consumer could misread it.
+const PROJECT_DOSSIER_FORMAT: &str = "sgian.dossier.v1";
 
 /// Project names are keys and appear in ledgers and shell output: short,
 /// `[A-Za-z0-9._-]`, no leading dot.
@@ -8417,7 +8495,7 @@ struct DaemonServer {
     /// Held keyboard leases. A LEAF lock: taken alone, never while holding
     /// registry/terminals, and dropped before either is acquired (persist()
     /// takes it last, after registry → terminals).
-    leases: Mutex<HashMap<String, HeldLease>>,
+    leases: Arc<Mutex<HashMap<String, HeldLease>>>,
     workspace_key: String,
     log_dispatch: tracing::dispatcher::Dispatch,
     /// Keeps the non-blocking log writer alive (flushes on drop). Must be held for
@@ -8666,6 +8744,9 @@ impl DaemonServer {
             .max()
             .unwrap_or(0)
             .saturating_add(1);
+        // Shared with the router so `pane.ended` can name the holder at exit.
+        let leases = Arc::new(Mutex::new(leases));
+        router.set_leases(Arc::clone(&leases));
         Ok(Self {
             registry: Mutex::new(registry),
             terminals: Mutex::new(terminals),
@@ -8676,7 +8757,7 @@ impl DaemonServer {
             ledger,
             // A hand-edited lease for a pane that no longer exists must not be
             // resurrected (same filter as the agent marks above).
-            leases: Mutex::new(leases),
+            leases,
             next_lease_generation: AtomicU64::new(next_lease_generation),
             workspace_key: ws_key,
             log_dispatch,
@@ -8938,6 +9019,67 @@ impl DaemonServer {
             records = records.split_off(total - limit);
         }
         Ok(json!({ "project": name, "total": total, "records": records }))
+    }
+
+    /// One JSON document a reviewer or a Kranz gate can consume without
+    /// touching the daemon again: `project show` plus, per member pane, the
+    /// whole ledger (chain verified, break named) and the last `lines` of
+    /// scrollback with controls stripped and 1-based line numbers a record
+    /// can cite. Ledgers hold counts and transitions, never keystrokes; the
+    /// scrollback tail is the only output in the document.
+    fn handle_project_dossier(&self, name: &str, lines: usize) -> Result<Value, String> {
+        let detail = self.handle_project_show(name)?;
+        let dir = self
+            .ledger
+            .lock()
+            .map_err(|_| "ledger lock poisoned".to_string())?
+            .dir
+            .clone();
+        let lines = match lines {
+            0 => PROJECT_DOSSIER_DEFAULT_LINES,
+            n => n.min(SCROLLBACK_LINES_MAX_PER_REQUEST),
+        };
+        let panes: Vec<Value> = detail["panes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut pane| {
+                let pane_id = pane["id"].as_str().unwrap_or("").to_string();
+                let path = ledger_path(&dir, &pane_id);
+                let chain = if path.exists() {
+                    match ledger_verify(&path) {
+                        Ok(summary) => json!({
+                            "verified": true,
+                            "records": summary.records,
+                            "head": summary.head,
+                        }),
+                        Err(broken) => json!({ "verified": false, "break": broken }),
+                    }
+                } else {
+                    json!({ "verified": true, "records": 0, "head": "" })
+                };
+                let records = read_ledger_tail(&path, 0);
+                let all = scrollback_text_lines(&self.scrollback_dir, &pane_id);
+                let total = all.len();
+                let start = total.saturating_sub(lines);
+                pane["ledger"] = json!({ "chain": chain, "records": records });
+                pane["scrollback"] = json!({
+                    "total_lines": total,
+                    "from": start + 1,
+                    "to": total,
+                    "lines": all[start..],
+                });
+                pane
+            })
+            .collect();
+        Ok(json!({
+            "format": PROJECT_DOSSIER_FORMAT,
+            "generated_at_ms": now_millis(),
+            "workspace": self.workspace_key,
+            "summary": detail["summary"],
+            "panes": panes,
+        }))
     }
 
     // ----- Kranz bindings (M4, docs/design/keyboard-lease-and-ledger.md) -----
@@ -9467,6 +9609,9 @@ impl DaemonServer {
             DaemonRequest::ProjectUnassign { pane_id } => self.handle_project_unassign(&pane_id),
             DaemonRequest::ProjectList => Ok(json!(self.project_summaries()?)),
             DaemonRequest::ProjectShow { name } => self.handle_project_show(&name),
+            DaemonRequest::ProjectDossier { name, lines } => {
+                self.handle_project_dossier(&name, lines)
+            }
             DaemonRequest::ProjectLedger { name, limit } => {
                 self.handle_project_ledger(&name, limit)
             }
@@ -16118,6 +16263,7 @@ enum ProjectVerb {
     Rm,
     Delete,
     Ledger,
+    Dossier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16128,10 +16274,13 @@ struct ProjectArgs {
     goal: Option<String>,
     repo: Option<String>,
     limit: usize,
+    lines: usize,
+    out: Option<String>,
 }
 
 /// `project list | show NAME | new NAME [--goal TEXT] [--repo PATH] |
-/// add NAME PANE... | rm PANE... | delete NAME | ledger NAME [-n N]`.
+/// add NAME PANE... | rm PANE... | delete NAME | ledger NAME [-n N] |
+/// dossier NAME [--lines N] [--out FILE]`.
 fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
     let verb = match args.first().map(String::as_str) {
         None | Some("list") => ProjectVerb::List,
@@ -16141,6 +16290,7 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
         Some("rm") | Some("remove") | Some("unassign") => ProjectVerb::Rm,
         Some("delete") => ProjectVerb::Delete,
         Some("ledger") => ProjectVerb::Ledger,
+        Some("dossier") => ProjectVerb::Dossier,
         Some(other) => return Err(format!("unknown project command: {other}")),
     };
     let mut parsed = ProjectArgs {
@@ -16150,6 +16300,8 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
         goal: None,
         repo: None,
         limit: 0,
+        lines: 0,
+        out: None,
     };
     let mut positionals: Vec<String> = Vec::new();
     let mut index = if args.is_empty() { 0 } else { 1 };
@@ -16180,6 +16332,26 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
                     .map_err(|_| format!("invalid -n count '{value}'"))?;
                 index += 1;
             }
+            "--lines" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--lines requires a count".to_string())?;
+                parsed.lines = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --lines count '{value}'"))?;
+                if parsed.lines == 0 {
+                    return Err("--lines must be at least 1".to_string());
+                }
+                index += 1;
+            }
+            "--out" => {
+                parsed.out = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .ok_or_else(|| "--out requires a FILE".to_string())?,
+                );
+                index += 1;
+            }
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(format!("unexpected argument for project: {other}"));
             }
@@ -16193,7 +16365,11 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
                 return Err("project list takes no arguments".to_string());
             }
         }
-        ProjectVerb::Show | ProjectVerb::Delete | ProjectVerb::New | ProjectVerb::Ledger => {
+        ProjectVerb::Show
+        | ProjectVerb::Delete
+        | ProjectVerb::New
+        | ProjectVerb::Ledger
+        | ProjectVerb::Dossier => {
             if positionals.len() != 1 {
                 return Err("expected exactly one project NAME".to_string());
             }
@@ -16218,6 +16394,9 @@ fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
     }
     if verb != ProjectVerb::Ledger && parsed.limit != 0 {
         return Err("-n applies to `project ledger`".to_string());
+    }
+    if verb != ProjectVerb::Dossier && (parsed.lines != 0 || parsed.out.is_some()) {
+        return Err("--lines/--out apply to `project dossier`".to_string());
     }
     Ok(parsed)
 }
@@ -16372,6 +16551,53 @@ fn control_project(
                     .map_err(|error| format!("failed to write stdout: {error}"))?;
             }
             Ok(())
+        }
+        ProjectVerb::Dossier => {
+            let result: Value = client.request(DaemonRequest::ProjectDossier {
+                name: parsed.name.unwrap_or_default(),
+                lines: parsed.lines,
+            })?;
+            match parsed.out {
+                Some(path) => {
+                    let pretty = serde_json::to_string_pretty(&result)
+                        .map_err(|error| format!("failed to encode dossier: {error}"))?;
+                    fs::write(&path, pretty.as_bytes())
+                        .map_err(|error| format!("failed to write {path}: {error}"))?;
+                    let panes = result["panes"].as_array().map_or(0, Vec::len);
+                    let unverified = result["panes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|pane| pane["ledger"]["chain"]["verified"] == json!(false))
+                        .count();
+                    if json_output {
+                        return write_json_stdout(&json!({
+                            "project": result["summary"]["project"]["name"],
+                            "file": path,
+                            "panes": panes,
+                            "unverified_ledgers": unverified,
+                        }));
+                    }
+                    writeln!(
+                        stdout,
+                        "{}\t{}\t{} pane(s), {} ledger(s) failed verification",
+                        result["summary"]["project"]["name"].as_str().unwrap_or("-"),
+                        path,
+                        panes,
+                        unverified
+                    )
+                    .map_err(|error| format!("failed to write stdout: {error}"))
+                }
+                None => {
+                    if json_output {
+                        return write_json_stdout(&result);
+                    }
+                    let pretty = serde_json::to_string_pretty(&result)
+                        .map_err(|error| format!("failed to encode dossier: {error}"))?;
+                    writeln!(stdout, "{pretty}")
+                        .map_err(|error| format!("failed to write stdout: {error}"))
+                }
+            }
         }
     }
 }
@@ -19137,6 +19363,11 @@ Commands (PANE is a pane id or title; defaults to the active pane):
   project rm <PANE>...          Take panes out of their project
   project delete <NAME>         Delete a project (its panes stay open)
   project ledger <NAME> [-n N]  Member panes' ledgers merged in time order
+  project dossier <NAME> [--lines N] [--out FILE]
+                                One JSON document for a reviewer or a Kranz
+                                  gate: the roll-up, every member pane's state,
+                                  its full ledger (chain verified) and the last
+                                  N scrollback lines (default 40)
   kranz status                  List panes bound to Kranz missions (auto: a
                                   `kranz run` under the pane; manual: bind)
   kranz bind [PANE] [--repo PATH]
@@ -36499,6 +36730,13 @@ exit 0
         assert_eq!(records[2]["payload"]["to"], Value::Null);
         assert_eq!(records[2]["payload"]["evidence"], json!("process ended"));
         assert_eq!(records[3]["payload"]["exit_code"], json!(0));
+        // The exit record says what the agent was doing when it died, and
+        // who held the keyboard (nobody: no lease table wired here).
+        assert_eq!(records[3]["payload"]["attention"], json!("idle"));
+        assert!(records[3]["payload"]["agent"].is_string());
+        assert_eq!(records[3]["payload"]["holder"], Value::Null);
+        assert_eq!(records[3]["payload"]["unattended"], json!(false));
+        assert!(records[3]["payload"].get("output_tricks").is_none());
         // A bare router (no sink) stays silent rather than failing.
         let silent = OutputRouter::new(dir.path().join("scrollback2"));
         silent.apply_agent_classification("pane-8", CLAUDE_WORKING_SCREEN);
@@ -37458,11 +37696,162 @@ exit 0
         assert_eq!(rm.panes, args(&["pane-1"]));
         let ledger = parse_project_args(&args(&["ledger", "feat", "-n", "5"])).expect("ledger");
         assert_eq!(ledger.limit, 5);
+        let dossier = parse_project_args(&args(&[
+            "dossier",
+            "feat",
+            "--lines",
+            "12",
+            "--out",
+            "/tmp/d.json",
+        ]))
+        .expect("dossier");
+        assert_eq!(dossier.verb, ProjectVerb::Dossier);
+        assert_eq!(dossier.name.as_deref(), Some("feat"));
+        assert_eq!(dossier.lines, 12);
+        assert_eq!(dossier.out.as_deref(), Some("/tmp/d.json"));
+        let bare_dossier = parse_project_args(&args(&["dossier", "feat"])).expect("bare dossier");
+        assert_eq!((bare_dossier.lines, bare_dossier.out), (0, None));
+        assert!(parse_project_args(&args(&["dossier"])).is_err());
+        assert!(parse_project_args(&args(&["dossier", "feat", "--lines", "0"])).is_err());
+        assert!(parse_project_args(&args(&["ledger", "feat", "--out", "x"])).is_err());
         assert!(parse_project_args(&args(&["add", "feat"])).is_err());
         assert!(parse_project_args(&args(&["show"])).is_err());
         assert!(parse_project_args(&args(&["list", "x"])).is_err());
         assert!(parse_project_args(&args(&["show", "feat", "--goal", "x"])).is_err());
         assert!(parse_project_args(&args(&["bogus"])).is_err());
+    }
+
+    #[test]
+    fn project_dossier_bundles_state_ledger_and_scrollback() {
+        let daemon = TestDaemon::spawn(Config::default());
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        client
+            .request::<Project>(DaemonRequest::ProjectCreate {
+                name: "feat".to_string(),
+                goal: Some("prove the dossier".to_string()),
+                repo: None,
+            })
+            .expect("create");
+        client
+            .request::<Value>(DaemonRequest::ProjectAssign {
+                name: "feat".to_string(),
+                pane_id: pane_id.clone(),
+            })
+            .expect("assign");
+        client
+            .request::<LeaseInfo>(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect("take");
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        client
+            .request::<CommandOk>(DaemonRequest::SendInputAs {
+                pane_id: pane_id.clone(),
+                input: "printf 'dossier-%s\n' one two; exit 3\n".to_string(),
+                holder: "alice".to_string(),
+                generation: None,
+            })
+            .expect("run and exit");
+
+        // Poll until the pane's exit is in its ledger.
+        let mut dossier = Value::Null;
+        for _ in 0..300 {
+            dossier = client
+                .request(DaemonRequest::ProjectDossier {
+                    name: "feat".to_string(),
+                    lines: 0,
+                })
+                .expect("dossier");
+            let ended = dossier["panes"][0]["ledger"]["records"]
+                .as_array()
+                .is_some_and(|records| records.iter().any(|r| r["type"] == json!("pane.ended")));
+            if ended {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(dossier["format"], json!(PROJECT_DOSSIER_FORMAT));
+        assert!(dossier["generated_at_ms"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(dossier["summary"]["project"]["name"], json!("feat"));
+        assert_eq!(
+            dossier["summary"]["project"]["goal"],
+            json!("prove the dossier")
+        );
+        let panes = dossier["panes"].as_array().expect("panes");
+        assert_eq!(panes.len(), 1, "{dossier}");
+        let pane = &panes[0];
+        assert_eq!(pane["id"], json!(pane_id));
+        assert_eq!(pane["state"], json!(PaneRuntimeState::Ended));
+        assert_eq!(pane["holder"], json!("alice"));
+
+        // The chain verifies and names its head; the records are the whole ledger.
+        let chain = &pane["ledger"]["chain"];
+        assert_eq!(chain["verified"], json!(true), "{chain}");
+        let records = pane["ledger"]["records"].as_array().expect("records");
+        assert_eq!(chain["records"], json!(records.len()));
+        assert_eq!(chain["head"], records.last().expect("last")["h"]);
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|record| record["type"].as_str().unwrap_or(""))
+            .collect();
+        assert!(kinds.contains(&"project.assigned"), "{kinds:?}");
+        assert!(kinds.contains(&"lease.taken"), "{kinds:?}");
+        let ended = records
+            .iter()
+            .find(|record| record["type"] == json!("pane.ended"))
+            .expect("pane.ended");
+        assert_eq!(ended["payload"]["exit_code"], json!(3));
+        assert_eq!(ended["payload"]["holder"], json!("alice"));
+        assert_eq!(ended["payload"]["unattended"], json!(false));
+
+        // The scrollback tail is control-stripped text with citable numbers.
+        let scrollback = &pane["scrollback"];
+        let lines = scrollback["lines"].as_array().expect("lines");
+        assert!(
+            lines.iter().any(|line| line == "dossier-two"),
+            "{scrollback}"
+        );
+        let total = scrollback["total_lines"].as_u64().expect("total") as usize;
+        assert_eq!(scrollback["to"], json!(total));
+        assert_eq!(
+            scrollback["from"].as_u64().expect("from") as usize,
+            total + 1 - lines.len()
+        );
+        assert!(lines.len() <= PROJECT_DOSSIER_DEFAULT_LINES);
+
+        // `lines` bounds the tail; an unknown project is a clean error.
+        let short: Value = client
+            .request(DaemonRequest::ProjectDossier {
+                name: "feat".to_string(),
+                lines: 1,
+            })
+            .expect("short dossier");
+        assert_eq!(
+            short["panes"][0]["scrollback"]["lines"]
+                .as_array()
+                .map_or(0, Vec::len),
+            1
+        );
+        assert_eq!(short["panes"][0]["scrollback"]["from"], json!(total));
+        let missing = client
+            .request::<Value>(DaemonRequest::ProjectDossier {
+                name: "nope".to_string(),
+                lines: 0,
+            })
+            .expect_err("unknown project");
+        assert!(missing.contains("unknown project"), "{missing}");
+        daemon.shutdown();
     }
 
     #[test]
