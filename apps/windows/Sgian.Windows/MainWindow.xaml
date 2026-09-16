@@ -15,6 +15,7 @@
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
@@ -61,7 +62,12 @@
                     </Button>
                 </Grid>
 
-                <ListView x:Name="PaneList" Grid.Row="2" SelectionMode="Single"
+                <!-- Project board (ENHANCEMENTS "projects"): one line per project with its
+                     attention roll-up; each pane's subtitle names its project. -->
+                <TextBlock x:Name="ProjectSummary" Grid.Row="2" FontSize="11" TextWrapping="Wrap"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" Visibility="Collapsed" />
+
+                <ListView x:Name="PaneList" Grid.Row="3" SelectionMode="Single"
                           IsItemClickEnabled="True" SelectionChanged="PaneList_SelectionChanged">
                     <ListView.ItemTemplate>
                         <DataTemplate>
@@ -82,7 +88,7 @@
                     </ListView.ItemTemplate>
                 </ListView>
 
-                <Button Grid.Row="3" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                <Button Grid.Row="4" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
                         Click="ChooseWorkspace_Click" ToolTipService.ToolTip="Choose workspace">
                     <Grid ColumnSpacing="9">
                         <Grid.ColumnDefinitions>

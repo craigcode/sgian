@@ -12,14 +12,30 @@ struct SidebarView: View {
     var body: some View {
         VStack(spacing: 0) {
             List(selection: selection) {
-                if !shells.isEmpty {
-                    Section("Terminals") {
-                        ForEach(shells) { pane in row(pane) }
+                if model.projects.isEmpty {
+                    if !shells.isEmpty {
+                        Section("Terminals") {
+                            ForEach(shells) { pane in row(pane) }
+                        }
                     }
-                }
-                if !agents.isEmpty {
-                    Section("Agents") {
-                        ForEach(agents) { pane in row(pane) }
+                    if !agents.isEmpty {
+                        Section("Agents") {
+                            ForEach(agents) { pane in row(pane) }
+                        }
+                    }
+                } else {
+                    // The project board: one section per project with its
+                    // attention roll-up, unassigned panes last.
+                    ForEach(model.projectGroups()) { group in
+                        Section {
+                            ForEach(group.panes) { pane in row(pane) }
+                        } header: {
+                            ProjectHeader(
+                                title: group.title,
+                                goal: group.goal,
+                                rollup: model.rollupText(for: group)
+                            )
+                        }
                     }
                 }
             }
@@ -63,7 +79,8 @@ struct SidebarView: View {
             spec: model.agentSpecs[pane.id],
             leaseHolder: model.lease(for: pane.id)?.holder,
             ownLease: model.isOwnLease(model.lease(for: pane.id)),
-            unattended: model.agentStates[pane.id]?.isUnattended ?? false
+            unattended: model.agentStates[pane.id]?.isUnattended ?? false,
+            outputWarning: model.outputWarning(for: pane.id)
         )
         .tag(pane.id)
         .contextMenu {
@@ -104,6 +121,30 @@ struct SidebarView: View {
     }
 }
 
+private struct ProjectHeader: View {
+    let title: String
+    let goal: String?
+    let rollup: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title)
+            if let goal {
+                Text(goal)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Text(rollup)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title). \(rollup)")
+    }
+}
+
 private struct PaneRow: View {
     let pane: Pane
     let runtime: PaneRuntimeState
@@ -112,6 +153,7 @@ private struct PaneRow: View {
     var leaseHolder: String? = nil
     var ownLease = false
     var unattended = false
+    var outputWarning: OutputTricks? = nil
 
     var body: some View {
         HStack(spacing: 9) {
@@ -134,6 +176,13 @@ private struct PaneRow: View {
                     .font(.caption2)
                     .foregroundStyle(.orange)
                     .help("Agent runs tools without approval")
+            }
+            if let outputWarning {
+                Image(systemName: "eye.slash.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help("Output hid something: \(outputWarning.summary)")
+                    .accessibilityLabel("Output hid something: \(outputWarning.summary)")
             }
             if let leaseHolder {
                 Image(systemName: "keyboard")

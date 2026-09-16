@@ -77,6 +77,63 @@ public sealed record AgentPaneSpec
     public string? Model { get; init; }
 }
 
+/// <summary>A named group of panes serving one goal (ENHANCEMENTS "projects"); a pane is in at most one.</summary>
+public sealed record Project
+{
+    [JsonPropertyName("name")]
+    public string Name { get; init; } = "";
+
+    [JsonPropertyName("goal")]
+    public string? Goal { get; init; }
+
+    [JsonPropertyName("repo")]
+    public string? Repo { get; init; }
+
+    /// <summary>Member pane ids in project order.</summary>
+    [JsonPropertyName("panes")]
+    public IReadOnlyList<string> Panes { get; init; } = [];
+}
+
+/// <summary>
+/// Output-guard counters (docs/design/keyboard-lease-and-ledger.md §7): the tricks a
+/// pane's output used to hide something from a person. Counts only grow for a pane's life.
+/// </summary>
+public sealed record OutputTricks
+{
+    [JsonPropertyName("conceal")]
+    public int Conceal { get; init; }
+
+    [JsonPropertyName("clipboard")]
+    public int Clipboard { get; init; }
+
+    [JsonPropertyName("hyperlink_mismatch")]
+    public int HyperlinkMismatch { get; init; }
+
+    [JsonPropertyName("string_controls")]
+    public int StringControls { get; init; }
+
+    [JsonPropertyName("c1_controls")]
+    public int C1Controls { get; init; }
+
+    [JsonIgnore]
+    public int Total =>
+        Math.Max(0, Conceal) + Math.Max(0, Clipboard) + Math.Max(0, HyperlinkMismatch)
+        + Math.Max(0, StringControls) + Math.Max(0, C1Controls);
+
+    /// <summary>"2 concealed text, 1 clipboard writes": the non-zero counters in display order.</summary>
+    [JsonIgnore]
+    public string Summary => string.Join(", ", new[]
+        {
+            (Conceal, "concealed text"),
+            (Clipboard, "clipboard writes"),
+            (HyperlinkMismatch, "mismatched links"),
+            (StringControls, "opaque control strings"),
+            (C1Controls, "C1 controls"),
+        }
+        .Where(entry => entry.Item1 > 0)
+        .Select(entry => $"{entry.Item1} {entry.Item2}"));
+}
+
 public sealed record WorkspaceSnapshot
 {
     [JsonPropertyName("panes")]
@@ -119,6 +176,16 @@ public sealed record WorkspaceSnapshot
     [JsonPropertyName("leases")]
     public IReadOnlyDictionary<string, LeaseInfo> Leases { get; init; }
         = new Dictionary<string, LeaseInfo>();
+
+    /// <summary>Projects by name; absent from pre-project daemons.</summary>
+    [JsonPropertyName("projects")]
+    public IReadOnlyDictionary<string, Project> Projects { get; init; }
+        = new Dictionary<string, Project>();
+
+    /// <summary>Panes whose output hid something; absent from pre-guard daemons.</summary>
+    [JsonPropertyName("output_warnings")]
+    public IReadOnlyDictionary<string, OutputTricks> OutputWarnings { get; init; }
+        = new Dictionary<string, OutputTricks>();
 }
 
 public sealed record CommandOk

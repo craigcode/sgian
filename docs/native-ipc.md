@@ -88,13 +88,16 @@ panes, created_at_ms }`), additive; the `project_*` requests (`project_create`,
 may receive `projects_changed` with the whole `projects` map after any change
 (create, delete, assign, unassign, a member pane closing); replace, do not
 diff. The Tauri client groups its session overview by project with a per-
-project roll-up; native clients should render the same grouping.
+project roll-up; the macOS sidebar groups its sections by project with the
+roll-up in each header, and the Windows sidebar shows one roll-up line per
+project above the list and names each pane's project in its subtitle.
 The bootstrap snapshot may carry `output_warnings` (pane_id → per-kind
 counts of output that hides content: `conceal`, `clipboard`,
 `hyperlink_mismatch`, `string_controls`, `c1_controls`), and subscribers may
 receive `output_warning` events with `added` and `total`; both additive, and a
 client should mark such a pane (the Tauri client shows an amber `⚠ N` badge
-beside the agent badge, with the per-kind counts in its title).
+beside the agent badge, with the per-kind counts in its title; macOS an
+orange eye-slash icon in the pane row; Windows `⚠ N hidden` in the subtitle).
 
 `agent_states` entries and `agent_state` events may carry `mode` (the
 agent's observed permission mode) and `unattended` (true when tools run
@@ -122,9 +125,10 @@ restore prompts that were never saved.
 
 ## Event handling
 
-The native client handles `pty_output`, `pane_ended`, `pane_created`,
-`pane_closed`, `pane_renamed`, `agent_state` and `agent_event`. Unknown events
-are ignored for forward compatibility. Subscription disconnects are retried;
+The native clients handle `pty_output`, `pane_ended`, `pane_created`,
+`pane_closed`, `pane_renamed`, `agent_state`, `agent_event`, `lease_state`,
+`projects_changed` and `output_warning`. Unknown events are ignored for
+forward compatibility. Subscription disconnects are retried;
 the daemon and its sessions are never tied to the client process lifetime.
 
 Native split layouts use the same binary JSON tree as Tauri. Clients validate

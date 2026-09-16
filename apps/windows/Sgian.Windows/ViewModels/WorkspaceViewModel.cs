@@ -12,6 +12,10 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     private readonly Dictionary<string, AgentChatState> _chats = [];
     private readonly Dictionary<string, string> _scrollback = [];
     private readonly Dictionary<string, PaneSize> _sizes = [];
+    /// <summary>Projects by name (ENHANCEMENTS "projects"); the sidebar shows them.</summary>
+    private Dictionary<string, Project> _projects = new(StringComparer.Ordinal);
+    /// <summary>Panes whose output hid something (docs/design/keyboard-lease-and-ledger.md §7).</summary>
+    private readonly Dictionary<string, OutputTricks> _outputWarnings = new(StringComparer.Ordinal);
     private DaemonClient? _client;
     private CancellationTokenSource? _connectionCancellation;
     private PaneViewModel? _selectedPane;
@@ -54,6 +58,27 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     }
 
     public ObservableCollection<PaneViewModel> Panes { get; } = [];
+    public IReadOnlyDictionary<string, Project> Projects => _projects;
+
+    /// <summary>
+    /// One line per project with its attention roll-up ("feat: 2 panes · 1 needs input · ⌨ alice"),
+    /// projects sorted by name, unassigned panes last; empty when there are no projects.
+    /// </summary>
+    public string ProjectSummary
+    {
+        get
+        {
+            if (_projects.Count == 0) return "";
+            var facts = Panes.ToDictionary(
+                pane => pane.Id,
+                pane => new PaneFacts(pane.Id, pane.State, pane.Attention, pane.Unattended, pane.LeaseHolder, pane.OutputWarning is not null),
+                StringComparer.Ordinal);
+            var lines = ProjectBoard.Group(Panes.Select(pane => pane.Id), _projects)
+                .Select(group => $"{group.Title}: {ProjectBoard.Rollup(group.PaneIds.Select(id => facts[id])).Text}");
+            return string.Join("\n", lines);
+        }
+    }
+
     public event EventHandler? WorkspaceChanged;
     public event EventHandler<ChatChangedEventArgs>? ChatChanged;
     public event EventHandler<TerminalOutputEventArgs>? TerminalOutput;
@@ -511,10 +536,19 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             _chats.Remove(stale.Id);
             _scrollback.Remove(stale.Id);
             _sizes.Remove(stale.Id);
+            _outputWarnings.Remove(stale.Id);
+        }
+        _projects = new Dictionary<string, Project>(snapshot.Projects, StringComparer.Ordinal);
+        _outputWarnings.Clear();
+        foreach (var (warnedPaneId, warning) in snapshot.OutputWarnings)
+        {
+            if (warning.Total > 0) _outputWarnings[warnedPaneId] = warning;
         }
         foreach (var pane in snapshot.Panes)
         {
             var item = Upsert(pane);
+            item.ProjectName = ProjectBoard.ProjectFor(pane.Id, _projects);
+            item.OutputWarning = _outputWarnings.GetValueOrDefault(pane.Id);
             item.State = snapshot.PaneStates.TryGetValue(pane.Id, out var state) ? state : "live";
             item.Attention = snapshot.AgentStates.TryGetValue(pane.Id, out var info)
                 ? info.Attention
@@ -583,6 +617,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                     _chats.Remove(closed.Id);
                     _scrollback.Remove(closed.Id);
                     _sizes.Remove(closed.Id);
+                    _outputWarnings.Remove(closed.Id);
                     Layout = Layout?.Remove(closed.Id);
                     if (SelectedPane == closed) SelectedPane = Panes.FirstOrDefault();
                     WorkspaceChanged?.Invoke(this, EventArgs.Empty);
@@ -596,6 +631,24 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                     statePane.Mode = item.String("mode");
                     statePane.Unattended = item.Payload.TryGetProperty("unattended", out var flag)
                         && flag.ValueKind == JsonValueKind.True;
+                }
+                break;
+            case "projects_changed":
+                var projects = ProjectBoard.ParseProjects(item.Payload);
+                if (projects is not null)
+                {
+                    _projects = new Dictionary<string, Project>(projects, StringComparer.Ordinal);
+                    foreach (var member in Panes) member.ProjectName = ProjectBoard.ProjectFor(member.Id, _projects);
+                    WorkspaceChanged?.Invoke(this, EventArgs.Empty);
+                }
+                break;
+            case "output_warning":
+                var warnedId = ProjectBoard.ApplyWarning(item.Payload, _outputWarnings);
+                var warned = warnedId is null ? null : Panes.FirstOrDefault(pane => pane.Id == warnedId);
+                if (warned is not null)
+                {
+                    warned.OutputWarning = _outputWarnings.GetValueOrDefault(warnedId!);
+                    WorkspaceChanged?.Invoke(this, EventArgs.Empty);
                 }
                 break;
             case "lease_state":

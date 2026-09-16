@@ -12,6 +12,8 @@ public sealed class PaneViewModel : ObservableObject
     private string? _leaseHolder;
     private bool _leaseIsMine;
     private AgentPaneSpec? _agentSpec;
+    private string? _projectName;
+    private OutputTricks? _outputWarning;
 
     public PaneViewModel(Pane pane)
     {
@@ -126,25 +128,62 @@ public sealed class PaneViewModel : ObservableObject
         }
     }
 
+    /// <summary>The project this pane serves, or null (ENHANCEMENTS "projects").</summary>
+    public string? ProjectName
+    {
+        get => _projectName;
+        set
+        {
+            if (Set(ref _projectName, value))
+            {
+                Raise(nameof(Subtitle));
+            }
+        }
+    }
+
+    /// <summary>Output-guard totals when the pane's output hid something, else null.</summary>
+    public OutputTricks? OutputWarning
+    {
+        get => _outputWarning;
+        set
+        {
+            if (Set(ref _outputWarning, value))
+            {
+                Raise(nameof(Subtitle));
+                Raise(nameof(OutputWarningLabel));
+                Raise(nameof(OutputWarningSummary));
+            }
+        }
+    }
+
+    /// <summary>"⚠ 3 hidden" or empty; the per-kind counts are in <see cref="OutputWarningSummary"/>.</summary>
+    public string OutputWarningLabel =>
+        OutputWarning is null ? "" : $"\u26A0 {OutputWarning.Total} hidden";
+
+    public string OutputWarningSummary =>
+        OutputWarning is null ? "" : $"Output hid something: {OutputWarning.Summary}";
+
     public string Subtitle
     {
         get
         {
             var mode = Mode is null ? "" : Unattended ? $" · \u26A0 {Mode} (unattended)" : $" · {Mode}";
-            var lease = (LeaseHolder is null ? "" : $" · {LeaseLabel}") + mode;
+            var warning = OutputWarning is null ? "" : $" · {OutputWarningLabel}";
+            var lease = (LeaseHolder is null ? "" : $" · {LeaseLabel}") + mode + warning;
+            var project = ProjectName is null ? "" : $"{ProjectName} · ";
             if (State == "ended")
             {
-                return "Ended" + lease;
+                return project + "Ended" + lease;
             }
             if (!IsAgent)
             {
-                return (Attention is null ? "Terminal" : $"Terminal · {Attention.Replace('_', ' ')}") + lease;
+                return project + (Attention is null ? "Terminal" : $"Terminal · {Attention.Replace('_', ' ')}") + lease;
             }
             var identity = AgentSpec is null
                 ? "Agent"
                 : string.Join(" · ", new[] { AgentSpec.Backend, AgentSpec.Model }
                     .Where(value => !string.IsNullOrWhiteSpace(value)));
-            return (Attention is null ? identity : $"{identity} · {Attention.Replace('_', ' ')}") + lease;
+            return project + (Attention is null ? identity : $"{identity} · {Attention.Replace('_', ' ')}") + lease;
         }
     }
 }
