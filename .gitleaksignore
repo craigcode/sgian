@@ -3,3 +3,7 @@
 # only. verify-vendored-xterm.mjs independently checks the complete bundle bytes.
 964dee7c0116a2e4bd1fb55de094c5010772eb0e:ui/vendor/xterm/addon-search.js:generic-api-key:1
 964dee7c0116a2e4bd1fb55de094c5010772eb0e:ui/vendor/xterm/xterm.js:generic-api-key:1
+# Reviewed false positive: a changelog line describing the lease take/release
+# shortcuts tripped generic-api-key. The line was reworded in the next commit;
+# this pins only that historical commit/line.
+41e1cd8fd60cd8cd021fba434b33c2ee97253caa:CHANGELOG.md:generic-api-key:18

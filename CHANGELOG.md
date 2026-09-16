@@ -14,8 +14,9 @@ follow SemVer once the first public tag exists.
   lease handovers, attention and permission-mode transitions, pane exits,
   project membership, Kranz mirroring and output-guard hits; `ctl ledger
   --verify` names the first broken line (#15, #17, #20, #21).
-- Lease UI in all three clients: holder badge, read-only notice on a refused
-  keystroke, `Ctrl/Cmd+Shift+T` take and `Ctrl/Cmd+Shift+L` release (#15).
+- Lease UI in all three clients: holder badge, read-only notice when typing
+  is refused, `Ctrl/Cmd+Shift+T` to take and `Ctrl/Cmd+Shift+L` to release
+  (#15).
 - Official agent signals: `claude agents --json` polled and mapped to panes
   through the process tree, outranking screen scraping while fresh; a finished
   session clears the badge (#15).
