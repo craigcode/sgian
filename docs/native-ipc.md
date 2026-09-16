@@ -81,6 +81,10 @@ while a pane is held, so a client that wants to type into a held pane must
 take the lease and use `send_input_as`. See
 `docs/design/keyboard-lease-and-ledger.md`.
 
+The bootstrap snapshot may carry `projects` (name → `{ name, goal?, repo?,
+panes, created_at_ms }`), additive; the `project_*` requests (`project_create`,
+`project_delete`, `project_assign`, `project_unassign`, `project_list`,
+`project_show`, `project_ledger`) manage them.
 The bootstrap snapshot may carry `output_warnings` (pane_id → per-kind
 counts of output that hides content: `conceal`, `clipboard`,
 `hyperlink_mismatch`, `string_controls`, `c1_controls`), and subscribers may

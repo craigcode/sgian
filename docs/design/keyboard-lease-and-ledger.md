@@ -286,7 +286,15 @@ Ranked by leverage against effort. None are committed beyond M1.
    maintained and exposes grid, scrollback, and regex search. Not urgent
    while vt100 only drives classification and snapshots, but it should be
    on the list before it drives a renderer.
-8. **Split `lib.rs`.** Everything lives in one flat module. The lease and
+8. **Projects (shipped 2026-09-16).** The grouping above panes that
+   Cursor's Projects (2026-09-10) put behind a cloud coordinator: a named
+   group with a goal, member panes, an attention roll-up, and the members'
+   ledgers merged in time order, persisted with the workspace and driven
+   through `ctl project` so any orchestrator or script can be the
+   coordinator. Cursor documents no per-project "who did what"; the merged
+   ledger is that record. Still open: rendering in the clients and a
+   per-project directory of shared context notes kept under git.
+9. **Split `lib.rs`.** Everything lives in one flat module. The lease and
    ledger code lands as its own banner section with pure functions so it can
    be the first thing moved into a module when the split happens.
 

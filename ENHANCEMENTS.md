@@ -150,6 +150,14 @@ Shipped (2026-09-15):
 
 Shipped (2026-09-16):
 
+- **Projects.** A named group of panes serving one goal (borrowed from the
+  shape of Cursor's Projects, 2026-09-10, minus the cloud coordinator):
+  persisted with the workspace, a pane in at most one, `project.assigned` /
+  `project.unassigned` on the pane's ledger, an attention roll-up (panes,
+  live, needs input, working, idle, unattended, keyboard holders), a
+  per-pane detail view, and the members' ledgers merged in time order —
+  the project-level "who did what" Cursor does not record. Daemon requests
+  plus `ctl project …` and `ctl new --project`; client rendering follows.
 - **Output guard.** Per-pane counts of output tricks that hide content from
   a human (conceal, clipboard write, mismatched hyperlink, string controls,
   C1), rate-limited into the ledger (`output.suspicious`) and an
@@ -159,6 +167,8 @@ Shipped (2026-09-16):
 Open, in order:
 
 - **Output-guard badges in the clients**, and stripping for agent panes.
+- **Project rendering in the clients** (sidebar grouping, roll-up counts,
+  the "listening" summary) and per-project shared context notes under git.
 - **Notification-hook ingestion** (`agent_needs_input`, `permission_prompt`,
   `idle_prompt`) for sub-second needs-input without polling, and the relay
   to Kranz's hook-status lane for bound panes.
