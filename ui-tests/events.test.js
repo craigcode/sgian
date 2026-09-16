@@ -597,3 +597,43 @@ describe("keyboard lease events", () => {
     expect(callbacks.calls.render).toBe(0);
   });
 });
+
+describe("agent permission mode", () => {
+  it("normalizes mode and the unattended flag", () => {
+    expect(normalizeAgentState({ agent: "claude", attention: "idle" })).toEqual({
+      agent: "claude",
+      attention: "idle",
+    });
+    expect(
+      normalizeAgentState({ agent: "claude", attention: "working", mode: "auto", unattended: true }),
+    ).toEqual({ agent: "claude", attention: "working", mode: "auto", unattended: true });
+    const odd = normalizeAgentState({ agent: "claude", mode: 7, unattended: "yes" });
+    expect("mode" in odd).toBe(false);
+    expect("unattended" in odd).toBe(false);
+    expect(
+      agentStateEquals(
+        { agent: "claude", attention: "idle" },
+        { agent: "claude", attention: "idle", mode: "auto", unattended: true },
+      ),
+    ).toBe(false);
+    expect(
+      agentStateEquals(
+        { agent: "claude", attention: "idle" },
+        { agent: "claude", attention: "idle", unattended: false },
+      ),
+    ).toBe(true);
+  });
+
+  it("a mode-only agent-state event re-renders", () => {
+    const state = makeState([{ id: "pane-1" }]);
+    const callbacks = makeCallbacks();
+    handleAgentState(state, { pane_id: "pane-1", agent: "claude", attention: "idle" }, callbacks);
+    handleAgentState(
+      state,
+      { pane_id: "pane-1", agent: "claude", attention: "idle", mode: "bypass", unattended: true },
+      callbacks,
+    );
+    expect(callbacks.calls.render).toBe(2);
+    expect(state.agentStates.get("pane-1").unattended).toBe(true);
+  });
+});

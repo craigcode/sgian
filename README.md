@@ -110,7 +110,12 @@ A single binary runs in three modes:
   polls `claude agents --json` (`agent_probe_interval_ms`, default 2000) and
   maps sessions to panes through the process tree, so Claude Code's own
   state outranks screen scraping while fresh and a finished session clears
-  the badge.
+  the badge. The agent's permission mode is read off the same screen
+  (`auto`, `bypass`, `accept-edits`, `plan`); a pane whose agent runs tools
+  without approval is flagged `unattended` in every client, in `ctl agent`,
+  and in the ledger as `mode.changed`, so an unattended run is never
+  invisible. Agent-kind panes carry their configured permission mode the
+  same way.
 - Keyboard lease: one holder per pane. While a pane is held, input from
   anyone else is refused (`lease_policy: "open"`, the default) or every write
   needs the lease (`"required"`). Takeovers, forced revocations, and releases

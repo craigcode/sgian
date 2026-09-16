@@ -81,6 +81,11 @@ while a pane is held, so a client that wants to type into a held pane must
 take the lease and use `send_input_as`. See
 `docs/design/keyboard-lease-and-ledger.md`.
 
+`agent_states` entries and `agent_state` events may carry `mode` (the
+agent's observed permission mode) and `unattended` (true when tools run
+without a person approving them); both are additive and clients must mark an
+unattended pane visibly.
+
 The bootstrap snapshot supplies the pane registry, active pane, scrollback,
 recorded PTY dimensions, runtime state, agent attention, provider/model specs
 and bounded normalized agent-event replay. Clients size their terminal emulator

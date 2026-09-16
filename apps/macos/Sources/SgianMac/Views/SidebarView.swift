@@ -62,7 +62,8 @@ struct SidebarView: View {
             attention: model.attention(for: pane.id),
             spec: model.agentSpecs[pane.id],
             leaseHolder: model.lease(for: pane.id)?.holder,
-            ownLease: model.isOwnLease(model.lease(for: pane.id))
+            ownLease: model.isOwnLease(model.lease(for: pane.id)),
+            unattended: model.agentStates[pane.id]?.isUnattended ?? false
         )
         .tag(pane.id)
         .contextMenu {
@@ -110,6 +111,7 @@ private struct PaneRow: View {
     let spec: AgentPaneSpec?
     var leaseHolder: String? = nil
     var ownLease = false
+    var unattended = false
 
     var body: some View {
         HStack(spacing: 9) {
@@ -127,6 +129,12 @@ private struct PaneRow: View {
                 }
             }
             Spacer(minLength: 4)
+            if unattended {
+                Image(systemName: "exclamationmark.shield.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help("Agent runs tools without approval")
+            }
             if let leaseHolder {
                 Image(systemName: "keyboard")
                     .font(.caption2)

@@ -514,7 +514,12 @@ final class WorkspaceModel: ObservableObject {
         case "agent_state":
             guard let paneID = event["pane_id"]?.stringValue else { return }
             let attention = event["attention"]?.stringValue.flatMap(AgentAttention.init(rawValue:))
-            agentStates[paneID] = AgentPaneInfo(agent: event["agent"]?.stringValue, attention: attention)
+            agentStates[paneID] = AgentPaneInfo(
+                agent: event["agent"]?.stringValue,
+                attention: attention,
+                mode: event["mode"]?.stringValue,
+                unattended: event["unattended"]?.boolValue
+            )
 
         case "lease_state":
             LeaseInfo.apply(event: .object(event.payload), to: &leases)

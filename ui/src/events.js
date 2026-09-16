@@ -74,7 +74,14 @@ export function normalizeAgentState(entry) {
   const attention = AGENT_ATTENTION_STATES.has(entry.attention)
     ? entry.attention
     : null;
-  return { agent: entry.agent, attention };
+  // `mode` is the agent's observed permission mode; `unattended` means tools
+  // run without a person approving them and the pane must be marked. Both
+  // are additive: absent from the object (not null) when the daemon did not
+  // send them, so older payloads normalize exactly as before.
+  const normalized = { agent: entry.agent, attention };
+  if (typeof entry.mode === "string" && entry.mode) normalized.mode = entry.mode;
+  if (entry.unattended === true) normalized.unattended = true;
+  return normalized;
 }
 
 /**
@@ -82,7 +89,12 @@ export function normalizeAgentState(entry) {
  */
 export function agentStateEquals(a, b) {
   if (!a || !b) return a === b;
-  return a.agent === b.agent && a.attention === b.attention;
+  return (
+    a.agent === b.agent &&
+    a.attention === b.attention &&
+    (a.mode ?? null) === (b.mode ?? null) &&
+    Boolean(a.unattended) === Boolean(b.unattended)
+  );
 }
 
 /**

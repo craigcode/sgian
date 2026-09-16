@@ -1595,3 +1595,9 @@ h3.md-heading {
   justify-content: flex-end;
   gap: 8px;
 }
+
+/* An agent running tools without approval (auto / bypass): always visible. */
+.agent-badge-unattended {
+  color: var(--amber);
+  font-weight: 600;
+}
