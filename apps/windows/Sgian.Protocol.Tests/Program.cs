@@ -29,6 +29,7 @@ var tests = new (string Name, Action Body)[]
     ("Native layout restoration and pane reconciliation", NativeLayouts),
     ("Keyboard lease model", KeyboardLease),
     ("Agent permission mode", AgentPermissionMode),
+    ("Project board model", ProjectBoardModel),
 };
 
 var failures = new List<string>();
@@ -194,6 +195,54 @@ static void KeyboardLease()
     Equal(true, LeaseState.NeedsForce("pane keyboard is held by bob; use --force --why REASON to revoke it"));
     Equal(true, LeaseState.IsRefusal("pane keyboard is held by bob (pane-2)"));
     Equal(false, LeaseState.IsRefusal("terminal session ended: pane-2"));
+}
+
+static void ProjectBoardModel()
+{
+    var snapshot = JsonSerializer.Deserialize<WorkspaceSnapshot>("""
+        {"panes":[],"cwd":"C:\\w","projects":{"feat":{"name":"feat","goal":"ship","panes":["p1","p2"],"created_at_ms":1}},"output_warnings":{"p1":{"conceal":2,"c1_controls":1}}}
+        """) ?? throw new Exception("snapshot did not deserialize");
+    Equal("ship", snapshot.Projects["feat"].Goal);
+    Equal(2, snapshot.Projects["feat"].Panes.Count);
+    Equal(3, snapshot.OutputWarnings["p1"].Total);
+    Equal("2 concealed text, 1 C1 controls", snapshot.OutputWarnings["p1"].Summary);
+    Equal(0, JsonSerializer.Deserialize<WorkspaceSnapshot>("""{"panes":[],"cwd":"C:\\w"}""")!.Projects.Count);
+
+    var projects = ProjectBoard.ParseProjects(Json("""{"projects":{"zeta":{"panes":["p3","gone","p3"]},"alpha":{"name":"alpha","goal":"first","panes":["p2"]},"empty":{},"bad":"no"}}"""))
+        ?? throw new Exception("projects did not parse");
+    Equal(3, projects.Count);
+    Equal(2, projects["zeta"].Panes.Count);
+    Equal("zeta", projects["zeta"].Name);
+    Equal(true, ProjectBoard.ParseProjects(Json("""{"event":"projects_changed"}""")) is null);
+    var groups = ProjectBoard.Group(["p1", "p2", "p3"], projects);
+    Equal("alpha,empty,zeta,", string.Join(",", groups.Select(group => group.Name ?? "")));
+    Equal("p2", groups[0].PaneIds[0]);
+    Equal("first", groups[0].Goal);
+    Equal("p3", groups[2].PaneIds[0]);
+    Equal(1, groups[2].PaneIds.Count);
+    Equal("p1", groups[3].PaneIds[0]);
+    Equal("No project", groups[3].Title);
+    Equal(1, ProjectBoard.Group(["p1"], new Dictionary<string, Project> { ["a"] = new Project { Name = "a", Panes = ["p1"] } }).Count);
+    Equal(1, ProjectBoard.Group(["p1"], new Dictionary<string, Project>()).Count);
+    Equal("alpha", ProjectBoard.ProjectFor("p2", projects));
+    Equal(true, ProjectBoard.ProjectFor("p1", projects) is null);
+
+    var rollup = ProjectBoard.Rollup(
+    [
+        new PaneFacts("p1", "live", "needs_input", false, "bob", false),
+        new PaneFacts("p2", "live", "working", true, "alice", true),
+        new PaneFacts("p3", "ended", null, false, "bob", false),
+    ]);
+    Equal("3 panes \u00B7 2 live \u00B7 1 needs input \u00B7 1 working \u00B7 \u26A0 1 unattended \u00B7 1 with output warnings \u00B7 \u2328 alice, bob", rollup.Text);
+    Equal("1 pane", ProjectBoard.Rollup([new PaneFacts("p9", "live", null, false, null, false)]).Text);
+
+    var warnings = new Dictionary<string, OutputTricks>(StringComparer.Ordinal);
+    Equal("p1", ProjectBoard.ApplyWarning(Json("""{"pane_id":"p1","added":{"clipboard":1},"total":{"conceal":2,"clipboard":1}}"""), warnings));
+    Equal(3, warnings["p1"].Total);
+    Equal(true, ProjectBoard.ApplyWarning(Json("""{"pane_id":"p1"}"""), warnings) is null);
+    Equal(3, warnings["p1"].Total);
+    Equal("p1", ProjectBoard.ApplyWarning(Json("""{"pane_id":"p1","total":{}}"""), warnings));
+    Equal(0, warnings.Count);
 }
 
 static void WorkspaceDefaults()

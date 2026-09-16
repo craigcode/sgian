@@ -10,6 +10,10 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var agentStates: [String: AgentPaneInfo] = [:]
     /// Keyboard leases for HELD panes (docs/design/keyboard-lease-and-ledger.md).
     @Published private(set) var leases: [String: LeaseInfo] = [:]
+    /// Projects by name (ENHANCEMENTS "projects"); the sidebar groups by them.
+    @Published private(set) var projects: [String: Project] = [:]
+    /// Panes whose output hid something (docs/design/keyboard-lease-and-ledger.md §7).
+    @Published private(set) var outputWarnings: [String: OutputTricks] = [:]
     /// A transient "read-only: held by …" notice for one pane after a refused keystroke.
     @Published private(set) var leaseNotice: LeaseNotice?
     @Published var leaseDialog: LeaseDialog?
@@ -110,6 +114,8 @@ final class WorkspaceModel: ObservableObject {
         selectedPaneID = nil
         paneStates = [:]
         agentStates = [:]
+        projects = [:]
+        outputWarnings = [:]
         agentSpecs = [:]
         terminals = [:]
         chats = [:]
@@ -349,6 +355,26 @@ final class WorkspaceModel: ObservableObject {
         return agentStates[paneID]?.attention
     }
 
+    // MARK: Project board (ENHANCEMENTS "projects")
+
+    /// The sidebar's sections: one per project plus the unassigned panes.
+    func projectGroups() -> [ProjectGroup] {
+        ProjectBoard.group(panes: panes, projects: projects)
+    }
+
+    func rollupText(for group: ProjectGroup) -> String {
+        ProjectBoard.rollup(
+            panes: group.panes,
+            paneStates: paneStates,
+            attention: attention(for:),
+            agentStates: agentStates,
+            leases: leases,
+            outputWarnings: outputWarnings
+        ).text
+    }
+
+    func outputWarning(for paneID: String) -> OutputTricks? { outputWarnings[paneID] }
+
     private func saveLayout() {
         layoutSaveTask?.cancel()
         guard let client else { return }
@@ -445,6 +471,8 @@ final class WorkspaceModel: ObservableObject {
         paneStates = snapshot.paneStates
         agentStates = snapshot.agentStates
         leases = snapshot.leases
+        projects = snapshot.projects
+        outputWarnings = snapshot.outputWarnings
         agentSpecs = snapshot.agentSpecs
         layout = PaneLayout.reconcile(PaneLayout.parse(snapshot.layout), paneIDs: snapshot.panes.map(\.id))
 
@@ -523,6 +551,12 @@ final class WorkspaceModel: ObservableObject {
 
         case "lease_state":
             LeaseInfo.apply(event: .object(event.payload), to: &leases)
+
+        case "projects_changed":
+            Project.apply(event: .object(event.payload), to: &projects)
+
+        case "output_warning":
+            OutputTricks.apply(event: .object(event.payload), to: &outputWarnings)
 
         case "agent_event":
             guard let paneID = event["pane_id"]?.stringValue,
@@ -756,6 +790,8 @@ final class WorkspaceModel: ObservableObject {
         paneStates.removeValue(forKey: paneID)
         agentStates.removeValue(forKey: paneID)
         leases.removeValue(forKey: paneID)
+        outputWarnings.removeValue(forKey: paneID)
+        for name in projects.keys { projects[name]?.panes.removeAll { $0 == paneID } }
         agentSpecs.removeValue(forKey: paneID)
         terminals.removeValue(forKey: paneID)
         chats.removeValue(forKey: paneID)

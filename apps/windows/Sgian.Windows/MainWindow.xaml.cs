@@ -94,6 +94,9 @@ public sealed partial class MainWindow : Window
         var pane = ViewModel.SelectedPane;
         PaneTitle.Text = pane?.Title ?? "Sgian";
         PaneSubtitle.Text = pane?.Subtitle ?? "Native terminals and coding agents";
+        var projectSummary = ViewModel.ProjectSummary;
+        ProjectSummary.Text = projectSummary;
+        ProjectSummary.Visibility = projectSummary.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         RenameButton.Visibility = pane is null ? Visibility.Collapsed : Visibility.Visible;
         CloseButton.Visibility = pane is null ? Visibility.Collapsed : Visibility.Visible;
         RestartButton.Visibility = pane?.State == "ended"

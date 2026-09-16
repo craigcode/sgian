@@ -7,6 +7,11 @@ follow SemVer once the first public tag exists.
 
 ### Added
 
+- Project board in the native clients: the macOS sidebar groups panes by
+  project with the roll-up in each section header and marks output-guard
+  hits with an eye-slash icon; the Windows sidebar shows one roll-up line
+  per project and names each pane's project and hidden-output count in its
+  subtitle. Both follow `projects_changed` and `output_warning`.
 - Project board in the Tauri client: the session overview groups panes by
   project with the attention roll-up in each heading (needs input, working,
   unattended, keyboard holders, output warnings) plus keyboard and output

@@ -97,6 +97,129 @@ struct LeaseInfo: Codable, Equatable, Sendable {
     }
 }
 
+/// A named group of panes serving one goal (ENHANCEMENTS "projects").
+/// `panes` lists member ids in project order; a pane is in at most one.
+struct Project: Codable, Equatable, Sendable {
+    var name: String
+    var goal: String?
+    var repo: String?
+    var panes: [String]
+
+    init(name: String, goal: String? = nil, repo: String? = nil, panes: [String] = []) {
+        self.name = name
+        self.goal = goal
+        self.repo = repo
+        self.panes = panes
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        goal = try container.decodeIfPresent(String.self, forKey: .goal)
+        repo = try container.decodeIfPresent(String.self, forKey: .repo)
+        panes = try container.decodeIfPresent([String].self, forKey: .panes) ?? []
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name, goal, repo, panes
+    }
+
+    /// Decode a `projects` table (bootstrap or `projects_changed`), dropping
+    /// malformed entries and de-duplicating pane ids.
+    static func table(from value: JSONValue?) -> [String: Project] {
+        guard let entries = value?.objectValue else { return [:] }
+        var table: [String: Project] = [:]
+        for (name, entry) in entries {
+            guard !name.isEmpty,
+                  let data = try? JSONEncoder.ipc.encode(entry),
+                  var project = try? JSONDecoder.ipc.decode(Project.self, from: data)
+            else { continue }
+            var seen = Set<String>()
+            project.panes = project.panes.filter { !$0.isEmpty && seen.insert($0).inserted }
+            project.name = name
+            table[name] = project
+        }
+        return table
+    }
+
+    /// Fold one `projects_changed` event into the table: the daemon sends the
+    /// whole table, so this replaces rather than diffs. False when malformed.
+    @discardableResult
+    static func apply(event: JSONValue, to projects: inout [String: Project]) -> Bool {
+        guard event["projects"]?.objectValue != nil else { return false }
+        projects = table(from: event["projects"])
+        return true
+    }
+}
+
+/// Output-guard counters (docs/design/keyboard-lease-and-ledger.md §7): the
+/// tricks a pane's output used to hide something from a person. Counts only
+/// grow for a pane's life.
+struct OutputTricks: Codable, Equatable, Sendable {
+    var conceal = 0
+    var clipboard = 0
+    var hyperlinkMismatch = 0
+    var stringControls = 0
+    var c1Controls = 0
+
+    enum CodingKeys: String, CodingKey {
+        case conceal, clipboard
+        case hyperlinkMismatch = "hyperlink_mismatch"
+        case stringControls = "string_controls"
+        case c1Controls = "c1_controls"
+    }
+
+    init(conceal: Int = 0, clipboard: Int = 0, hyperlinkMismatch: Int = 0, stringControls: Int = 0, c1Controls: Int = 0) {
+        self.conceal = conceal
+        self.clipboard = clipboard
+        self.hyperlinkMismatch = hyperlinkMismatch
+        self.stringControls = stringControls
+        self.c1Controls = c1Controls
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        conceal = max(0, try container.decodeIfPresent(Int.self, forKey: .conceal) ?? 0)
+        clipboard = max(0, try container.decodeIfPresent(Int.self, forKey: .clipboard) ?? 0)
+        hyperlinkMismatch = max(0, try container.decodeIfPresent(Int.self, forKey: .hyperlinkMismatch) ?? 0)
+        stringControls = max(0, try container.decodeIfPresent(Int.self, forKey: .stringControls) ?? 0)
+        c1Controls = max(0, try container.decodeIfPresent(Int.self, forKey: .c1Controls) ?? 0)
+    }
+
+    var total: Int { conceal + clipboard + hyperlinkMismatch + stringControls + c1Controls }
+
+    /// "2 concealed text, 1 clipboard writes": the non-zero counters in display order.
+    var summary: String {
+        [
+            (conceal, "concealed text"),
+            (clipboard, "clipboard writes"),
+            (hyperlinkMismatch, "mismatched links"),
+            (stringControls, "opaque control strings"),
+            (c1Controls, "C1 controls"),
+        ]
+        .filter { $0.0 > 0 }
+        .map { "\($0.0) \($0.1)" }
+        .joined(separator: ", ")
+    }
+
+    /// Fold one `output_warning` event into the per-pane map (its `total` is
+    /// the running count). False when malformed.
+    @discardableResult
+    static func apply(event: JSONValue, to warnings: inout [String: OutputTricks]) -> Bool {
+        guard let paneID = event["pane_id"]?.stringValue, !paneID.isEmpty,
+              let total = event["total"],
+              let data = try? JSONEncoder.ipc.encode(total),
+              let tricks = try? JSONDecoder.ipc.decode(OutputTricks.self, from: data)
+        else { return false }
+        if tricks.total > 0 {
+            warnings[paneID] = tricks
+        } else {
+            warnings.removeValue(forKey: paneID)
+        }
+        return true
+    }
+}
+
 struct PaneSize: Codable, Equatable, Sendable {
     var cols: Int
     var rows: Int
@@ -115,9 +238,14 @@ struct WorkspaceSnapshot: Codable, Sendable {
     var agentSpecs: [String: AgentPaneSpec]
     /// Held keyboard leases only; absent from pre-lease daemons.
     var leases: [String: LeaseInfo]
+    /// Projects by name; absent from pre-project daemons.
+    var projects: [String: Project]
+    /// Panes whose output hid something; absent from pre-guard daemons.
+    var outputWarnings: [String: OutputTricks]
 
     enum CodingKeys: String, CodingKey {
-        case panes, cwd, layout, scrollback, sizes, leases
+        case panes, cwd, layout, scrollback, sizes, leases, projects
+        case outputWarnings = "output_warnings"
         case activePaneID = "active_pane_id"
         case paneStates = "pane_states"
         case agentStates = "agent_states"
@@ -138,6 +266,9 @@ struct WorkspaceSnapshot: Codable, Sendable {
         agentEvents = try container.decodeIfPresent([String: [JSONValue]].self, forKey: .agentEvents) ?? [:]
         agentSpecs = try container.decodeIfPresent([String: AgentPaneSpec].self, forKey: .agentSpecs) ?? [:]
         leases = try container.decodeIfPresent([String: LeaseInfo].self, forKey: .leases) ?? [:]
+        projects = Project.table(from: try container.decodeIfPresent(JSONValue.self, forKey: .projects))
+        let warnings = try container.decodeIfPresent([String: OutputTricks].self, forKey: .outputWarnings) ?? [:]
+        outputWarnings = warnings.filter { $0.value.total > 0 }
     }
 }
 

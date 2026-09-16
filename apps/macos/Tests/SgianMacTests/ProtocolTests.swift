@@ -266,3 +266,70 @@ func daemonRoundTrip() async throws {
     #expect(legacy.mode == nil)
     #expect(!legacy.isUnattended)
 }
+
+@Test func workspaceSnapshotDecodesProjectsAndOutputWarnings() throws {
+    let json = #"{"panes":[],"cwd":"/w","projects":{"feat":{"name":"feat","goal":"ship","panes":["p1","p1","p2"],"created_at_ms":1},"bad":"no"},"output_warnings":{"p1":{"conceal":2,"c1_controls":1},"p2":{}}}"#
+    let snapshot = try JSONDecoder().decode(WorkspaceSnapshot.self, from: Data(json.utf8))
+    #expect(snapshot.projects["feat"] == Project(name: "feat", goal: "ship", panes: ["p1", "p2"]))
+    #expect(snapshot.projects.count == 1)
+    #expect(snapshot.outputWarnings["p1"] == OutputTricks(conceal: 2, c1Controls: 1))
+    #expect(snapshot.outputWarnings["p1"]?.summary == "2 concealed text, 1 C1 controls")
+    #expect(snapshot.outputWarnings["p2"] == nil, "a zero total is not a warning")
+    let bare = try JSONDecoder().decode(WorkspaceSnapshot.self, from: Data(#"{"panes":[],"cwd":"/w"}"#.utf8))
+    #expect(bare.projects.isEmpty && bare.outputWarnings.isEmpty)
+}
+
+@Test func projectsChangedAndOutputWarningEventsFoldIntoTheirMaps() throws {
+    var projects: [String: Project] = ["old": Project(name: "old")]
+    let changed = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"projects_changed","projects":{"feat":{"name":"feat","panes":["p2"]}}}"#.utf8))
+    #expect(Project.apply(event: changed, to: &projects))
+    #expect(projects.keys.sorted() == ["feat"], "the whole table is replaced")
+    #expect(projects["feat"]?.panes == ["p2"])
+    let malformed = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"projects_changed"}"#.utf8))
+    #expect(Project.apply(event: malformed, to: &projects) == false)
+    #expect(projects["feat"] != nil)
+
+    var warnings: [String: OutputTricks] = [:]
+    let warning = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"output_warning","pane_id":"p1","added":{"clipboard":1},"total":{"conceal":2,"clipboard":1}}"#.utf8))
+    #expect(OutputTricks.apply(event: warning, to: &warnings))
+    #expect(warnings["p1"]?.total == 3)
+    let bad = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"output_warning","pane_id":"p1"}"#.utf8))
+    #expect(OutputTricks.apply(event: bad, to: &warnings) == false)
+    #expect(warnings["p1"]?.total == 3)
+}
+
+@Test func projectBoardGroupsPanesAndRollsAttentionUp() {
+    let panes = [
+        Pane(id: "p1", title: "one", kind: .shell, createdAtMs: 1),
+        Pane(id: "p2", title: "two", kind: .agent, createdAtMs: 2),
+        Pane(id: "p3", title: "three", kind: .shell, createdAtMs: 3),
+    ]
+    let projects = [
+        "zeta": Project(name: "zeta", panes: ["p3", "gone"]),
+        "alpha": Project(name: "alpha", goal: "first", panes: ["p2"]),
+        "empty": Project(name: "empty"),
+    ]
+    let groups = ProjectBoard.group(panes: panes, projects: projects)
+    #expect(groups.map(\.name) == ["alpha", "empty", "zeta", nil])
+    #expect(groups[0].panes.map(\.id) == ["p2"])
+    #expect(groups[0].goal == "first")
+    #expect(groups[2].panes.map(\.id) == ["p3"])
+    #expect(groups[3].panes.map(\.id) == ["p1"])
+    #expect(groups[3].title == "No project")
+    let all = ProjectBoard.group(panes: panes, projects: ["a": Project(name: "a", panes: ["p1", "p2", "p3"])])
+    #expect(all.map(\.name) == ["a"], "no trailing group when every pane is assigned")
+    let none = ProjectBoard.group(panes: panes, projects: [:])
+    #expect(none.count == 1 && none[0].name == nil && none[0].panes.count == 3)
+
+    let rollup = ProjectBoard.rollup(
+        panes: panes,
+        paneStates: ["p3": .ended],
+        attention: { ["p1": .needsInput, "p2": .working][$0] },
+        agentStates: ["p2": AgentPaneInfo(agent: "claude", attention: .working, mode: "auto", unattended: true)],
+        leases: ["p1": LeaseInfo(holder: "bob"), "p2": LeaseInfo(holder: "alice"), "p3": LeaseInfo(holder: "bob")],
+        outputWarnings: ["p2": OutputTricks(conceal: 1)]
+    )
+    #expect(rollup == ProjectRollup(panes: 3, live: 2, needsInput: 1, working: 1, idle: 0, unattended: 1, held: 3, holders: ["alice", "bob"], warnings: 1))
+    #expect(rollup.text == "3 panes · 2 live · 1 needs input · 1 working · ⚠ 1 unattended · 1 with output warnings · ⌨ alice, bob")
+    #expect(ProjectRollup(panes: 1, live: 1).text == "1 pane")
+}
