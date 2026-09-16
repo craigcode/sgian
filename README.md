@@ -232,6 +232,12 @@ platforms, and assembles a draft release for acceptance before publication.
   App Installer updates and a manual check in Commands.
 - Linux: Debian package and AppImage with the Tauri signed updater.
 
+The public-launch checklist is `docs/public-readiness.md` and the release
+procedure is `docs/releasing.md`; `scripts/audit-public-history.sh` is the
+fail-closed history audit both require and CI runs on every push. The crate
+names `sgian`, `sgian-pty` and `sgian-protocol` are reserved on crates.io as
+placeholders under `crates/`.
+
 Production credentials and installed version-to-version acceptance remain
 required before public distribution. Local ad-hoc/unsigned builds and portable
 CI ZIPs are development artifacts. See [the native release runbook](docs/native-release.md)

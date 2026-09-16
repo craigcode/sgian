@@ -1,0 +1,14 @@
+[package]
+name = "sgian-protocol"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Reserved: the typed request/event contract of the Sgian daemon (leases, projects, ledger), for clients and orchestrators."
+repository = "https://github.com/craigcode/sgian"
+homepage = "https://github.com/craigcode/sgian"
+readme = "README.md"
+keywords = ["terminal", "agent", "ipc", "protocol"]
+categories = ["development-tools"]
+
+[dependencies]

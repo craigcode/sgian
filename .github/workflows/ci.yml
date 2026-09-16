@@ -30,7 +30,7 @@ jobs:
       - name: Scan Git history for secrets
         run: |
           brew install gitleaks
-          gitleaks git --redact --no-banner --log-opts=--all .
+          scripts/audit-public-history.sh
       # dtolnay/rust-toolchain publishes only moving refs (stable/beta/nightly),
       # so the `stable` branch head is pinned by commit SHA like every other
       # action. Verify against: git ls-remote https://github.com/dtolnay/rust-toolchain refs/heads/stable
