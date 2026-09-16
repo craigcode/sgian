@@ -2355,6 +2355,21 @@ enum DaemonRequest {
         #[serde(default)]
         lines: usize,
     },
+    /// A Claude Code hook fired inside some pane (`ctl hook`): `pid` is the
+    /// hook process (the daemon walks its ancestry to the pane), `event` the
+    /// `hook_event_name`, `notification_type` the Notification kind. Maps to
+    /// an official attention reading with evidence `hook`; never an error
+    /// when nothing matches (a hook must not fail the session).
+    AgentSignal {
+        pid: u32,
+        event: String,
+        #[serde(default)]
+        notification_type: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     ResizePaneTerminal {
         pane_id: String,
         cols: u16,
@@ -3008,6 +3023,18 @@ fn process_parent_snapshot() -> Option<HashMap<u32, u32>> {
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn process_parent_snapshot() -> Option<HashMap<u32, u32>> {
+    None
+}
+
+/// The process tree for hook placement: the fork-free kernel snapshot on
+/// macOS and Linux; nothing elsewhere (a hook there reports `mapped: false`).
+#[cfg(unix)]
+fn process_parent_snapshot_for_hooks() -> Option<HashMap<u32, u32>> {
+    process_parent_snapshot()
+}
+
+#[cfg(not(unix))]
+fn process_parent_snapshot_for_hooks() -> Option<HashMap<u32, u32>> {
     None
 }
 
@@ -8410,6 +8437,55 @@ pub struct KranzBinding {
 /// Attribute each probe entry to the pane whose child process is its ancestor
 /// (or itself). When several sessions land in one pane the loudest wins:
 /// needs-input over working over idle.
+/// The pane whose child process is `pid` or one of its ancestors (at most
+/// 64 hops, stopping at init). `parent_of` is child → parent.
+fn pane_for_pid(
+    mut pid: u32,
+    parent_of: &HashMap<u32, u32>,
+    pane_pids: &[(String, u32)],
+) -> Option<String> {
+    let pane_by_pid: HashMap<u32, &str> = pane_pids
+        .iter()
+        .map(|(pane_id, pid)| (*pid, pane_id.as_str()))
+        .collect();
+    for _ in 0..64 {
+        if let Some(found) = pane_by_pid.get(&pid) {
+            return Some((*found).to_string());
+        }
+        match parent_of.get(&pid) {
+            Some(parent) if *parent != pid && *parent > 1 => pid = *parent,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// How long a hook's reading outranks the screen heuristic. Long enough to
+/// bridge the gap to the next hook or probe round, short enough that a
+/// partial hook set (Notification only) cannot pin a stale badge for long.
+const HOOK_ATTENTION_TTL: Duration = Duration::from_secs(20);
+
+/// Map a Claude Code hook onto pane attention. `event` is the payload's
+/// `hook_event_name`; `notification_type` the Notification kind. `None` =
+/// nothing to say (the hook is acknowledged and ignored).
+fn attention_from_hook(event: &str, notification_type: Option<&str>) -> Option<AgentAttention> {
+    match event.trim() {
+        "Notification" => match notification_type.map(str::trim) {
+            Some("permission_prompt")
+            | Some("idle_prompt")
+            | Some("elicitation_dialog")
+            | Some("agent_needs_input")
+            | Some("needs_input") => Some(AgentAttention::NeedsInput),
+            _ => None,
+        },
+        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStart" => {
+            Some(AgentAttention::Working)
+        }
+        "Stop" | "SubagentStop" => Some(AgentAttention::Idle),
+        _ => None,
+    }
+}
+
 fn map_probe_entries(
     entries: &[AgentProbeEntry],
     parent_of: &HashMap<u32, u32>,
@@ -8422,27 +8498,12 @@ fn map_probe_entries(
             AgentAttention::Idle => 0,
         }
     }
-    let pane_by_pid: HashMap<u32, &str> = pane_pids
-        .iter()
-        .map(|(pane_id, pid)| (*pid, pane_id.as_str()))
-        .collect();
     let mut mapped: HashMap<String, AgentAttention> = HashMap::new();
     for entry in entries {
-        let (Some(mut pid), Some(attention)) = (entry.pid, attention_from_probe(entry)) else {
+        let (Some(pid), Some(attention)) = (entry.pid, attention_from_probe(entry)) else {
             continue;
         };
-        let mut pane = None;
-        for _ in 0..64 {
-            if let Some(found) = pane_by_pid.get(&pid) {
-                pane = Some((*found).to_string());
-                break;
-            }
-            match parent_of.get(&pid) {
-                Some(parent) if *parent != pid && *parent > 1 => pid = *parent,
-                _ => break,
-            }
-        }
-        let Some(pane) = pane else {
+        let Some(pane) = pane_for_pid(pid, parent_of, pane_pids) else {
             continue;
         };
         let keep = mapped
@@ -9043,6 +9104,60 @@ impl DaemonServer {
         Ok(json!({ "project": name, "total": total, "records": records }))
     }
 
+    /// (M3) A Claude Code hook fired somewhere under one of this daemon's
+    /// panes. Walk the hook process's ancestry to the pane and apply the
+    /// hook's reading as official attention (evidence `hook`), which
+    /// outranks the screen heuristic for `HOOK_ATTENTION_TTL`. Notification
+    /// hooks (a person is wanted) are also ledgered with their message so a
+    /// dossier shows what the agent was waiting for. Never an error: a hook
+    /// that cannot be placed reports `mapped: false` and a reason, and the
+    /// session it came from is unaffected. Kranz-bound panes need no relay
+    /// here: a Kranz run registers its own `kranz hook-status` hooks.
+    fn handle_agent_signal(
+        &self,
+        pid: u32,
+        event: &str,
+        notification_type: Option<&str>,
+        message: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Value {
+        let Some(attention) = attention_from_hook(event, notification_type) else {
+            return json!({ "mapped": false, "reason": format!("hook event '{event}' carries no attention") });
+        };
+        let Some(parent_of) = process_parent_snapshot_for_hooks() else {
+            return json!({ "mapped": false, "reason": "no process tree on this platform" });
+        };
+        let pane_pids = match self.lock_terminals() {
+            Ok(terminals) => terminals.live_pane_pids(),
+            Err(_) => return json!({ "mapped": false, "reason": "terminal store unavailable" }),
+        };
+        let Some(pane_id) = pane_for_pid(pid, &parent_of, &pane_pids) else {
+            return json!({ "mapped": false, "reason": format!("no live pane owns pid {pid}") });
+        };
+        self.router.apply_official_attention_with(
+            &pane_id,
+            "claude",
+            attention,
+            HOOK_ATTENTION_TTL,
+            "hook",
+        );
+        if attention == AgentAttention::NeedsInput {
+            let message = message.map(|text| text.chars().take(200).collect::<String>());
+            let _ = self.ledger_record(
+                &pane_id,
+                "hook.received",
+                json!({
+                    "event": event,
+                    "notification_type": notification_type,
+                    "message": message,
+                    "session_id": session_id,
+                    "attention": attention,
+                }),
+            );
+        }
+        json!({ "mapped": true, "pane_id": pane_id, "attention": attention, "evidence": "hook" })
+    }
+
     /// One JSON document a reviewer or a Kranz gate can consume without
     /// touching the daemon again: `project show` plus, per member pane, the
     /// whole ledger (chain verified, break named) and the last `lines` of
@@ -9637,6 +9752,19 @@ impl DaemonServer {
             DaemonRequest::ProjectDossier { name, lines } => {
                 self.handle_project_dossier(&name, lines)
             }
+            DaemonRequest::AgentSignal {
+                pid,
+                event,
+                notification_type,
+                message,
+                session_id,
+            } => Ok(self.handle_agent_signal(
+                pid,
+                &event,
+                notification_type.as_deref(),
+                message.as_deref(),
+                session_id.as_deref(),
+            )),
             DaemonRequest::ProjectLedger { name, limit } => {
                 self.handle_project_ledger(&name, limit)
             }
@@ -14943,6 +15071,166 @@ fn workspace_cwd_for_key(key: &str) -> String {
         .unwrap_or_default()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct HookArgs {
+    event: Option<String>,
+    notification_type: Option<String>,
+    pid: Option<u32>,
+    /// Read the hook payload from stdin (the default; `--no-stdin` for scripts
+    /// that pass everything as flags).
+    read_stdin: bool,
+}
+
+/// `hook [--event NAME] [--type NAME] [--pid N] [--no-stdin]`.
+fn parse_hook_args(args: &[String]) -> Result<HookArgs, String> {
+    let mut parsed = HookArgs {
+        read_stdin: true,
+        ..HookArgs::default()
+    };
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--event" => {
+                parsed.event = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .ok_or_else(|| "--event requires a NAME".to_string())?,
+                );
+                index += 1;
+            }
+            "--type" => {
+                parsed.notification_type = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .ok_or_else(|| "--type requires a NAME".to_string())?,
+                );
+                index += 1;
+            }
+            "--pid" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--pid requires a number".to_string())?;
+                parsed.pid = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid --pid '{value}'"))?,
+                );
+                index += 1;
+            }
+            "--no-stdin" => parsed.read_stdin = false,
+            other => return Err(format!("unexpected argument for hook: {other}")),
+        }
+        index += 1;
+    }
+    if !parsed.read_stdin && parsed.event.is_none() {
+        return Err("--no-stdin needs --event NAME".to_string());
+    }
+    Ok(parsed)
+}
+
+/// The fields `ctl hook` reads from a Claude Code hook payload (stdin JSON).
+/// Everything is optional so a payload from a newer CLI still parses.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+struct HookPayload {
+    #[serde(default)]
+    hook_event_name: Option<String>,
+    #[serde(default)]
+    notification_type: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// Build the daemon request for a hook: flags win over the payload, the pid
+/// defaults to this process (the daemon walks up from it to the pane).
+fn hook_request(
+    parsed: &HookArgs,
+    payload: &HookPayload,
+    own_pid: u32,
+) -> Result<DaemonRequest, String> {
+    let event = parsed
+        .event
+        .clone()
+        .or_else(|| payload.hook_event_name.clone())
+        .filter(|event| !event.trim().is_empty())
+        .ok_or_else(|| "hook payload has no hook_event_name; pass --event NAME".to_string())?;
+    Ok(DaemonRequest::AgentSignal {
+        pid: parsed.pid.unwrap_or(own_pid),
+        event,
+        notification_type: parsed
+            .notification_type
+            .clone()
+            .or_else(|| payload.notification_type.clone()),
+        message: payload.message.clone(),
+        session_id: payload.session_id.clone(),
+    })
+}
+
+/// `ctl hook`: the command a Claude Code hook runs. Reads the hook payload
+/// from stdin, asks the workspace daemon (this cwd first, then every other
+/// running daemon) which pane owns the calling process, and hands it the
+/// hook's reading. Exits 0 whatever happens: a hook must never fail the
+/// session it reports on. `--json` prints the daemon's answer.
+fn control_hook(workspace: PathBuf, parsed: HookArgs, json_output: bool) -> Result<(), String> {
+    let payload: HookPayload = if parsed.read_stdin {
+        let mut raw = String::new();
+        let _ = std::io::stdin().read_to_string(&mut raw);
+        if raw.trim().is_empty() {
+            HookPayload::default()
+        } else {
+            serde_json::from_str(&raw).unwrap_or_default()
+        }
+    } else {
+        HookPayload::default()
+    };
+    let request = match hook_request(&parsed, &payload, std::process::id()) {
+        Ok(request) => request,
+        Err(error) => {
+            return if json_output {
+                write_json_stdout(&json!({ "mapped": false, "reason": error }))
+            } else {
+                Ok(())
+            };
+        }
+    };
+    let mut answer = json!({ "mapped": false, "reason": "no running daemon" });
+    let mut tried = std::collections::HashSet::new();
+    // This workspace first: a hook fires in the session's cwd, which is the
+    // pane's cwd more often than not.
+    let own_key = workspace_key(&workspace);
+    tried.insert(own_key.clone());
+    if let Ok(client) = DaemonClient::connect_existing(workspace) {
+        if let Ok(result) = client.request::<Value>(request.clone()) {
+            if result["mapped"] == json!(true) {
+                answer = result;
+                answer["workspace_key"] = json!(own_key);
+            } else {
+                answer = result;
+            }
+        }
+    }
+    if answer["mapped"] != json!(true) {
+        for key in workspace_keys() {
+            if !tried.insert(key.clone()) || !daemon_is_alive(&key) {
+                continue;
+            }
+            let Ok(response) = daemon_request_by_key(&key, request.clone()) else {
+                continue;
+            };
+            if response.ok && response.result["mapped"] == json!(true) {
+                answer = response.result;
+                answer["workspace_key"] = json!(key);
+                break;
+            }
+        }
+    }
+    if json_output {
+        return write_json_stdout(&answer);
+    }
+    Ok(())
+}
+
 fn control_list_daemons(json_output: bool) -> Result<(), String> {
     let daemons = workspace_keys()
         .into_iter()
@@ -15229,6 +15517,13 @@ fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
         "daemons" => {
             ensure_no_extra_args("daemons", &options.args[1..])?;
             control_list_daemons(options.json)
+        }
+        "hook" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_hook_args(&options.args[1..])?;
+            control_hook(options.workspace, parsed, options.json)
         }
         "write-config" => {
             let client = DaemonClient::connect_or_spawn(options.workspace)?;
@@ -19371,6 +19666,14 @@ Commands (PANE is a pane id or title; defaults to the active pane):
   agent --watch [PANE]          Stream agent-state, lease and pane-end transitions
                                   (one line each; --json prints the daemon events).
                                   No PANE watches every pane; with one, exits on close.
+  hook [--event NAME] [--type NAME] [--pid N] [--no-stdin]
+                                The command a Claude Code hook runs: reads the
+                                  hook payload from stdin, finds the pane that
+                                  owns the calling process (this workspace first,
+                                  then every running daemon) and sets its badge
+                                  from the hook (Notification → needs input,
+                                  UserPromptSubmit/PreToolUse → working, Stop →
+                                  idle). Always exits 0; --json prints the answer.
   lease [PANE]                  Show who holds a pane's keyboard (alias: lease status)
   lease take [PANE] [--as HOLDER] [--force --why REASON]
                                 Claim the keyboard. While held, input from anyone
@@ -36919,6 +37222,242 @@ exit 0
             map_probe_entries(&two, &parents, &pane_pids).get("pane-1"),
             Some(&AgentAttention::NeedsInput)
         );
+    }
+
+    #[test]
+    fn hooks_map_onto_attention_and_panes() {
+        assert_eq!(
+            attention_from_hook("Notification", Some("permission_prompt")),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(
+            attention_from_hook("Notification", Some("idle_prompt")),
+            Some(AgentAttention::NeedsInput)
+        );
+        assert_eq!(
+            attention_from_hook("Notification", Some("auth_success")),
+            None
+        );
+        assert_eq!(attention_from_hook("Notification", None), None);
+        assert_eq!(
+            attention_from_hook("UserPromptSubmit", None),
+            Some(AgentAttention::Working)
+        );
+        assert_eq!(
+            attention_from_hook("PreToolUse", None),
+            Some(AgentAttention::Working)
+        );
+        assert_eq!(
+            attention_from_hook("Stop", None),
+            Some(AgentAttention::Idle)
+        );
+        assert_eq!(attention_from_hook("SessionStart", None), None);
+        assert_eq!(attention_from_hook("", None), None);
+
+        // pane-1's shell is 100 → claude 200 → hook 300; pane-2's shell is 400.
+        let parents = HashMap::from([(300u32, 200u32), (200, 100), (100, 50), (50, 1), (400, 50)]);
+        let pane_pids = vec![("pane-1".to_string(), 100u32), ("pane-2".to_string(), 400)];
+        assert_eq!(
+            pane_for_pid(300, &parents, &pane_pids).as_deref(),
+            Some("pane-1")
+        );
+        assert_eq!(
+            pane_for_pid(100, &parents, &pane_pids).as_deref(),
+            Some("pane-1")
+        );
+        assert_eq!(
+            pane_for_pid(400, &parents, &pane_pids).as_deref(),
+            Some("pane-2")
+        );
+        assert_eq!(
+            pane_for_pid(50, &parents, &pane_pids),
+            None,
+            "above every pane"
+        );
+        assert_eq!(
+            pane_for_pid(999, &parents, &pane_pids),
+            None,
+            "unknown process"
+        );
+        // A parent cycle terminates.
+        let cycle = HashMap::from([(7u32, 8u32), (8, 7)]);
+        assert_eq!(pane_for_pid(7, &cycle, &pane_pids), None);
+
+        let parsed = parse_hook_args(&args(&["--event", "Stop", "--pid", "42", "--no-stdin"]))
+            .expect("flags");
+        assert_eq!(parsed.event.as_deref(), Some("Stop"));
+        assert_eq!(parsed.pid, Some(42));
+        assert!(!parsed.read_stdin);
+        assert!(
+            parse_hook_args(&args(&["--no-stdin"])).is_err(),
+            "no event source"
+        );
+        assert!(parse_hook_args(&args(&["--pid", "x"])).is_err());
+        assert!(parse_hook_args(&args(&["bogus"])).is_err());
+        let payload: HookPayload = serde_json::from_str(
+            r#"{"session_id":"s1","transcript_path":"/t","cwd":"/w","hook_event_name":"Notification","message":"Claude needs your permission to use Bash","notification_type":"permission_prompt","permission_mode":"default"}"#,
+        )
+        .expect("payload");
+        let request =
+            hook_request(&parse_hook_args(&[]).expect("bare"), &payload, 777).expect("request");
+        assert_eq!(
+            request,
+            DaemonRequest::AgentSignal {
+                pid: 777,
+                event: "Notification".to_string(),
+                notification_type: Some("permission_prompt".to_string()),
+                message: Some("Claude needs your permission to use Bash".to_string()),
+                session_id: Some("s1".to_string()),
+            }
+        );
+        // Flags win over the payload; an empty payload needs --event.
+        let forced = parse_hook_args(&args(&["--event", "Stop", "--type", "x"])).expect("forced");
+        let DaemonRequest::AgentSignal {
+            event,
+            notification_type,
+            ..
+        } = hook_request(&forced, &payload, 1).expect("request")
+        else {
+            panic!("wrong request");
+        };
+        assert_eq!(
+            (event.as_str(), notification_type.as_deref()),
+            ("Stop", Some("x"))
+        );
+        assert!(hook_request(
+            &parse_hook_args(&[]).expect("bare"),
+            &HookPayload::default(),
+            1
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_signal_sets_the_owning_pane_badge_over_ipc() {
+        let daemon = TestDaemon::spawn(Config {
+            shell: Some("/bin/sh".to_string()),
+            agent_probe_interval_ms: Some(0),
+            ..Default::default()
+        });
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        // The shell prints its own pid; a hook fired from a child of that
+        // shell must map to this pane.
+        client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: "echo SHELLPID=$$\n".to_string(),
+            })
+            .expect("print pid");
+        let mut shell_pid: Option<u32> = None;
+        for _ in 0..200 {
+            let found: Value = client
+                .request(DaemonRequest::SearchScrollback {
+                    pane_id: pane_id.clone(),
+                    needle: "SHELLPID=".to_string(),
+                    ignore_case: false,
+                    limit: 0,
+                })
+                .expect("search");
+            shell_pid = found["matches"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|hit| hit["text"].as_str())
+                .filter_map(|text| text.strip_prefix("SHELLPID="))
+                .filter_map(|rest| rest.trim().parse::<u32>().ok())
+                .next();
+            if shell_pid.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let shell_pid = shell_pid.expect("the pane's shell printed its pid");
+
+        let signal = |pid: u32, event: &str, kind: Option<&str>| -> Value {
+            client
+                .request(DaemonRequest::AgentSignal {
+                    pid,
+                    event: event.to_string(),
+                    notification_type: kind.map(str::to_string),
+                    message: Some("Claude needs your permission to use Bash".to_string()),
+                    session_id: Some("s1".to_string()),
+                })
+                .expect("signal")
+        };
+        let mapped = signal(shell_pid, "Notification", Some("permission_prompt"));
+        assert_eq!(mapped["mapped"], json!(true), "{mapped}");
+        assert_eq!(mapped["pane_id"], json!(pane_id));
+        assert_eq!(mapped["attention"], json!("needs_input"));
+        assert_eq!(mapped["evidence"], json!("hook"));
+        let snapshot: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap after hook");
+        let info = snapshot.agent_states.get(&pane_id).expect("agent state");
+        assert_eq!(info.agent.as_deref(), Some("claude"));
+        assert_eq!(info.attention, Some(AgentAttention::NeedsInput));
+
+        // A Stop hook from the same session turns the badge idle.
+        let stopped = signal(shell_pid, "Stop", None);
+        assert_eq!(stopped["attention"], json!("idle"));
+        let snapshot: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap after stop");
+        assert_eq!(
+            snapshot
+                .agent_states
+                .get(&pane_id)
+                .and_then(|info| info.attention),
+            Some(AgentAttention::Idle)
+        );
+
+        // Unknown process, and an event with nothing to say: acknowledged, not errors.
+        let stray = signal(u32::MAX - 7, "Notification", Some("permission_prompt"));
+        assert_eq!(stray["mapped"], json!(false));
+        assert!(
+            stray["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no live pane"),
+            "{stray}"
+        );
+        let ignored = signal(shell_pid, "SessionStart", None);
+        assert_eq!(ignored["mapped"], json!(false));
+
+        // The Notification landed on the ledger with its message; the Stop did not.
+        let records = read_ledger_tail(
+            &ledger_path(&daemon.data_dir.path().join(LEDGER_DIR), &pane_id),
+            0,
+        );
+        let hooks: Vec<&Value> = records
+            .iter()
+            .filter(|record| record["type"] == json!("hook.received"))
+            .collect();
+        assert_eq!(hooks.len(), 1, "{records:?}");
+        assert_eq!(
+            hooks[0]["payload"]["notification_type"],
+            json!("permission_prompt")
+        );
+        assert_eq!(
+            hooks[0]["payload"]["message"],
+            json!("Claude needs your permission to use Bash")
+        );
+        let evidence: Vec<&str> = records
+            .iter()
+            .filter(|record| record["type"] == json!("attention.changed"))
+            .filter_map(|record| record["payload"]["evidence"].as_str())
+            .collect();
+        assert_eq!(evidence, vec!["hook", "hook"]);
+        daemon.shutdown();
     }
 
     #[test]

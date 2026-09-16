@@ -226,8 +226,12 @@ note cannot submit. Shortcuts are `Ctrl/Cmd+Shift+T` (take) and
 Deferred from the draft: the hollow read-only cursor, take-on-first-keystroke,
 and the "needs input" window title.
 
-**M3 — official agent signals before heuristics (shipped 2026-09-14;
-Notification-hook ingestion and the Kranz relay remain open).** Claude Code's
+**M3 — official agent signals before heuristics (shipped 2026-09-14; hook
+ingestion shipped 2026-09-16 as `ctl hook` → `agent_signal`, evidence `hook`,
+20 s TTL over the screen heuristic, `hook.received` ledgered for
+Notifications. No Sgian-side relay to Kranz: a Kranz run registers its own
+`kranz hook-status` hooks, so a bound pane's session already feeds both
+lanes).** Claude Code's
 `claude agents --json` (`state`, `status`, `waitingFor`) and the Notification
 hook (`agent_needs_input`, `permission_prompt`, `idle_prompt`) are the
 supported ways to read session state; screen classification becomes the

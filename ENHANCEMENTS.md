@@ -172,6 +172,15 @@ Shipped (2026-09-16):
   `output_warning` event, in `find --json` and `ctl agent`
   (`HIDDEN-OUTPUT …`), and in the bootstrap snapshot's `output_warnings`.
 
+- **Hook ingestion.** `ctl hook` is the command a Claude Code hook runs:
+  it reads the payload from stdin, finds the pane that owns the calling
+  process by walking its ancestry (this workspace's daemon first, then
+  every running daemon) and applies the hook as an official reading
+  (Notification → needs input, `UserPromptSubmit`/`PreToolUse` → working,
+  `Stop` → idle; evidence `hook`, 20 s over the screen heuristic;
+  `hook.received` with the message for Notifications). Sub-second
+  needs-input without polling. Kranz-bound panes need no relay: the run's
+  own `kranz hook-status` hooks post to Kranz's lane.
 - **Lease generations.** Every held lease carries a monotonic generation
   (never repeated across restarts); `send --generation N` and
   `lease release --generation N` are refused as stale once the lease has
@@ -187,9 +196,6 @@ Open, in order:
   (the Tauri client has both: `⚠ N` badge, overview grouped by project with
   the roll-up); stripping for agent panes; per-project shared context notes
   under git.
-- **Notification-hook ingestion** (`agent_needs_input`, `permission_prompt`,
-  `idle_prompt`) for sub-second needs-input without polling, and the relay
-  to Kranz's hook-status lane for bound panes.
 - **M4 Kranz target**, **M5 SSM / ECS Exec target**, **M6 per-client
   identity** (the lease becomes a boundary).
 
