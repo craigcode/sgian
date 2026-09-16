@@ -17,6 +17,10 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
       reporting, `README.md` leading with the claim and the control plane.
 - [x] `scripts/audit-public-history.sh` passes from a full clone with every
       branch and tag (`git fetch --all --tags`), with gitleaks installed.
+      CI runs the same scan over every fetched ref, so a hit on any pushed
+      branch fails the check job on every open pull request until it is
+      fixed. A reviewed false positive is pinned by its exact fingerprint in
+      `.gitleaksignore` (commit, file, rule, line); never by path or rule.
 - [x] crates.io names held by the owner: `sgian` 0.0.1, `sgian-pty` 0.0.1,
       `sgian-protocol` 0.0.1 (placeholders whose READMEs state the intent).
 - [ ] `CHANGELOG.md` finalised for the chosen version (draft exists).
