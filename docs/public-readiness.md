@@ -29,8 +29,9 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
       verifies they agree). No tag exists yet.
 - [ ] Repository description on GitHub reviewed; the current one predates the
       lease/ledger work.
-- [ ] Dependabot pull requests merged or closed so the lockfiles are stable
-      for the version pull request.
+- [x] Dependabot pull requests merged or closed so the lockfiles are stable
+      for the version pull request (all seven landed 2026-09-16; vite 8 and
+      plugin-react 6 went in together because each peers on the other).
 
 ## Working and stable
 
