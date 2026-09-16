@@ -154,11 +154,13 @@ A single binary runs in three modes:
   pane's ledger stays readable by id.
 - `ctl agent --watch [PANE] --json` to stream agent-state, lease and pane-end
   transitions to a script instead of polling.
-- `ctl project new|list|show|add|rm|delete|ledger` for projects: a named group
-  of panes serving one goal, persisted with the workspace, with an attention
-  roll-up (needs input / working / idle / unattended / keyboard holders) and
-  the member panes' ledgers merged in time order. `ctl new --project NAME`
-  creates a pane straight into one.
+- `ctl project new|list|show|add|rm|delete|ledger|dossier` for projects: a
+  named group of panes serving one goal, persisted with the workspace, with an
+  attention roll-up (needs input / working / idle / unattended / keyboard
+  holders), the member panes' ledgers merged in time order, and a dossier: one
+  JSON document with every pane's state, verified ledger and scrollback tail
+  for a reviewer or a Kranz gate. `ctl new --project NAME` creates a pane
+  straight into one.
 - Output guard: every pane's output is scanned for the tricks an agent can
   use to hide things from the person watching (SGR 8 conceal, OSC 52
   clipboard writes, OSC 8 hyperlinks whose visible text is a URL on another

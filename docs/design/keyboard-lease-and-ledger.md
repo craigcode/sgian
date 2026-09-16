@@ -153,7 +153,19 @@ Event vocabulary for M1:
 
 M3 added `attention.changed { agent, from, to, evidence }` and
 `pane.ended { exit_code }`, written by the output router without an fsync
-(they are frequent and are not the product). Keystrokes are never in the
+(they are frequent and are not the product). `pane.ended` now also carries
+what a reviewer or a gate classifies the run on: `agent`, `attention` (the
+state the agent was in when its process ended; `needs_input` means it was
+still waiting on a person), `mode` and `unattended`, `holder` (the keyboard
+holder at exit), and `output_tricks` when the output guard fired. Keys beyond
+`exit_code` are additive.
+
+`ctl project dossier NAME [--lines N] [--out FILE]` bundles a project into one
+JSON document (`format: "sgian.dossier.v1"`): the roll-up, every member pane's
+state, its full ledger with the chain verified (or the first break named), and
+the last N scrollback lines with controls stripped and citable 1-based numbers.
+It is the receipt half of `execution-grants.md`: what a Kranz gate consumes
+instead of vibes. Keystrokes are never in the
 ledger; only counts.
 Output bytes are never in the ledger; they stay in scrollback.
 

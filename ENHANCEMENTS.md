@@ -98,8 +98,13 @@ Shipped (M3a, 2026-09-14):
 - **Attention in the ledger.** Every agent-attention transition is appended
   as `attention.changed { agent, from, to, evidence }` (`screen` today,
   `process ended` when the pane's process exits) and every pane exit as
-  `pane.ended { exit_code }`, best-effort and unsynced (lease events stay
-  fsynced). A closed pane's ledger is its full session record.
+  `pane.ended { exit_code, agent, attention, mode, unattended, holder,
+  output_tricks? }`, best-effort and unsynced (lease events stay fsynced).
+  A closed pane's ledger is its full session record.
+- **`ctl project dossier NAME [--lines N] [--out FILE]`.** One JSON document
+  per project for a reviewer or a Kranz gate: the roll-up, each member
+  pane's state, its full ledger with the chain verified, and the last N
+  scrollback lines with citable numbers (`docs/design/execution-grants.md`).
 - **`ctl agent --watch [PANE] [--json]`.** Streams agent-state, lease and
   pane-end transitions after a baseline line per pane, so CI, notification
   glue, or a mission orchestrator can react to needs-input without polling.

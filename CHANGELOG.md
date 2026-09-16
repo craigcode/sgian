@@ -7,6 +7,11 @@ follow SemVer once the first public tag exists.
 
 ### Added
 
+- `ctl project dossier NAME [--lines N] [--out FILE]`: one JSON document per
+  project (roll-up, each pane's state, full ledger with the chain verified,
+  last N scrollback lines with citable numbers) for a reviewer or a Kranz
+  gate. `pane.ended` ledger records now carry the agent, its attention at
+  exit, mode, unattended flag, keyboard holder and output-guard totals.
 - Keyboard leases: one holder per pane, `lease_policy` open/required, a
   mandatory hand-back note, per-lease generations that refuse a previous
   holder's late command as stale, and `ctl lease` / `ctl send --as` (#15, #22).
