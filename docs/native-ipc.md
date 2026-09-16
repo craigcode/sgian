@@ -81,6 +81,11 @@ while a pane is held, so a client that wants to type into a held pane must
 take the lease and use `send_input_as`. See
 `docs/design/keyboard-lease-and-ledger.md`.
 
+The bootstrap snapshot may carry `projects` (name → `{ name, goal?, repo?,
+panes, created_at_ms }`), additive; the `project_*` requests (`project_create`,
+`project_delete`, `project_assign`, `project_unassign`, `project_list`,
+`project_show`, `project_ledger`) manage them.
+
 `agent_states` entries and `agent_state` events may carry `mode` (the
 agent's observed permission mode) and `unattended` (true when tools run
 without a person approving them); both are additive and clients must mark an

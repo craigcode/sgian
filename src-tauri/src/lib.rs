@@ -1609,6 +1609,9 @@ pub struct WorkspaceSnapshot {
     /// Additive: old daemons omit it, old clients ignore it.
     #[serde(default)]
     pub leases: HashMap<String, LeaseInfo>,
+    /// Named pane groups (docs/design/keyboard-lease-and-ledger.md §7).
+    #[serde(default)]
+    pub projects: HashMap<String, Project>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1706,6 +1709,9 @@ struct PersistedWorkspace {
     /// restart does not silently forget who was in control. Additive.
     #[serde(default)]
     leases: HashMap<String, HeldLease>,
+    /// Named pane groups; additive.
+    #[serde(default)]
+    projects: HashMap<String, Project>,
 }
 
 /// User configuration, loaded from a global config.json and an optional per-workspace
@@ -2302,6 +2308,35 @@ enum DaemonRequest {
         pane_id: String,
     },
     KranzBindings,
+    /// Projects (docs/design/keyboard-lease-and-ledger.md §7): a named group
+    /// of panes serving one goal, with an attention roll-up and a merged
+    /// ledger. Panes belong to at most one project.
+    ProjectCreate {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+    },
+    ProjectDelete {
+        name: String,
+    },
+    ProjectAssign {
+        name: String,
+        pane_id: String,
+    },
+    ProjectUnassign {
+        pane_id: String,
+    },
+    ProjectList,
+    ProjectShow {
+        name: String,
+    },
+    ProjectLedger {
+        name: String,
+        #[serde(default)]
+        limit: usize,
+    },
     ResizePaneTerminal {
         pane_id: String,
         cols: u16,
@@ -2823,6 +2858,7 @@ impl PaneRegistry {
             agent_events: HashMap::new(),
             agent_specs: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         }
     }
 
@@ -7869,6 +7905,106 @@ fn kranz_attention_from_state(state: &Value) -> Option<AgentAttention> {
     }
 }
 
+/// A named group of panes serving one goal (a feature, a migration, a
+/// mission): the grouping above panes that lets one page show every worker,
+/// its attention, who holds its keyboard, and a merged ledger. Projects
+/// persist with the workspace; panes belong to at most one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Project {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub panes: Vec<String>,
+    pub created_at_ms: u64,
+}
+
+const MAX_PROJECTS: usize = 64;
+const PROJECT_NAME_MAX_LEN: usize = 64;
+const PROJECT_LEDGER_DEFAULT_LIMIT: usize = 50;
+const PROJECT_LEDGER_MAX_LIMIT: usize = 500;
+
+/// Project names are keys and appear in ledgers and shell output: short,
+/// `[A-Za-z0-9._-]`, no leading dot.
+fn validate_project_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("project name must not be blank".to_string());
+    }
+    if name.len() > PROJECT_NAME_MAX_LEN {
+        return Err(format!(
+            "project name is longer than {PROJECT_NAME_MAX_LEN} bytes"
+        ));
+    }
+    if name.starts_with('.')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err("project name may only contain letters, digits, '.', '_' and '-'".to_string());
+    }
+    Ok(name.to_string())
+}
+
+/// A project with its attention roll-up: what one glance needs to tell.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectSummary {
+    pub project: Project,
+    pub panes: usize,
+    pub live: usize,
+    pub needs_input: usize,
+    pub working: usize,
+    pub idle: usize,
+    pub unattended: usize,
+    pub held: usize,
+    pub holders: Vec<String>,
+}
+
+fn project_rollup(
+    project: &Project,
+    states: &HashMap<String, PaneRuntimeState>,
+    agents: &HashMap<String, AgentPaneInfo>,
+    leases: &HashMap<String, HeldLease>,
+) -> ProjectSummary {
+    let mut summary = ProjectSummary {
+        project: project.clone(),
+        panes: project.panes.len(),
+        live: 0,
+        needs_input: 0,
+        working: 0,
+        idle: 0,
+        unattended: 0,
+        held: 0,
+        holders: Vec::new(),
+    };
+    for pane_id in &project.panes {
+        if states.get(pane_id) == Some(&PaneRuntimeState::Live) {
+            summary.live += 1;
+        }
+        if let Some(info) = agents.get(pane_id) {
+            match info.attention {
+                Some(AgentAttention::NeedsInput) => summary.needs_input += 1,
+                Some(AgentAttention::Working) => summary.working += 1,
+                Some(AgentAttention::Idle) => summary.idle += 1,
+                None => {}
+            }
+            if info.unattended {
+                summary.unattended += 1;
+            }
+        }
+        if let Some(held) = leases.get(pane_id) {
+            summary.held += 1;
+            if !summary.holders.contains(&held.holder) {
+                summary.holders.push(held.holder.clone());
+            }
+        }
+    }
+    summary.holders.sort();
+    summary
+}
+
 /// (M4) A pane bound to a Kranz mission: hand-back notes are mirrored into
 /// its inbox and its attention comes from `kranz status`. Auto bindings come
 /// from the process tree (a `kranz run` under the pane's shell); manual ones
@@ -8017,6 +8153,9 @@ struct DaemonServer {
     probe_mapped: Mutex<HashMap<String, u8>>,
     /// (M4) Panes bound to a Kranz mission. Leaf lock.
     kranz_bindings: Mutex<HashMap<String, KranzBinding>>,
+    /// Named pane groups (name → project). Leaf lock; persist() takes it after
+    /// registry → terminals → leases.
+    projects: Mutex<HashMap<String, Project>>,
 }
 
 /// Removes a pane's in-flight spawn marker and wakes any ensure/restart
@@ -8088,6 +8227,7 @@ impl DaemonServer {
             agent_specs,
             pane_shells,
             leases,
+            projects,
             was_corrupt,
         ) = (
             loaded.registry,
@@ -8100,6 +8240,7 @@ impl DaemonServer {
             loaded.agent_specs,
             loaded.pane_shells,
             loaded.leases,
+            loaded.projects,
             loaded.was_corrupt,
         );
 
@@ -8237,7 +8378,249 @@ impl DaemonServer {
             probe_warned: AtomicBool::new(false),
             probe_mapped: Mutex::new(HashMap::new()),
             kranz_bindings: Mutex::new(HashMap::new()),
+            // Members that no longer exist are dropped on load, like leases.
+            projects: Mutex::new(
+                projects
+                    .into_iter()
+                    .map(|(name, mut project)| {
+                        project
+                            .panes
+                            .retain(|pane_id| live_pane_ids.contains(pane_id));
+                        (name, project)
+                    })
+                    .collect(),
+            ),
         })
+    }
+
+    // ----- Projects (docs/design/keyboard-lease-and-ledger.md §7) -----
+
+    fn lock_projects(&self) -> Result<MutexGuard<'_, HashMap<String, Project>>, String> {
+        self.projects
+            .lock()
+            .map_err(|_| "project lock poisoned".to_string())
+    }
+
+    fn projects_snapshot(&self) -> HashMap<String, Project> {
+        self.lock_projects()
+            .map(|projects| projects.clone())
+            .unwrap_or_default()
+    }
+
+    fn handle_project_create(
+        &self,
+        name: &str,
+        goal: Option<String>,
+        repo: Option<String>,
+    ) -> Result<Value, String> {
+        let name = validate_project_name(name)?;
+        let goal = match goal {
+            Some(goal) => Some(validate_bounded_text(&goal, "goal", 4096)?),
+            None => None,
+        };
+        let repo = match repo {
+            Some(repo) => Some(validate_bounded_text(&repo, "repo", 4096)?),
+            None => None,
+        };
+        let project = Project {
+            name: name.clone(),
+            goal,
+            repo,
+            panes: Vec::new(),
+            created_at_ms: now_millis(),
+        };
+        {
+            let mut projects = self.lock_projects()?;
+            if projects.len() >= MAX_PROJECTS {
+                return Err(format!("project limit reached ({MAX_PROJECTS})"));
+            }
+            if projects.contains_key(&name) {
+                return Err(format!("project '{name}' already exists"));
+            }
+            projects.insert(name.clone(), project.clone());
+        }
+        if let Err(error) = self.persist() {
+            let _ = self
+                .lock_projects()
+                .map(|mut projects| projects.remove(&name));
+            return Err(error);
+        }
+        Ok(json!(project))
+    }
+
+    fn handle_project_delete(&self, name: &str) -> Result<Value, String> {
+        let removed = self.lock_projects()?.remove(name);
+        let Some(project) = removed else {
+            return Err(format!("unknown project '{name}'"));
+        };
+        for pane_id in &project.panes {
+            let _ = self.ledger_record(pane_id, "project.unassigned", json!({ "project": name }));
+        }
+        if let Err(error) = self.persist() {
+            let _ = self
+                .lock_projects()
+                .map(|mut projects| projects.insert(name.to_string(), project.clone()));
+            return Err(error);
+        }
+        Ok(json!(project))
+    }
+
+    /// Put a pane in a project (a pane belongs to at most one; moving it
+    /// leaves the previous project). Both sides are ledgered on the pane so
+    /// its record shows which project it served.
+    fn handle_project_assign(&self, name: &str, pane_id: &str) -> Result<Value, String> {
+        self.ensure_pane_exists(pane_id)?;
+        let previous = {
+            let mut projects = self.lock_projects()?;
+            if !projects.contains_key(name) {
+                return Err(format!("unknown project '{name}'"));
+            }
+            let mut previous = None;
+            for (other_name, project) in projects.iter_mut() {
+                if other_name != name && project.panes.iter().any(|id| id == pane_id) {
+                    project.panes.retain(|id| id != pane_id);
+                    previous = Some(other_name.clone());
+                }
+            }
+            let project = projects.get_mut(name).expect("checked above");
+            if !project.panes.iter().any(|id| id == pane_id) {
+                project.panes.push(pane_id.to_string());
+            }
+            previous
+        };
+        if let Some(previous) = &previous {
+            let _ = self.ledger_record(
+                pane_id,
+                "project.unassigned",
+                json!({ "project": previous }),
+            );
+        }
+        let _ = self.ledger_record(pane_id, "project.assigned", json!({ "project": name }));
+        self.persist()?;
+        Ok(json!({ "pane_id": pane_id, "project": name, "previous": previous }))
+    }
+
+    fn handle_project_unassign(&self, pane_id: &str) -> Result<Value, String> {
+        let mut left = None;
+        {
+            let mut projects = self.lock_projects()?;
+            for (name, project) in projects.iter_mut() {
+                if project.panes.iter().any(|id| id == pane_id) {
+                    project.panes.retain(|id| id != pane_id);
+                    left = Some(name.clone());
+                }
+            }
+        }
+        if let Some(name) = &left {
+            let _ = self.ledger_record(pane_id, "project.unassigned", json!({ "project": name }));
+            self.persist()?;
+        }
+        Ok(json!({ "pane_id": pane_id, "project": left }))
+    }
+
+    /// Drop a closed pane from its project (the caller persists).
+    fn forget_pane_in_projects(&self, pane_id: &str) {
+        if let Ok(mut projects) = self.lock_projects() {
+            for project in projects.values_mut() {
+                project.panes.retain(|id| id != pane_id);
+            }
+        }
+    }
+
+    fn project_summaries(&self) -> Result<Vec<ProjectSummary>, String> {
+        let projects = self.projects_snapshot();
+        let pane_ids: Vec<String> = projects
+            .values()
+            .flat_map(|project| project.panes.iter().cloned())
+            .collect();
+        let states = self.lock_terminals()?.runtime_states(&pane_ids);
+        let agents = self.router.agent_info_map();
+        let leases = self.lock_leases()?.clone();
+        let mut summaries: Vec<ProjectSummary> = projects
+            .values()
+            .map(|project| project_rollup(project, &states, &agents, &leases))
+            .collect();
+        summaries.sort_by(|a, b| a.project.name.cmp(&b.project.name));
+        Ok(summaries)
+    }
+
+    fn handle_project_show(&self, name: &str) -> Result<Value, String> {
+        let summary = self
+            .project_summaries()?
+            .into_iter()
+            .find(|summary| summary.project.name == name)
+            .ok_or_else(|| format!("unknown project '{name}'"))?;
+        let registry = self.lock_registry()?;
+        let titles: HashMap<String, (String, PaneKind)> = registry
+            .panes
+            .iter()
+            .map(|pane| (pane.id.clone(), (pane.title.clone(), pane.kind)))
+            .collect();
+        drop(registry);
+        let states = self
+            .lock_terminals()?
+            .runtime_states(&summary.project.panes);
+        let agents = self.router.agent_info_map();
+        let leases = self.lock_leases()?.clone();
+        let bindings = self.kranz_bindings_snapshot();
+        let panes: Vec<Value> = summary
+            .project
+            .panes
+            .iter()
+            .map(|pane_id| {
+                let (title, kind) = titles
+                    .get(pane_id)
+                    .cloned()
+                    .unwrap_or_else(|| (pane_id.clone(), PaneKind::Shell));
+                json!({
+                    "id": pane_id,
+                    "title": title,
+                    "kind": kind,
+                    "state": states.get(pane_id).copied().unwrap_or(PaneRuntimeState::Ended),
+                    "agent": agents.get(pane_id).cloned().unwrap_or_default(),
+                    "holder": leases.get(pane_id).map(|held| held.holder.clone()),
+                    "kranz": bindings.get(pane_id).cloned(),
+                })
+            })
+            .collect();
+        Ok(json!({ "summary": summary, "panes": panes }))
+    }
+
+    /// The project's members' ledgers merged in time order: the project-level
+    /// "who did what" a single pane's ledger cannot show.
+    fn handle_project_ledger(&self, name: &str, limit: usize) -> Result<Value, String> {
+        let project = self
+            .projects_snapshot()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown project '{name}'"))?;
+        let dir = self
+            .ledger
+            .lock()
+            .map_err(|_| "ledger lock poisoned".to_string())?
+            .dir
+            .clone();
+        let mut records: Vec<Value> = project
+            .panes
+            .iter()
+            .flat_map(|pane_id| read_ledger_tail(&ledger_path(&dir, pane_id), 0))
+            .collect();
+        records.sort_by_key(|record| {
+            (
+                record["ts_ms"].as_u64().unwrap_or(0),
+                record["pane_id"].as_str().unwrap_or("").to_string(),
+                record["seq"].as_u64().unwrap_or(0),
+            )
+        });
+        let limit = match limit {
+            0 => PROJECT_LEDGER_DEFAULT_LIMIT,
+            n => n.min(PROJECT_LEDGER_MAX_LIMIT),
+        };
+        let total = records.len();
+        if total > limit {
+            records = records.split_off(total - limit);
+        }
+        Ok(json!({ "project": name, "total": total, "records": records }))
     }
 
     // ----- Kranz bindings (M4, docs/design/keyboard-lease-and-ledger.md) -----
@@ -8672,6 +9055,7 @@ impl DaemonServer {
                 // So does its keyboard lease (ledgered as revoked; the ledger
                 // file itself is kept).
                 self.revoke_lease_on_close(&pane_id);
+                self.forget_pane_in_projects(&pane_id);
                 self.lock_terminals()?.close_pane(&pane_id);
                 self.router.invalidate_append_handle(&pane_id);
                 let _ = fs::remove_file(scrollback_path(&self.scrollback_dir, &pane_id));
@@ -8753,6 +9137,19 @@ impl DaemonServer {
             DaemonRequest::KranzBind { pane_id, repo } => self.handle_kranz_bind(&pane_id, repo),
             DaemonRequest::KranzUnbind { pane_id } => self.handle_kranz_unbind(&pane_id),
             DaemonRequest::KranzBindings => Ok(json!(self.kranz_bindings_snapshot())),
+            DaemonRequest::ProjectCreate { name, goal, repo } => {
+                self.handle_project_create(&name, goal, repo)
+            }
+            DaemonRequest::ProjectDelete { name } => self.handle_project_delete(&name),
+            DaemonRequest::ProjectAssign { name, pane_id } => {
+                self.handle_project_assign(&name, &pane_id)
+            }
+            DaemonRequest::ProjectUnassign { pane_id } => self.handle_project_unassign(&pane_id),
+            DaemonRequest::ProjectList => Ok(json!(self.project_summaries()?)),
+            DaemonRequest::ProjectShow { name } => self.handle_project_show(&name),
+            DaemonRequest::ProjectLedger { name, limit } => {
+                self.handle_project_ledger(&name, limit)
+            }
             DaemonRequest::LeaseStatus { pane_id } => {
                 self.ensure_pane_exists(&pane_id)?;
                 self.lease_info(&pane_id).map(|info| json!(info))
@@ -10000,6 +10397,7 @@ impl DaemonServer {
         // Held keyboard leases ride alongside so a client can render the
         // holder without a second request.
         snapshot.leases = self.lease_infos();
+        snapshot.projects = self.projects_snapshot();
         // (T2) Bounded conversation replay for agent panes, read back from the
         // per-pane JSONL log (covers live, ended, and not-yet-respawned panes).
         for pane in &snapshot.panes {
@@ -10656,6 +11054,17 @@ impl DaemonServer {
                 .iter()
                 .filter(|(pane_id, _)| registry.contains_pane(pane_id))
                 .map(|(pane_id, held)| (pane_id.clone(), held.clone()))
+                .collect(),
+            projects: self
+                .lock_projects()?
+                .iter()
+                .map(|(name, project)| {
+                    let mut project = project.clone();
+                    project
+                        .panes
+                        .retain(|pane_id| registry.contains_pane(pane_id));
+                    (name.clone(), project)
+                })
                 .collect(),
         };
         drop(terminals);
@@ -13274,6 +13683,7 @@ struct LoadedWorkspace {
     /// Held keyboard leases restored from workspace.json (empty for a fresh,
     /// corrupt, or pre-lease workspace).
     leases: HashMap<String, HeldLease>,
+    projects: HashMap<String, Project>,
     was_corrupt: bool,
     /// The cwd recorded in the persisted workspace.json, if the file was parsed
     /// successfully. Used by the daemon-side collision check (defense-in-depth:
@@ -13297,6 +13707,7 @@ fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
                 agent_specs: HashMap::new(),
                 pane_shells: HashMap::new(),
                 leases: HashMap::new(),
+                projects: HashMap::new(),
                 was_corrupt: false,
                 persisted_cwd: None,
             };
@@ -13317,6 +13728,7 @@ fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
             let agent_specs = persisted.agent_specs.clone();
             let pane_shells = persisted.pane_shells.clone();
             let leases = persisted.leases.clone();
+            let projects = persisted.projects.clone();
             let persisted_cwd = Some(persisted.cwd.clone());
             let registry = PaneRegistry::from_persisted(persisted, cwd);
             LoadedWorkspace {
@@ -13330,6 +13742,7 @@ fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
                 agent_specs,
                 pane_shells,
                 leases,
+                projects,
                 was_corrupt: false,
                 persisted_cwd,
             }
@@ -13349,6 +13762,7 @@ fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
                 agent_specs: HashMap::new(),
                 pane_shells: HashMap::new(),
                 leases: HashMap::new(),
+                projects: HashMap::new(),
                 was_corrupt: true,
                 persisted_cwd: None,
             }
@@ -14159,6 +14573,21 @@ fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             };
             control_lease(&client, parsed, options.json)
         }
+        "project" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_project_args(&options.args[1..])?;
+            let client = if matches!(
+                parsed.verb,
+                ProjectVerb::List | ProjectVerb::Show | ProjectVerb::Ledger
+            ) {
+                DaemonClient::connect_existing(options.workspace)?
+            } else {
+                DaemonClient::connect_or_spawn(options.workspace)?
+            };
+            control_project(&client, parsed, options.json)
+        }
         "kranz" => {
             if has_help_flag(&options.args[1..]) {
                 return print_control_help();
@@ -14537,6 +14966,8 @@ struct ParsedNewPaneArgs {
     backend: Option<AgentBackendKind>,
     model: Option<String>,
     profile: Option<String>,
+    /// `--project NAME`: put the new pane in a project right away.
+    project: Option<String>,
 }
 
 fn parse_new_pane_args_with_spec(args: &[String]) -> Result<ParsedNewPaneArgs, String> {
@@ -14544,6 +14975,7 @@ fn parse_new_pane_args_with_spec(args: &[String]) -> Result<ParsedNewPaneArgs, S
     let mut backend = None;
     let mut model = None;
     let mut profile = None;
+    let mut project = None;
     let mut title_args = Vec::with_capacity(args.len());
     let mut index = 0;
     while index < args.len() {
@@ -14551,6 +14983,17 @@ fn parse_new_pane_args_with_spec(args: &[String]) -> Result<ParsedNewPaneArgs, S
             "--agent" => {
                 agent = true;
                 index += 1;
+            }
+            "--project" => {
+                if project.is_some() {
+                    return Err("--project given more than once".to_string());
+                }
+                project = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--project requires a name".to_string())?
+                        .clone(),
+                );
+                index += 2;
             }
             "--profile" => {
                 if profile.is_some() {
@@ -14619,6 +15062,7 @@ fn parse_new_pane_args_with_spec(args: &[String]) -> Result<ParsedNewPaneArgs, S
         backend,
         model,
         profile,
+        project,
     })
 }
 
@@ -14664,6 +15108,12 @@ fn control_new_pane(
             profile: parsed.profile,
         })?
     };
+    if let Some(project) = parsed.project {
+        client.request::<Value>(DaemonRequest::ProjectAssign {
+            name: project,
+            pane_id: pane.id.clone(),
+        })?;
+    }
     if json_output {
         write_json_stdout(&pane)
     } else {
@@ -15254,6 +15704,273 @@ fn control_lines(
             .map_err(|error| format!("failed to write stdout: {error}"))?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectVerb {
+    List,
+    Show,
+    New,
+    Add,
+    Rm,
+    Delete,
+    Ledger,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectArgs {
+    verb: ProjectVerb,
+    name: Option<String>,
+    panes: Vec<String>,
+    goal: Option<String>,
+    repo: Option<String>,
+    limit: usize,
+}
+
+/// `project list | show NAME | new NAME [--goal TEXT] [--repo PATH] |
+/// add NAME PANE... | rm PANE... | delete NAME | ledger NAME [-n N]`.
+fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
+    let verb = match args.first().map(String::as_str) {
+        None | Some("list") => ProjectVerb::List,
+        Some("show") => ProjectVerb::Show,
+        Some("new") | Some("create") => ProjectVerb::New,
+        Some("add") | Some("assign") => ProjectVerb::Add,
+        Some("rm") | Some("remove") | Some("unassign") => ProjectVerb::Rm,
+        Some("delete") => ProjectVerb::Delete,
+        Some("ledger") => ProjectVerb::Ledger,
+        Some(other) => return Err(format!("unknown project command: {other}")),
+    };
+    let mut parsed = ProjectArgs {
+        verb,
+        name: None,
+        panes: Vec::new(),
+        goal: None,
+        repo: None,
+        limit: 0,
+    };
+    let mut positionals: Vec<String> = Vec::new();
+    let mut index = if args.is_empty() { 0 } else { 1 };
+    while index < args.len() {
+        match args[index].as_str() {
+            "--goal" => {
+                parsed.goal = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .ok_or_else(|| "--goal requires TEXT".to_string())?,
+                );
+                index += 1;
+            }
+            "--repo" => {
+                parsed.repo = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .ok_or_else(|| "--repo requires PATH".to_string())?,
+                );
+                index += 1;
+            }
+            "-n" | "--limit" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "-n requires a count".to_string())?;
+                parsed.limit = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid -n count '{value}'"))?;
+                index += 1;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(format!("unexpected argument for project: {other}"));
+            }
+            other => positionals.push(other.to_string()),
+        }
+        index += 1;
+    }
+    match verb {
+        ProjectVerb::List => {
+            if !positionals.is_empty() {
+                return Err("project list takes no arguments".to_string());
+            }
+        }
+        ProjectVerb::Show | ProjectVerb::Delete | ProjectVerb::New | ProjectVerb::Ledger => {
+            if positionals.len() != 1 {
+                return Err("expected exactly one project NAME".to_string());
+            }
+            parsed.name = positionals.pop();
+        }
+        ProjectVerb::Add => {
+            if positionals.len() < 2 {
+                return Err("project add needs a NAME and at least one PANE".to_string());
+            }
+            parsed.name = Some(positionals.remove(0));
+            parsed.panes = positionals;
+        }
+        ProjectVerb::Rm => {
+            if positionals.is_empty() {
+                return Err("project rm needs at least one PANE".to_string());
+            }
+            parsed.panes = positionals;
+        }
+    }
+    if verb != ProjectVerb::New && (parsed.goal.is_some() || parsed.repo.is_some()) {
+        return Err("--goal/--repo apply to `project new`".to_string());
+    }
+    if verb != ProjectVerb::Ledger && parsed.limit != 0 {
+        return Err("-n applies to `project ledger`".to_string());
+    }
+    Ok(parsed)
+}
+
+fn control_project(
+    client: &DaemonClient,
+    parsed: ProjectArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let mut stdout = std::io::stdout();
+    match parsed.verb {
+        ProjectVerb::List => {
+            let summaries: Vec<ProjectSummary> = client.request(DaemonRequest::ProjectList)?;
+            if json_output {
+                return write_json_stdout(&summaries);
+            }
+            for summary in summaries {
+                writeln!(
+                    stdout,
+                    "{}\tpanes={} live={} needs_input={} working={} idle={} unattended={} held={}{}",
+                    summary.project.name,
+                    summary.panes,
+                    summary.live,
+                    summary.needs_input,
+                    summary.working,
+                    summary.idle,
+                    summary.unattended,
+                    summary.held,
+                    if summary.holders.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", summary.holders.join(", "))
+                    }
+                )
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+            }
+            Ok(())
+        }
+        ProjectVerb::Show => {
+            let name = parsed.name.unwrap_or_default();
+            let detail: Value = client.request(DaemonRequest::ProjectShow { name })?;
+            if json_output {
+                return write_json_stdout(&detail);
+            }
+            let summary = &detail["summary"];
+            writeln!(
+                stdout,
+                "{}\t{}",
+                summary["project"]["name"].as_str().unwrap_or("-"),
+                summary["project"]["goal"].as_str().unwrap_or("")
+            )
+            .map_err(|error| format!("failed to write stdout: {error}"))?;
+            for pane in detail["panes"].as_array().into_iter().flatten() {
+                let agent = &pane["agent"];
+                writeln!(
+                    stdout,
+                    "  {}\t{}\t{}\t{}\t{}\t{}{}",
+                    pane["id"].as_str().unwrap_or("-"),
+                    pane["title"].as_str().unwrap_or("-"),
+                    pane["state"].as_str().unwrap_or("-"),
+                    agent["agent"].as_str().unwrap_or("-"),
+                    agent["attention"].as_str().unwrap_or("-"),
+                    pane["holder"].as_str().unwrap_or("-"),
+                    if agent["unattended"].as_bool().unwrap_or(false) {
+                        "\tUNATTENDED"
+                    } else {
+                        ""
+                    }
+                )
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+            }
+            Ok(())
+        }
+        ProjectVerb::New => {
+            let project: Project = client.request(DaemonRequest::ProjectCreate {
+                name: parsed.name.unwrap_or_default(),
+                goal: parsed.goal,
+                repo: parsed.repo,
+            })?;
+            if json_output {
+                return write_json_stdout(&project);
+            }
+            writeln!(stdout, "{}", project.name)
+                .map_err(|error| format!("failed to write stdout: {error}"))
+        }
+        ProjectVerb::Add => {
+            let name = parsed.name.unwrap_or_default();
+            let mut results = Vec::new();
+            for pane_ref in &parsed.panes {
+                let pane_id = resolve_pane_ref(client, pane_ref)?;
+                let result: Value = client.request(DaemonRequest::ProjectAssign {
+                    name: name.clone(),
+                    pane_id,
+                })?;
+                results.push(result);
+            }
+            if json_output {
+                return write_json_stdout(&results);
+            }
+            for result in results {
+                writeln!(
+                    stdout,
+                    "{}\t{}",
+                    result["pane_id"].as_str().unwrap_or("-"),
+                    result["project"].as_str().unwrap_or("-")
+                )
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+            }
+            Ok(())
+        }
+        ProjectVerb::Rm => {
+            let mut results = Vec::new();
+            for pane_ref in &parsed.panes {
+                let pane_id = resolve_pane_ref(client, pane_ref)?;
+                let result: Value = client.request(DaemonRequest::ProjectUnassign { pane_id })?;
+                results.push(result);
+            }
+            if json_output {
+                return write_json_stdout(&results);
+            }
+            for result in results {
+                writeln!(
+                    stdout,
+                    "{}\t{}",
+                    result["pane_id"].as_str().unwrap_or("-"),
+                    result["project"].as_str().unwrap_or("-")
+                )
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+            }
+            Ok(())
+        }
+        ProjectVerb::Delete => {
+            let project: Project = client.request(DaemonRequest::ProjectDelete {
+                name: parsed.name.unwrap_or_default(),
+            })?;
+            if json_output {
+                return write_json_stdout(&project);
+            }
+            writeln!(stdout, "{}\tdeleted", project.name)
+                .map_err(|error| format!("failed to write stdout: {error}"))
+        }
+        ProjectVerb::Ledger => {
+            let result: Value = client.request(DaemonRequest::ProjectLedger {
+                name: parsed.name.unwrap_or_default(),
+                limit: parsed.limit,
+            })?;
+            if json_output {
+                return write_json_stdout(&result);
+            }
+            for record in result["records"].as_array().into_iter().flatten() {
+                writeln!(stdout, "{record}")
+                    .map_err(|error| format!("failed to write stdout: {error}"))?;
+            }
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17941,7 +18658,7 @@ Commands (PANE is a pane id or title; defaults to the active pane):
   ipc-endpoint                  Start/locate the daemon and print native-client
                                 IPC discovery metadata (never prints the token)
   panes | list                  List panes in the workspace
-  new [--agent] [--backend claude|droid] [--model ID] [--profile NAME] [--name NAME]
+  new [--agent] [--backend claude|droid] [--model ID] [--profile NAME] [--project NAME] [--name NAME]
                                 Create a pane (alias: pane new).
                                   --agent defaults to Claude
                                   --backend selects the agent CLI
@@ -17971,6 +18688,17 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   $SGIAN_HOLDER or user@host.
   lease release [PANE] -m NOTE [--as HOLDER]
                                 Hand the keyboard back; the note is mandatory.
+  project list                  Projects with their attention roll-up
+                                  (panes, live, needs input, working, idle,
+                                  unattended, keyboard holders)
+  project show <NAME>           One project with every member pane's state
+  project new <NAME> [--goal TEXT] [--repo PATH]
+                                Create a project (a named group of panes
+                                  serving one goal; persists with the workspace)
+  project add <NAME> <PANE>...  Put panes in a project (a pane is in at most one)
+  project rm <PANE>...          Take panes out of their project
+  project delete <NAME>         Delete a project (its panes stay open)
+  project ledger <NAME> [-n N]  Member panes' ledgers merged in time order
   kranz status                  List panes bound to Kranz missions (auto: a
                                   `kranz run` under the pane; manual: bind)
   kranz bind [PANE] [--repo PATH]
@@ -19297,6 +20025,7 @@ mod tests {
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         };
         fs::write(
             data_dir.join(WORKSPACE_FILE),
@@ -19649,6 +20378,7 @@ mod tests {
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         };
         let registry = PaneRegistry::from_persisted(persisted, "/tmp/x".to_string());
         let snapshot = registry.snapshot();
@@ -19686,6 +20416,7 @@ mod tests {
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         };
         let mut registry = PaneRegistry::from_persisted(persisted, "/tmp/x".to_string());
         let snapshot = registry.snapshot();
@@ -21815,6 +22546,7 @@ mod tests {
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         };
         fs::write(
             dir.path().join(WORKSPACE_FILE),
@@ -28547,6 +29279,7 @@ mod tests {
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -30064,6 +30797,7 @@ mod tests {
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -30114,6 +30848,7 @@ mod tests {
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -30157,6 +30892,7 @@ mod tests {
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -30212,6 +30948,7 @@ mod tests {
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         };
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
@@ -30588,6 +31325,7 @@ mod tests {
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         };
         fs::write(
             dir.path().join(WORKSPACE_FILE),
@@ -30618,6 +31356,7 @@ mod tests {
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         };
         fs::write(
             dir.path().join(WORKSPACE_FILE),
@@ -30658,6 +31397,7 @@ mod tests {
             agent_specs: HashMap::new(),
             pane_shells: HashMap::new(),
             leases: HashMap::new(),
+            projects: HashMap::new(),
         };
         fs::write(
             dir.path().join(WORKSPACE_FILE),
@@ -34010,6 +34750,8 @@ exit 0
                 backend: Some(AgentBackendKind::Droid),
                 model: Some("custom:Fireworks-Qwen-0".to_string()),
                 profile: None,
+
+                project: None,
             }
         );
 
@@ -34024,6 +34766,8 @@ exit 0
                 backend: None,
                 model: Some("sonnet".to_string()),
                 profile: None,
+
+                project: None,
             }
         );
         assert_eq!(
@@ -34034,6 +34778,8 @@ exit 0
                 backend: None,
                 model: None,
                 profile: None,
+
+                project: None,
             }
         );
 
@@ -36188,6 +36934,250 @@ exit 0
             })
             .expect_err("range too wide");
         assert!(bad.contains("at most"), "{bad}");
+        daemon.shutdown();
+    }
+
+    #[test]
+    fn project_names_and_rollup() {
+        assert_eq!(
+            validate_project_name(" feature-x "),
+            Ok("feature-x".to_string())
+        );
+        assert!(validate_project_name("").is_err());
+        assert!(validate_project_name(".hidden").is_err());
+        assert!(validate_project_name("has space").is_err());
+        assert!(validate_project_name(&"n".repeat(65)).is_err());
+
+        let project = Project {
+            name: "p".to_string(),
+            goal: None,
+            repo: None,
+            panes: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            created_at_ms: 1,
+        };
+        let states = HashMap::from([
+            ("a".to_string(), PaneRuntimeState::Live),
+            ("b".to_string(), PaneRuntimeState::Live),
+            ("c".to_string(), PaneRuntimeState::Ended),
+        ]);
+        let agents = HashMap::from([
+            (
+                "a".to_string(),
+                AgentPaneInfo {
+                    agent: Some("claude".to_string()),
+                    attention: Some(AgentAttention::NeedsInput),
+                    mode: Some("auto".to_string()),
+                    unattended: true,
+                },
+            ),
+            (
+                "b".to_string(),
+                AgentPaneInfo {
+                    agent: Some("claude".to_string()),
+                    attention: Some(AgentAttention::Working),
+                    mode: None,
+                    unattended: false,
+                },
+            ),
+        ]);
+        let leases = HashMap::from([
+            ("a".to_string(), HeldLease::new("alice", 1)),
+            ("c".to_string(), HeldLease::new("alice", 2)),
+        ]);
+        let summary = project_rollup(&project, &states, &agents, &leases);
+        assert_eq!(summary.panes, 3);
+        assert_eq!(summary.live, 2);
+        assert_eq!(summary.needs_input, 1);
+        assert_eq!(summary.working, 1);
+        assert_eq!(summary.idle, 0);
+        assert_eq!(summary.unattended, 1);
+        assert_eq!(summary.held, 2);
+        assert_eq!(summary.holders, vec!["alice".to_string()]);
+    }
+
+    #[test]
+    fn parse_project_args_shapes() {
+        assert_eq!(
+            parse_project_args(&[]).expect("bare").verb,
+            ProjectVerb::List
+        );
+        let new = parse_project_args(&args(&["new", "feat", "--goal", "ship it", "--repo", "/r"]))
+            .expect("new");
+        assert_eq!(new.name.as_deref(), Some("feat"));
+        assert_eq!(new.goal.as_deref(), Some("ship it"));
+        assert_eq!(new.repo.as_deref(), Some("/r"));
+        let add = parse_project_args(&args(&["add", "feat", "pane-1", "pane-2"])).expect("add");
+        assert_eq!(add.panes, args(&["pane-1", "pane-2"]));
+        let rm = parse_project_args(&args(&["rm", "pane-1"])).expect("rm");
+        assert_eq!(rm.panes, args(&["pane-1"]));
+        let ledger = parse_project_args(&args(&["ledger", "feat", "-n", "5"])).expect("ledger");
+        assert_eq!(ledger.limit, 5);
+        assert!(parse_project_args(&args(&["add", "feat"])).is_err());
+        assert!(parse_project_args(&args(&["show"])).is_err());
+        assert!(parse_project_args(&args(&["list", "x"])).is_err());
+        assert!(parse_project_args(&args(&["show", "feat", "--goal", "x"])).is_err());
+        assert!(parse_project_args(&args(&["bogus"])).is_err());
+    }
+
+    #[test]
+    fn projects_round_trip_over_ipc_and_persist() {
+        let daemon = TestDaemon::spawn(Config::default());
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let first = initial.panes[0].id.clone();
+        let second: Pane = client
+            .request(DaemonRequest::CreatePane {
+                title: Some("worker".to_string()),
+                profile: None,
+            })
+            .expect("second pane");
+
+        let project: Project = client
+            .request(DaemonRequest::ProjectCreate {
+                name: "feat".to_string(),
+                goal: Some("ship the thing".to_string()),
+                repo: None,
+            })
+            .expect("create");
+        assert_eq!(project.name, "feat");
+        let dup = client
+            .request::<Project>(DaemonRequest::ProjectCreate {
+                name: "feat".to_string(),
+                goal: None,
+                repo: None,
+            })
+            .expect_err("duplicate refused");
+        assert!(dup.contains("already exists"), "{dup}");
+        assert!(client
+            .request::<Project>(DaemonRequest::ProjectCreate {
+                name: "bad name".to_string(),
+                goal: None,
+                repo: None,
+            })
+            .is_err());
+
+        client
+            .request::<Value>(DaemonRequest::ProjectAssign {
+                name: "feat".to_string(),
+                pane_id: first.clone(),
+            })
+            .expect("assign first");
+        client
+            .request::<Value>(DaemonRequest::ProjectAssign {
+                name: "feat".to_string(),
+                pane_id: second.id.clone(),
+            })
+            .expect("assign second");
+        client
+            .request::<LeaseInfo>(DaemonRequest::TakeLease {
+                pane_id: second.id.clone(),
+                holder: "alice".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect("take");
+
+        let summaries: Vec<ProjectSummary> =
+            client.request(DaemonRequest::ProjectList).expect("list");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].panes, 2);
+        assert_eq!(summaries[0].held, 1);
+        assert_eq!(summaries[0].holders, vec!["alice".to_string()]);
+        assert_eq!(summaries[0].project.goal.as_deref(), Some("ship the thing"));
+
+        // Moving a pane to another project leaves the first.
+        client
+            .request::<Project>(DaemonRequest::ProjectCreate {
+                name: "other".to_string(),
+                goal: None,
+                repo: None,
+            })
+            .expect("other");
+        let moved: Value = client
+            .request(DaemonRequest::ProjectAssign {
+                name: "other".to_string(),
+                pane_id: first.clone(),
+            })
+            .expect("move");
+        assert_eq!(moved["previous"], json!("feat"));
+        let detail: Value = client
+            .request(DaemonRequest::ProjectShow {
+                name: "feat".to_string(),
+            })
+            .expect("show");
+        let members: Vec<&str> = detail["panes"]
+            .as_array()
+            .expect("panes")
+            .iter()
+            .map(|pane| pane["id"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(members, vec![second.id.as_str()]);
+        assert_eq!(detail["panes"][0]["holder"], json!("alice"));
+
+        // The merged ledger carries both panes' records in time order.
+        let ledger: Value = client
+            .request(DaemonRequest::ProjectLedger {
+                name: "other".to_string(),
+                limit: 0,
+            })
+            .expect("ledger");
+        let kinds: Vec<&str> = ledger["records"]
+            .as_array()
+            .expect("records")
+            .iter()
+            .map(|record| record["type"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["project.assigned", "project.unassigned", "project.assigned"]
+        );
+        assert_eq!(ledger["records"][2]["payload"]["project"], json!("other"));
+
+        // Persisted, and the snapshot carries it.
+        let persisted: PersistedWorkspace = serde_json::from_str(
+            &fs::read_to_string(daemon.data_dir.path().join(WORKSPACE_FILE))
+                .expect("workspace.json"),
+        )
+        .expect("parse");
+        assert_eq!(persisted.projects["feat"].panes, vec![second.id.clone()]);
+        assert_eq!(persisted.projects["other"].panes, vec![first.clone()]);
+        let snapshot: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        assert_eq!(snapshot.projects.len(), 2);
+
+        // Closing a member drops it; deleting a project keeps its panes.
+        client
+            .request::<Value>(DaemonRequest::ClosePane {
+                pane_id: second.id.clone(),
+            })
+            .expect("close member");
+        let after: Vec<ProjectSummary> = client
+            .request(DaemonRequest::ProjectList)
+            .expect("list after close");
+        let feat = after
+            .iter()
+            .find(|summary| summary.project.name == "feat")
+            .expect("feat");
+        assert_eq!(feat.panes, 0);
+        client
+            .request::<Project>(DaemonRequest::ProjectDelete {
+                name: "other".to_string(),
+            })
+            .expect("delete");
+        assert!(client
+            .request::<Value>(DaemonRequest::ProjectShow {
+                name: "other".to_string(),
+            })
+            .is_err());
+        let status: PaneStatus = client
+            .request(DaemonRequest::PaneStatus {
+                pane_id: first.clone(),
+            })
+            .expect("pane survives project deletion");
+        assert_eq!(status.pane.id, first);
         daemon.shutdown();
     }
 
