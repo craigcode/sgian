@@ -100,6 +100,15 @@ transports.
 | `write(holder?)` under `open` | Unheld, or Held by `holder` | `pane keyboard is held by H` |
 | `write(holder?)` under `required` | Held by `holder` only | as above, or `pane keyboard is unheld; take it first` |
 | `broadcast` / sync input | writes skip every held pane | never refused, reports which panes were written |
+| any command naming a `generation` | the lease's generation is unchanged | `stale lease: generation N is no longer current` (also when the pane is now unheld) |
+
+Every held lease carries a monotonic `generation` (never repeated across
+restarts). A writer that names the generation it believes it holds is refused
+once the lease has changed hands, so a previous holder's late write, answer or
+release cannot land on the current holder's session. This is what makes the
+lease arbitrate control rather than merely redirect messages (Kranz review,
+2026-09-16); ACP prompt submission and permission answers will use the same
+check. See also `execution-grants.md` for the boundary with Kranz.
 
 Predicates are pure functions on `(policy, lease, holder)` and are unit tested
 in isolation. Handlers call them; clients never re-derive the rules.

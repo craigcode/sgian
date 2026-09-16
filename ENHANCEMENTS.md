@@ -164,8 +164,17 @@ Shipped (2026-09-16):
   `output_warning` event, in `find --json` and `ctl agent`
   (`HIDDEN-OUTPUT …`), and in the bootstrap snapshot's `output_warnings`.
 
+- **Lease generations.** Every held lease carries a monotonic generation
+  (never repeated across restarts); `send --generation N` and
+  `lease release --generation N` are refused as stale once the lease has
+  changed hands, so a previous holder's late command cannot land on the
+  current holder's session. `docs/design/execution-grants.md` records the
+  Kranz-authorizes / Sgian-executes boundary agreed with the Kranz side.
+
 Open, in order:
 
+- **Execution grants** (`docs/design/execution-grants.md`): the Sgian half
+  once `kranz-acp` and Kranz's `TerminalProvider` seam exist.
 - **Output-guard badges in the clients**, and stripping for agent panes.
 - **Project rendering in the clients** (sidebar grouping, roll-up counts,
   the "listening" summary) and per-project shared context notes under git.

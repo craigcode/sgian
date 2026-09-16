@@ -2279,6 +2279,10 @@ enum DaemonRequest {
         pane_id: String,
         input: String,
         holder: String,
+        /// Optional: the lease generation the writer believes it holds; a
+        /// mismatch is refused as stale (docs/design/keyboard-lease-and-ledger.md §3).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
     },
     /// Claim a pane's keyboard for `holder`. Idempotent for the current
     /// holder; against another holder it needs `force` plus a `why`, and both
@@ -2296,6 +2300,8 @@ enum DaemonRequest {
         pane_id: String,
         holder: String,
         note: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
     },
     LeaseStatus {
         pane_id: String,
@@ -7645,10 +7651,16 @@ struct HeldLease {
     refused_writes: u64,
     #[serde(default)]
     last_input_ms: Option<u64>,
+    /// Monotonic per-workspace lease number. A command that names a
+    /// generation is refused when the lease has changed hands since, so a
+    /// previous holder's late write, answer or release cannot land on the
+    /// current holder's session. 0 for leases persisted before generations.
+    #[serde(default)]
+    generation: u64,
 }
 
 impl HeldLease {
-    fn new(holder: &str, since_ms: u64) -> Self {
+    fn new(holder: &str, since_ms: u64, generation: u64) -> Self {
         Self {
             holder: holder.to_string(),
             since_ms,
@@ -7656,6 +7668,7 @@ impl HeldLease {
             bytes_typed: 0,
             refused_writes: 0,
             last_input_ms: None,
+            generation,
         }
     }
 }
@@ -7676,6 +7689,9 @@ pub struct LeaseInfo {
     pub refused_writes: u64,
     #[serde(default)]
     pub last_input_ms: Option<u64>,
+    /// The lease's generation (see `HeldLease::generation`); present while held.
+    #[serde(default)]
+    pub generation: Option<u64>,
 }
 
 impl LeaseInfo {
@@ -7695,7 +7711,24 @@ impl LeaseInfo {
             bytes_typed: lease.map(|held| held.bytes_typed).unwrap_or(0),
             refused_writes: lease.map(|held| held.refused_writes).unwrap_or(0),
             last_input_ms: lease.and_then(|held| held.last_input_ms),
+            generation: lease.map(|held| held.generation),
         }
+    }
+}
+
+/// Refuse a command that names a lease generation which is no longer the
+/// pane's current one (or names one while the pane is unheld).
+fn check_generation(lease: Option<&HeldLease>, generation: Option<u64>) -> Result<(), String> {
+    match (generation, lease) {
+        (None, _) => Ok(()),
+        (Some(wanted), Some(held)) if held.generation == wanted => Ok(()),
+        (Some(wanted), Some(held)) => Err(format!(
+            "stale lease: generation {wanted} is no longer current (now {} held by {})",
+            held.generation, held.holder
+        )),
+        (Some(wanted), None) => Err(format!(
+            "stale lease: generation {wanted} is no longer current (pane is unheld)"
+        )),
     }
 }
 
@@ -8431,6 +8464,9 @@ struct DaemonServer {
     /// Named pane groups (name → project). Leaf lock; persist() takes it after
     /// registry → terminals → leases.
     projects: Mutex<HashMap<String, Project>>,
+    /// The next lease generation (see `HeldLease::generation`); seeded above
+    /// every persisted lease so numbers never repeat across restarts.
+    next_lease_generation: AtomicU64,
 }
 
 /// Removes a pane's in-flight spawn marker and wakes any ensure/restart
@@ -8620,6 +8656,16 @@ impl DaemonServer {
         let policy_is_auto = config.restore_policy_effective() == "auto_respawn";
         let should_spawn_on_bootstrap = !restored_from_disk || policy_is_auto;
 
+        let leases: HashMap<String, HeldLease> = leases
+            .into_iter()
+            .filter(|(pane_id, _)| live_pane_ids.contains(pane_id))
+            .collect();
+        let next_lease_generation = leases
+            .values()
+            .map(|held| held.generation)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         Ok(Self {
             registry: Mutex::new(registry),
             terminals: Mutex::new(terminals),
@@ -8630,12 +8676,8 @@ impl DaemonServer {
             ledger,
             // A hand-edited lease for a pane that no longer exists must not be
             // resurrected (same filter as the agent marks above).
-            leases: Mutex::new(
-                leases
-                    .into_iter()
-                    .filter(|(pane_id, _)| live_pane_ids.contains(pane_id))
-                    .collect(),
-            ),
+            leases: Mutex::new(leases),
+            next_lease_generation: AtomicU64::new(next_lease_generation),
             workspace_key: ws_key,
             log_dispatch,
             _log_guard: log_guard,
@@ -9383,20 +9425,21 @@ impl DaemonServer {
                 Ok(json!(CommandOk { ok: true }))
             }
             DaemonRequest::WriteToPane { pane_id, data } => {
-                self.write_input(&pane_id, &data, None)?;
+                self.write_input(&pane_id, &data, None, None)?;
                 Ok(json!(CommandOk { ok: true }))
             }
             DaemonRequest::SendInput { pane_id, input } => {
-                self.write_input(&pane_id, &input, None)?;
+                self.write_input(&pane_id, &input, None, None)?;
                 Ok(json!(CommandOk { ok: true }))
             }
             DaemonRequest::SendInputAs {
                 pane_id,
                 input,
                 holder,
+                generation,
             } => {
                 let holder = validate_holder(&holder)?;
-                self.write_input(&pane_id, &input, Some(&holder))?;
+                self.write_input(&pane_id, &input, Some(&holder), generation)?;
                 Ok(json!(CommandOk { ok: true }))
             }
             DaemonRequest::TakeLease {
@@ -9409,7 +9452,8 @@ impl DaemonServer {
                 pane_id,
                 holder,
                 note,
-            } => self.handle_release_lease(&pane_id, &holder, &note),
+                generation,
+            } => self.handle_release_lease(&pane_id, &holder, &note, generation),
             DaemonRequest::KranzBind { pane_id, repo } => self.handle_kranz_bind(&pane_id, repo),
             DaemonRequest::KranzUnbind { pane_id } => self.handle_kranz_unbind(&pane_id),
             DaemonRequest::KranzBindings => Ok(json!(self.kranz_bindings_snapshot())),
@@ -10177,12 +10221,18 @@ impl DaemonServer {
     /// legacy unattributed path). The lease gate runs BEFORE the terminal lock
     /// and the lease map is a leaf lock, so lock order stays
     /// registry → terminals with leases only ever taken alone.
-    fn write_input(&self, pane_id: &str, data: &str, holder: Option<&str>) -> Result<(), String> {
+    fn write_input(
+        &self,
+        pane_id: &str,
+        data: &str,
+        holder: Option<&str>,
+        generation: Option<u64>,
+    ) -> Result<(), String> {
         self.ensure_pane_exists(pane_id)?;
         if self.sync_input.load(Ordering::SeqCst) {
             // Mirrored input skips panes held by someone else rather than
             // refusing the whole write; the target pane itself is still gated.
-            self.check_lease_write(pane_id, holder)?;
+            self.check_lease_write(pane_id, holder, generation)?;
             let skip = self.panes_held_by_others(holder)?;
             let written = self.lock_terminals()?.write_to_live_except(data, &skip);
             for written_pane in &written {
@@ -10190,7 +10240,7 @@ impl DaemonServer {
             }
             Ok(())
         } else {
-            self.check_lease_write(pane_id, holder)?;
+            self.check_lease_write(pane_id, holder, generation)?;
             self.lock_terminals()?.write_to_pane(pane_id, data)?;
             self.note_lease_write(pane_id, data.len());
             Ok(())
@@ -10269,10 +10319,17 @@ impl DaemonServer {
     /// Gate one write against the pane's lease. A refusal bumps the holder's
     /// `refused_writes` counter so the eventual release record shows how often
     /// someone else tried to type while the pane was held.
-    fn check_lease_write(&self, pane_id: &str, holder: Option<&str>) -> Result<(), String> {
+    fn check_lease_write(
+        &self,
+        pane_id: &str,
+        holder: Option<&str>,
+        generation: Option<u64>,
+    ) -> Result<(), String> {
         let policy = self.lease_policy();
         let mut leases = self.lock_leases()?;
-        match can_write(policy, leases.get(pane_id), holder) {
+        let verdict = can_write(policy, leases.get(pane_id), holder)
+            .and_then(|_| check_generation(leases.get(pane_id), generation));
+        match verdict {
             Ok(()) => Ok(()),
             Err(refusal) => {
                 if let Some(held) = leases.get_mut(pane_id) {
@@ -10316,7 +10373,11 @@ impl DaemonServer {
             let outcome = can_take(leases.get(pane_id), &holder, force, why.as_deref())?;
             let previous = leases.get(pane_id).cloned();
             if outcome != TakeOutcome::AlreadyHeld {
-                leases.insert(pane_id.to_string(), HeldLease::new(&holder, now));
+                let generation = self.next_lease_generation.fetch_add(1, Ordering::SeqCst);
+                leases.insert(
+                    pane_id.to_string(),
+                    HeldLease::new(&holder, now, generation),
+                );
             }
             (outcome, previous)
         };
@@ -10408,6 +10469,7 @@ impl DaemonServer {
         pane_id: &str,
         holder: &str,
         note: &str,
+        generation: Option<u64>,
     ) -> Result<Value, String> {
         self.ensure_pane_exists(pane_id)?;
         let holder = validate_holder(holder)?;
@@ -10416,6 +10478,7 @@ impl DaemonServer {
         let released = {
             let mut leases = self.lock_leases()?;
             can_release(leases.get(pane_id), &holder)?;
+            check_generation(leases.get(pane_id), generation)?;
             leases
                 .remove(pane_id)
                 .ok_or_else(|| format!("pane keyboard is not held ({pane_id})"))?
@@ -11559,6 +11622,7 @@ fn write_to_pane(
         pane_id: pane_id.clone(),
         input: data.clone(),
         holder: default_holder(),
+        generation: None,
     }) {
         Err(error) if error.contains("unknown variant") => {
             client.request(DaemonRequest::WriteToPane { pane_id, data })
@@ -11598,6 +11662,7 @@ fn release_lease(
         pane_id,
         holder: default_holder(),
         note,
+        generation: None,
     })
 }
 
@@ -15561,6 +15626,37 @@ fn local_hostname() -> String {
 
 /// Pull `--as HOLDER` out of a send/broadcast argument list, stopping at `--`
 /// like `parse_lf_flag` so a payload can still contain the literal text.
+/// Pull `--generation N` out of a send argument list (before `--`).
+fn parse_generation_flag(args: &[String]) -> Result<(Option<u64>, Vec<String>), String> {
+    let mut generation = None;
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut passthrough = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if passthrough {
+            remaining.push(arg.clone());
+        } else if arg == "--generation" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| "--generation requires a number".to_string())?;
+            generation = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --generation '{value}'"))?,
+            );
+            index += 1;
+        } else {
+            if arg == "--" {
+                passthrough = true;
+            }
+            remaining.push(arg.clone());
+        }
+        index += 1;
+    }
+    Ok((generation, remaining))
+}
+
 fn parse_as_flag(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
     let mut holder = None;
     let mut remaining = Vec::with_capacity(args.len());
@@ -15604,6 +15700,8 @@ struct LeaseArgs {
     force: bool,
     why: Option<String>,
     note: Option<String>,
+    /// `--generation N`: refuse the release if the lease changed hands.
+    generation: Option<u64>,
 }
 
 /// `lease [status|take|release] [PANE] [--as HOLDER] [--force --why REASON] [-m NOTE]`.
@@ -15615,6 +15713,7 @@ fn parse_lease_args(args: &[String]) -> Result<LeaseArgs, String> {
         force: false,
         why: None,
         note: None,
+        generation: None,
     };
     let mut index = 0;
     let mut pane_seen = false;
@@ -15654,6 +15753,15 @@ fn parse_lease_args(args: &[String]) -> Result<LeaseArgs, String> {
             }
             "-m" | "--note" => {
                 parsed.note = Some(take_value(index, "-m/--note")?);
+                index += 1;
+            }
+            "--generation" => {
+                let value = take_value(index, "--generation")?;
+                parsed.generation = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid --generation '{value}'"))?,
+                );
                 index += 1;
             }
             other if other.starts_with('-') && other.len() > 1 => {
@@ -15704,13 +15812,16 @@ fn print_lease_info(info: &LeaseInfo, json_output: bool) -> Result<(), String> {
     let mut stdout = std::io::stdout();
     writeln!(
         stdout,
-        "{}\t{}\t{}\t{}\twrites={}\trefused={}",
+        "{}\t{}\t{}\t{}\twrites={}\trefused={}\tgen={}",
         info.pane_id,
         info.policy,
         info.holder.as_deref().unwrap_or("-"),
         format_held_for(info.held_ms),
         info.writes,
-        info.refused_writes
+        info.refused_writes,
+        info.generation
+            .map(|generation| generation.to_string())
+            .unwrap_or_else(|| "-".to_string())
     )
     .map_err(|error| format!("failed to write stdout: {error}"))
 }
@@ -15736,6 +15847,7 @@ fn control_lease(
             pane_id,
             holder,
             note: parsed.note.unwrap_or_default(),
+            generation: parsed.generation,
         })?,
     };
     print_lease_info(&info, json_output)
@@ -16391,6 +16503,7 @@ fn control_send_input(client: &DaemonClient, args: &[String]) -> Result<(), Stri
     }
     let (literal_lf, args) = parse_lf_flag(args);
     let (holder, args) = parse_as_flag(&args)?;
+    let (generation, args) = parse_generation_flag(&args)?;
     if args.len() < 2 {
         return Err("send requires a pane and input".to_string());
     }
@@ -16414,6 +16527,7 @@ fn control_send_input(client: &DaemonClient, args: &[String]) -> Result<(), Stri
             pane_id: status.pane.id,
             input,
             holder,
+            generation,
         })?,
         None => client.request::<CommandOk>(DaemonRequest::SendInput {
             pane_id: status.pane.id,
@@ -18991,7 +19105,7 @@ Commands (PANE is a pane id or title; defaults to the active pane):
   status --verbose              Show daemon-level runtime detail (subscribers,
                                 pane states, uptime, effective config summary)
   restart [PANE]                Restart a pane's shell (alias: pane restart)
-  send <PANE> [--lf|--raw] [--as HOLDER] [--] <TEXT...>
+  send <PANE> [--lf|--raw] [--as HOLDER] [--generation N] [--] <TEXT...>
                                 Send text to a pane    (alias: pane send)
                                   By default \n and \r submit a line as Enter/CR.
                                   --lf / --raw sends a literal LF (0x0A) instead of CR.
@@ -19008,8 +19122,10 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   else is refused. --force revokes another holder
                                   (REASON is ledgered). HOLDER defaults to
                                   $SGIAN_HOLDER or user@host.
-  lease release [PANE] -m NOTE [--as HOLDER]
+  lease release [PANE] -m NOTE [--as HOLDER] [--generation N]
                                 Hand the keyboard back; the note is mandatory.
+                                  --generation N (from `lease take --json`) makes
+                                  a late command from a previous holder fail as stale.
   project list                  Projects with their attention roll-up
                                   (panes, live, needs input, working, idle,
                                   unattended, keyboard holders)
@@ -35812,7 +35928,7 @@ exit 0
     // docs/design/keyboard-lease-and-ledger.md
 
     fn held_by(holder: &str) -> HeldLease {
-        HeldLease::new(holder, 1_000)
+        HeldLease::new(holder, 1_000, 1)
     }
 
     #[test]
@@ -36118,6 +36234,7 @@ exit 0
                 pane_id: pane_id.clone(),
                 input: "x".to_string(),
                 holder: "bob".to_string(),
+                generation: None,
             })
             .expect_err("bob refused");
         assert!(refused.contains("held by alice"), "{refused}");
@@ -36126,6 +36243,7 @@ exit 0
                 pane_id: pane_id.clone(),
                 input: "echo hi\r".to_string(),
                 holder: "alice".to_string(),
+                generation: None,
             })
             .expect("holder write accepted");
         let broadcast: Value = client
@@ -36201,6 +36319,7 @@ exit 0
                 pane_id: pane_id.clone(),
                 holder: "bob".to_string(),
                 note: "   ".to_string(),
+                generation: None,
             })
             .expect_err("empty note refused");
         assert!(empty_note.contains("hand-back note"), "{empty_note}");
@@ -36209,6 +36328,7 @@ exit 0
                 pane_id: pane_id.clone(),
                 holder: "alice".to_string(),
                 note: "not mine".to_string(),
+                generation: None,
             })
             .expect_err("alice no longer holds it");
         assert!(
@@ -36220,6 +36340,7 @@ exit 0
                 pane_id: pane_id.clone(),
                 holder: "bob".to_string(),
                 note: "answered the y/N; agent can carry on".to_string(),
+                generation: None,
             })
             .expect("release");
         assert_eq!(released.holder, None);
@@ -36304,6 +36425,7 @@ exit 0
                 pane_id: pane_id.clone(),
                 input: "x".to_string(),
                 holder: "alice".to_string(),
+                generation: None,
             })
             .expect_err("unheld write refused under required");
         assert!(refused.contains("unheld"), "{refused}");
@@ -36332,6 +36454,7 @@ exit 0
                 pane_id,
                 input: "".to_string(),
                 holder: "alice".to_string(),
+                generation: None,
             })
             .expect("holder write accepted");
         daemon.shutdown();
@@ -36760,6 +36883,7 @@ exit 0
                 pane_id: pane_id.clone(),
                 holder: "alice".to_string(),
                 note: "answered the grant; carry on".to_string(),
+                generation: None,
             })
             .expect("release");
         let recorded = fs::read_to_string(&record).expect("fake kranz was invoked");
@@ -37303,8 +37427,8 @@ exit 0
             ),
         ]);
         let leases = HashMap::from([
-            ("a".to_string(), HeldLease::new("alice", 1)),
-            ("c".to_string(), HeldLease::new("alice", 2)),
+            ("a".to_string(), HeldLease::new("alice", 1, 1)),
+            ("c".to_string(), HeldLease::new("alice", 2, 1)),
         ]);
         let summary = project_rollup(&project, &states, &agents, &leases);
         assert_eq!(summary.panes, 3);
@@ -37578,6 +37702,168 @@ exit 0
     }
 
     #[test]
+    fn lease_generation_refuses_stale_commands() {
+        let held = HeldLease::new("alice", 1, 7);
+        assert_eq!(check_generation(Some(&held), None), Ok(()));
+        assert_eq!(check_generation(Some(&held), Some(7)), Ok(()));
+        let stale = check_generation(Some(&held), Some(6)).expect_err("stale");
+        assert!(stale.contains("stale lease"), "{stale}");
+        assert!(stale.contains("held by alice"), "{stale}");
+        let gone = check_generation(None, Some(7)).expect_err("unheld");
+        assert!(gone.contains("unheld"), "{gone}");
+        assert_eq!(check_generation(None, None), Ok(()));
+        let (generation, rest) =
+            parse_generation_flag(&args(&["pane-1", "--generation", "9", "echo", "hi"]))
+                .expect("parse");
+        assert_eq!(generation, Some(9));
+        assert_eq!(rest, args(&["pane-1", "echo", "hi"]));
+        assert!(parse_generation_flag(&args(&["pane-1", "--generation", "x"])).is_err());
+        let release = parse_lease_args(&args(&["release", "-m", "done", "--generation", "3"]))
+            .expect("release with generation");
+        assert_eq!(release.generation, Some(3));
+
+        let daemon = TestDaemon::spawn(Config::default());
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        let alice: LeaseInfo = client
+            .request(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                force: false,
+                why: None,
+            })
+            .expect("take");
+        let g1 = alice.generation.expect("held leases carry a generation");
+        client
+            .request::<CommandOk>(DaemonRequest::SendInputAs {
+                pane_id: pane_id.clone(),
+                input: "".to_string(),
+                holder: "alice".to_string(),
+                generation: Some(g1),
+            })
+            .expect("current generation writes");
+        let bob: LeaseInfo = client
+            .request(DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "bob".to_string(),
+                force: true,
+                why: Some("alice is away".to_string()),
+            })
+            .expect("force take");
+        let g2 = bob.generation.expect("generation");
+        assert!(g2 > g1);
+        // Alice's late write names the old generation even with her own name: stale.
+        let late = client
+            .request::<CommandOk>(DaemonRequest::SendInputAs {
+                pane_id: pane_id.clone(),
+                input: "x".to_string(),
+                holder: "bob".to_string(),
+                generation: Some(g1),
+            })
+            .expect_err("stale generation refused even for the current holder");
+        assert!(late.contains("stale lease"), "{late}");
+        let late_release = client
+            .request::<LeaseInfo>(DaemonRequest::ReleaseLease {
+                pane_id: pane_id.clone(),
+                holder: "bob".to_string(),
+                note: "done".to_string(),
+                generation: Some(g1),
+            })
+            .expect_err("stale release refused");
+        assert!(late_release.contains("stale lease"), "{late_release}");
+        let status: LeaseInfo = client
+            .request(DaemonRequest::LeaseStatus {
+                pane_id: pane_id.clone(),
+            })
+            .expect("status");
+        assert_eq!(
+            status.refused_writes, 1,
+            "the stale write counted as refused"
+        );
+        client
+            .request::<LeaseInfo>(DaemonRequest::ReleaseLease {
+                pane_id: pane_id.clone(),
+                holder: "bob".to_string(),
+                note: "done".to_string(),
+                generation: Some(g2),
+            })
+            .expect("current generation releases");
+        let after = client
+            .request::<CommandOk>(DaemonRequest::SendInputAs {
+                pane_id: pane_id.clone(),
+                input: "x".to_string(),
+                holder: "bob".to_string(),
+                generation: Some(g2),
+            })
+            .expect_err("a generation named on an unheld pane is stale");
+        assert!(after.contains("unheld"), "{after}");
+        daemon.shutdown();
+    }
+
+    #[test]
+    fn lease_generations_never_repeat_across_restarts() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let cwd = PathBuf::from("/tmp/sgian-lease-gen");
+        let first_generation = {
+            let server = DaemonServer::with_config(
+                cwd.clone(),
+                data_dir.path().to_path_buf(),
+                Config::default(),
+            )
+            .expect("server");
+            let pane = server.lock_registry().expect("registry").create_pane(None);
+            let info: LeaseInfo = serde_json::from_value(
+                server
+                    .handle(DaemonRequest::TakeLease {
+                        pane_id: pane.id.clone(),
+                        holder: "alice".to_string(),
+                        force: false,
+                        why: None,
+                    })
+                    .expect("take"),
+            )
+            .expect("lease info");
+            info.generation.expect("generation")
+        };
+        let server =
+            DaemonServer::with_config(cwd, data_dir.path().to_path_buf(), Config::default())
+                .expect("restart");
+        let restored = server.lease_infos();
+        let (pane_id, info) = restored.iter().next().expect("lease restored");
+        assert_eq!(info.generation, Some(first_generation));
+        // A new lease after the restart gets a strictly greater generation.
+        let pane_id = pane_id.clone();
+        let _: Value = server
+            .handle(DaemonRequest::ReleaseLease {
+                pane_id: pane_id.clone(),
+                holder: "alice".to_string(),
+                note: "handover".to_string(),
+                generation: None,
+            })
+            .expect("release");
+        let next: LeaseInfo = serde_json::from_value(
+            server
+                .handle(DaemonRequest::TakeLease {
+                    pane_id,
+                    holder: "bob".to_string(),
+                    force: false,
+                    why: None,
+                })
+                .expect("take again"),
+        )
+        .expect("lease info");
+        assert!(next.generation.expect("generation") > first_generation);
+    }
+
+    #[test]
     fn agent_probe_interval_config() {
         let mut config = Config::default();
         assert_eq!(
@@ -37638,7 +37924,7 @@ exit 0
         .expect("parse");
         persisted
             .leases
-            .insert("pane-999".to_string(), HeldLease::new("ghost", 1));
+            .insert("pane-999".to_string(), HeldLease::new("ghost", 1, 1));
         fs::write(
             data_dir.path().join(WORKSPACE_FILE),
             serde_json::to_string(&persisted).expect("encode"),

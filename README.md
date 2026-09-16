@@ -146,7 +146,9 @@ A single binary runs in three modes:
 - `ctl lease take|release|status` to claim, hand back (with a note), or show a
   pane's keyboard lease; `ctl send --as HOLDER` attributes input to a holder.
   In the clients: `Ctrl/Cmd+Shift+T` takes the active pane's keyboard,
-  `Ctrl/Cmd+Shift+L` releases it with a note.
+  `Ctrl/Cmd+Shift+L` releases it with a note. Every lease carries a
+  generation; `--generation N` on `send` or `lease release` makes a late
+  command from a previous holder fail as stale.
 - `ctl ledger [PANE] [--verify]` to print or verify a pane's hash-chained
   ledger (lease handovers, attention transitions, pane exits); a closed
   pane's ledger stays readable by id.
