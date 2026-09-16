@@ -152,6 +152,10 @@ A single binary runs in three modes:
   pane's ledger stays readable by id.
 - `ctl agent --watch [PANE] --json` to stream agent-state, lease and pane-end
   transitions to a script instead of polling.
+- `ctl search <PANE> [-i] [-n N] <NEEDLE>` for a substring search over a pane's
+  whole scrollback with control sequences stripped, and `ctl lines <PANE> A:B`
+  to print the cited range, so a ledger record or a search hit can point at
+  exact output lines.
 - `ctl kranz status|bind|unbind` for panes bound to a Kranz mission: the
   mission's pending questions and grants drive the badge, and a hand-back
   note is mirrored into the mission inbox with `kranz msg`.

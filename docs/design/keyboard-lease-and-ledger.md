@@ -253,8 +253,12 @@ Ranked by leverage against effort. None are committed beyond M1.
    slowest concurrent request was 110 ms, the scrollback file never exceeded
    its 16 MiB cap, and an unbounded `yes` died with its pane. The throughput
    figure is the number to beat if a network producer (M5) ever needs more.
-2. **Scrollback search and permalinks.** `Find` filters metadata only. A
-   substring search over the scrollback file with `ctl lines <pane> a:b`
+2. **Scrollback search and permalinks (shipped 2026-09-15).** `ctl search`
+   and `ctl lines` over the scrollback file with control sequences stripped;
+   line numbers are relative to the current file and the 16 MiB cap
+   renumbers, which `total_lines` lets a script notice. Originally: `Find`
+   filters metadata only. A substring search over the scrollback file with
+   `ctl lines <pane> a:b`
    is small and makes the ledger's `seq` range citable.
 3. **Terminal-output injection guard.** ATR-2026-00259 documents agents
    hiding content from human review with OSC and cursor moves. Agent panes
