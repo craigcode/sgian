@@ -152,6 +152,11 @@ A single binary runs in three modes:
   pane's ledger stays readable by id.
 - `ctl agent --watch [PANE] --json` to stream agent-state, lease and pane-end
   transitions to a script instead of polling.
+- `ctl project new|list|show|add|rm|delete|ledger` for projects: a named group
+  of panes serving one goal, persisted with the workspace, with an attention
+  roll-up (needs input / working / idle / unattended / keyboard holders) and
+  the member panes' ledgers merged in time order. `ctl new --project NAME`
+  creates a pane straight into one.
 - `ctl search <PANE> [-i] [-n N] <NEEDLE>` for a substring search over a pane's
   whole scrollback with control sequences stripped, and `ctl lines <PANE> A:B`
   to print the cited range, so a ledger record or a search hit can point at
