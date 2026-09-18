@@ -260,8 +260,9 @@ This is the milestone that makes Windows and WorkSpaces operators
 first-class and it is the one with real network risk; fuzz whatever framing
 is hand-rolled.
 
-**M6 — per-client identity.** Per-client tokens or a signed hello so the
-lease becomes a boundary rather than a convention. This is also what makes
+**M6 — per-client identity (proposal: `client-identity.md`).** Per-client
+tokens or a signed hello so the lease becomes a boundary rather than a
+convention. This is also what makes
 "agent tried to type while a human held the pane" a refusal the ledger can
 attribute honestly.
 
