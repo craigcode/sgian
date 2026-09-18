@@ -134,6 +134,85 @@ public sealed record OutputTricks
         .Select(entry => $"{entry.Item1} {entry.Item2}"));
 }
 
+/// <summary>One rate-limit window from Claude Code's status line: percent used and when it resets (unix seconds).</summary>
+public sealed record RateLimitWindow
+{
+    [JsonPropertyName("used_percentage")]
+    public int UsedPercentage { get; init; }
+
+    [JsonPropertyName("resets_at")]
+    public ulong? ResetsAt { get; init; }
+}
+
+/// <summary>
+/// What the Claude Code session under a pane last said about itself through <c>sgian ctl statusline</c>:
+/// model, context fill and the account's rate-limit windows. Push from the CLI, never polled.
+/// </summary>
+public sealed record AgentUsage
+{
+    [JsonPropertyName("model")]
+    public string? Model { get; init; }
+
+    [JsonPropertyName("context_used_percentage")]
+    public int? ContextUsedPercentage { get; init; }
+
+    [JsonPropertyName("five_hour")]
+    public RateLimitWindow? FiveHour { get; init; }
+
+    [JsonPropertyName("seven_day")]
+    public RateLimitWindow? SevenDay { get; init; }
+
+    [JsonPropertyName("updated_at_ms")]
+    public ulong UpdatedAtMilliseconds { get; init; }
+
+    [JsonIgnore]
+    public bool IsEmpty => Model is null && ContextUsedPercentage is null && FiveHour is null && SevenDay is null;
+
+    /// <summary>Context fill or the tightest rate-limit window is at or past 80%.</summary>
+    [JsonIgnore]
+    public bool IsHot => (ContextUsedPercentage ?? 0) >= 80 || (FiveHour?.UsedPercentage ?? 0) >= 80 || (SevenDay?.UsedPercentage ?? 0) >= 80;
+
+    /// <summary>" ↻ 1h10m" until a window resets, or "" when unknown or past.</summary>
+    public static string FormatReset(ulong? resetsAt, ulong now)
+    {
+        if (resetsAt is not { } at || at <= now) return "";
+        var secs = at - now;
+        var h = secs / 3600;
+        var m = (secs % 3600) / 60;
+        if (h >= 48) return $" \u21BB {h / 24}d";
+        if (h > 0) return $" \u21BB {h}h{m:D2}m";
+        return $" \u21BB {m}m";
+    }
+
+    /// <summary>"Opus · 40% context · 5h 23% ↻ 1h10m · 7d 41%": the same line the daemon's <c>ctl agent</c> prints.</summary>
+    public string Summary(ulong? now = null)
+    {
+        var at = now ?? (ulong)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var parts = new List<string>();
+        if (Model is not null) parts.Add(Model);
+        if (ContextUsedPercentage is { } context) parts.Add($"{context}% context");
+        if (FiveHour is not null) parts.Add($"5h {FiveHour.UsedPercentage}%" + FormatReset(FiveHour.ResetsAt, at));
+        if (SevenDay is not null) parts.Add($"7d {SevenDay.UsedPercentage}%" + FormatReset(SevenDay.ResetsAt, at));
+        return string.Join(" \u00B7 ", parts);
+    }
+
+    /// <summary>Fold one <c>agent_usage</c> payload into the per-pane map. Returns the pane id, or null when malformed.</summary>
+    public static string? Apply(JsonElement payload, IDictionary<string, AgentUsage> usage)
+    {
+        if (payload.ValueKind != JsonValueKind.Object) return null;
+        if (!payload.TryGetProperty("pane_id", out var idElement) || idElement.ValueKind != JsonValueKind.String) return null;
+        if (!payload.TryGetProperty("usage", out var usageElement) || usageElement.ValueKind != JsonValueKind.Object) return null;
+        AgentUsage? decoded;
+        try { decoded = usageElement.Deserialize<AgentUsage>(); }
+        catch (JsonException) { return null; }
+        var paneId = idElement.GetString()!;
+        if (paneId.Length == 0 || decoded is null) return null;
+        if (decoded.IsEmpty) usage.Remove(paneId);
+        else usage[paneId] = decoded;
+        return paneId;
+    }
+}
+
 public sealed record WorkspaceSnapshot
 {
     [JsonPropertyName("panes")]
@@ -186,6 +265,11 @@ public sealed record WorkspaceSnapshot
     [JsonPropertyName("output_warnings")]
     public IReadOnlyDictionary<string, OutputTricks> OutputWarnings { get; init; }
         = new Dictionary<string, OutputTricks>();
+
+    /// <summary>Per-pane usage from Claude Code's status line; absent until a session reports.</summary>
+    [JsonPropertyName("agent_usage")]
+    public IReadOnlyDictionary<string, AgentUsage> AgentUsage { get; init; }
+        = new Dictionary<string, AgentUsage>();
 }
 
 public sealed record CommandOk

@@ -15,6 +15,8 @@ import {
   projectRollup,
   rollupText,
   outputWarningSummary,
+  usageText,
+  groupLimitText,
 } from "./projects.js";
 import { buildPaletteCommands, filterPaletteCommands } from "./palette.js";
 
@@ -89,6 +91,31 @@ function LeaseBadge({ info, holder }) {
  * clipboard writes, mismatched links, opaque control strings, C1 controls).
  * Counts only ever grow for a pane's life; the title lists them.
  */
+/**
+ * Usage badge: what the session under this pane last said about itself
+ * through the status line (`sgian ctl statusline`): context fill and the
+ * tightest rate-limit window. The full line is in the title.
+ */
+function UsageBadge({ usage }) {
+  if (!usage) return null;
+  const full = usageText(usage);
+  const bits = [];
+  if (usage.context !== null) bits.push(`${usage.context}%`);
+  const limit = [usage.fiveHour, usage.sevenDay].filter(Boolean).sort((a, b) => b.used - a.used)[0];
+  if (limit) bits.push(`${limit.used}% limit`);
+  if (bits.length === 0) return null;
+  const hot = usage.context >= 80 || (limit && limit.used >= 80);
+  return (
+    <span
+      className={`usage-badge${hot ? " usage-badge-hot" : ""}`}
+      title={full}
+      data-context={usage.context ?? undefined}
+    >
+      {bits.join(" · ")}
+    </span>
+  );
+}
+
 function OutputBadge({ warning }) {
   if (!warning) return null;
   return (
@@ -797,6 +824,7 @@ function Pane({ paneId, state, controller }) {
         </button>
         <AgentBadge info={state.agentStates.get(paneId)} />
         <OutputBadge warning={state.outputWarnings?.get(paneId)} />
+        <UsageBadge usage={state.agentUsage?.get(paneId)} />
         <LeaseBadge info={state.leases.get(paneId)} holder={state.holder} />
         <span className="pane-meta">
           {runtime === "ended" ? `ended · ${paneMeta}` : paneMeta}
@@ -1202,6 +1230,7 @@ function SessionOverview({ state, controller }) {
     const agentInfo = state.agentStates.get(pane.id);
     const lastActivity = state.lastActivityMs.get(pane.id);
     const warning = state.outputWarnings?.get(pane.id);
+    const usage = state.agentUsage?.get(pane.id);
     const canClose = state.panes.size > 1;
     return (
       <tr
@@ -1217,6 +1246,7 @@ function SessionOverview({ state, controller }) {
         <td className={warning ? "overview-output overview-output-warning" : "overview-output"}>
           {warning ? `⚠ ${outputWarningSummary(warning)}` : "—"}
         </td>
+        <td className="overview-usage">{usage ? usageText(usage) : "—"}</td>
         <td>{formatLastActivity(lastActivity, now)}</td>
         <td className="overview-actions">
           <button
@@ -1306,6 +1336,7 @@ function SessionOverview({ state, controller }) {
                   <th scope="col">Agent</th>
                   <th scope="col">Keyboard</th>
                   <th scope="col">Output</th>
+                  <th scope="col">Usage</th>
                   <th scope="col">Activity (this attach)</th>
                   <th scope="col">Actions</th>
                 </tr>
@@ -1322,7 +1353,7 @@ function SessionOverview({ state, controller }) {
                   >
                     {showHeading && (
                       <tr className="overview-group-row">
-                        <th scope="rowgroup" colSpan={8}>
+                        <th scope="rowgroup" colSpan={9}>
                           <span className="overview-group-name">
                             {group.name ?? "No project"}
                           </span>
@@ -1332,6 +1363,11 @@ function SessionOverview({ state, controller }) {
                             </span>
                           )}
                           <span className="overview-group-rollup">{rollupText(rollup)}</span>
+                          {groupLimitText(group.panes, state) && (
+                            <span className="overview-group-limit">
+                              {groupLimitText(group.panes, state)}
+                            </span>
+                          )}
                         </th>
                       </tr>
                     )}

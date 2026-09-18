@@ -14,6 +14,8 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var projects: [String: Project] = [:]
     /// Panes whose output hid something (docs/design/keyboard-lease-and-ledger.md §7).
     @Published private(set) var outputWarnings: [String: OutputTricks] = [:]
+    /// Per-pane usage from Claude Code's status line (`sgian ctl statusline`).
+    @Published private(set) var agentUsage: [String: AgentUsage] = [:]
     /// A transient "read-only: held by …" notice for one pane after a refused keystroke.
     @Published private(set) var leaseNotice: LeaseNotice?
     @Published var leaseDialog: LeaseDialog?
@@ -116,6 +118,7 @@ final class WorkspaceModel: ObservableObject {
         agentStates = [:]
         projects = [:]
         outputWarnings = [:]
+        agentUsage = [:]
         agentSpecs = [:]
         terminals = [:]
         chats = [:]
@@ -375,6 +378,21 @@ final class WorkspaceModel: ObservableObject {
 
     func outputWarning(for paneID: String) -> OutputTricks? { outputWarnings[paneID] }
 
+    func usage(for paneID: String) -> AgentUsage? { agentUsage[paneID] }
+
+    /// The account's rate-limit line for a group header: the freshest reading
+    /// among its panes (limits are per account), or nil.
+    func limitText(for group: ProjectGroup) -> String? {
+        let freshest = group.panes
+            .compactMap { agentUsage[$0.id] }
+            .filter { $0.fiveHour != nil || $0.sevenDay != nil }
+            .max { $0.updatedAtMs < $1.updatedAtMs }
+        guard var usage = freshest else { return nil }
+        usage.model = nil
+        usage.contextUsedPercentage = nil
+        return usage.summary()
+    }
+
     private func saveLayout() {
         layoutSaveTask?.cancel()
         guard let client else { return }
@@ -473,6 +491,7 @@ final class WorkspaceModel: ObservableObject {
         leases = snapshot.leases
         projects = snapshot.projects
         outputWarnings = snapshot.outputWarnings
+        agentUsage = snapshot.agentUsage
         agentSpecs = snapshot.agentSpecs
         layout = PaneLayout.reconcile(PaneLayout.parse(snapshot.layout), paneIDs: snapshot.panes.map(\.id))
 
@@ -557,6 +576,9 @@ final class WorkspaceModel: ObservableObject {
 
         case "output_warning":
             OutputTricks.apply(event: .object(event.payload), to: &outputWarnings)
+
+        case "agent_usage":
+            AgentUsage.apply(event: .object(event.payload), to: &agentUsage)
 
         case "agent_event":
             guard let paneID = event["pane_id"]?.stringValue,
@@ -791,6 +813,7 @@ final class WorkspaceModel: ObservableObject {
         agentStates.removeValue(forKey: paneID)
         leases.removeValue(forKey: paneID)
         outputWarnings.removeValue(forKey: paneID)
+        agentUsage.removeValue(forKey: paneID)
         for name in projects.keys { projects[name]?.panes.removeAll { $0 == paneID } }
         agentSpecs.removeValue(forKey: paneID)
         terminals.removeValue(forKey: paneID)

@@ -19,6 +19,8 @@ import {
   outputWarningEquals,
   normalizeProjects,
   projectsEqual,
+  normalizeUsage,
+  usageEquals,
 } from "./projects.js";
 
 /**
@@ -179,6 +181,24 @@ export function handleOutputWarning(state, payload, callbacks) {
 }
 
 /**
+ * Handle an `agent-usage` event: a Claude Code session under the pane
+ * reported its model, context fill and rate-limit windows through the
+ * status line. Same unknown-pane guard as the other handlers.
+ */
+export function handleAgentUsage(state, payload, callbacks) {
+  const paneId = payload.pane_id || payload.paneId;
+  if (!paneId) return;
+  if (!state.panes.has(paneId)) return;
+  if (!state.agentUsage) state.agentUsage = new Map();
+  const next = normalizeUsage(payload.usage);
+  const existing = state.agentUsage.get(paneId) ?? null;
+  if (usageEquals(existing, next)) return;
+  if (next) state.agentUsage.set(paneId, next);
+  else state.agentUsage.delete(paneId);
+  callbacks.render();
+}
+
+/**
  * Handle a `projects-changed` event: the daemon sends the whole project
  * table after any change, so this replaces rather than diffs. Member pane
  * ids the client does not know are kept (the pane-created event may still
@@ -266,6 +286,7 @@ export function handlePaneClosed(state, payload, callbacks) {
   state.agentSpecs?.delete(paneId);
   state.lastActivityMs?.delete(paneId);
   state.outputWarnings?.delete(paneId);
+  state.agentUsage?.delete(paneId);
   state.leases?.delete(paneId);
   // (T2) The pane's chat goes with it (mirrors the agentStates drop).
   state.chats?.delete(paneId);

@@ -8,7 +8,57 @@ import {
   groupPanesByProject,
   projectRollup,
   rollupText,
+  normalizeUsage,
+  usageEquals,
+  usageText,
+  formatReset,
+  groupLimitText,
 } from "../ui/src/projects.js";
+
+describe("usage from the status line", () => {
+  it("normalizes a daemon usage entry and renders the shared summary line", () => {
+    const usage = normalizeUsage({
+      model: "Opus",
+      model_id: "claude-opus-5",
+      context_used_percentage: 40,
+      five_hour: { used_percentage: 23, resets_at: 1000000 },
+      seven_day: { used_percentage: 41.6 },
+      updated_at_ms: 5,
+    });
+    expect(usage).toEqual({
+      model: "Opus",
+      context: 40,
+      fiveHour: { used: 23, resetsAt: 1000000 },
+      sevenDay: { used: 42, resetsAt: null },
+      updatedAtMs: 5,
+    });
+    expect(usageText(usage, 1000000 - 4200)).toBe("Opus · 40% context · 5h 23% ↻ 1h10m · 7d 42%");
+    expect(usageText(usage, 3000000)).toBe("Opus · 40% context · 5h 23% · 7d 42%");
+    expect(usageText(normalizeUsage({ model: "Sonnet" }))).toBe("Sonnet");
+    expect(normalizeUsage({ updated_at_ms: 1 })).toBeNull();
+    expect(normalizeUsage(null)).toBeNull();
+    expect(usageEquals(usage, normalizeUsage({ model: "Opus", context_used_percentage: 40, five_hour: { used_percentage: 23, resets_at: 1000000 }, seven_day: { used_percentage: 42 }, updated_at_ms: 5 }))).toBe(true);
+    expect(usageEquals(usage, { ...usage, context: 41 })).toBe(false);
+    expect(usageEquals(null, null)).toBe(true);
+    expect(formatReset(100, 50)).toBe(" ↻ 0m");
+    expect(formatReset(100 + 90 * 60, 100)).toBe(" ↻ 1h30m");
+    expect(formatReset(100 + 72 * 3600, 100)).toBe(" ↻ 3d");
+    expect(formatReset(null, 0)).toBe("");
+  });
+
+  it("picks the freshest rate-limit reading for a group heading", () => {
+    const state = {
+      agentUsage: new Map([
+        ["p1", { model: "Opus", context: 10, fiveHour: { used: 20, resetsAt: null }, sevenDay: null, updatedAtMs: 1 }],
+        ["p2", { model: "Opus", context: 90, fiveHour: { used: 25, resetsAt: null }, sevenDay: { used: 41, resetsAt: null }, updatedAtMs: 9 }],
+        ["p3", { model: "Sonnet", context: 5, fiveHour: null, sevenDay: null, updatedAtMs: 99 }],
+      ]),
+    };
+    expect(groupLimitText([{ id: "p1" }, { id: "p2" }, { id: "p3" }], state, 0)).toBe("5h 25% · 7d 41%");
+    expect(groupLimitText([{ id: "p3" }], state, 0)).toBe("");
+    expect(groupLimitText([{ id: "nope" }], state, 0)).toBe("");
+  });
+});
 
 describe("output warning normalization", () => {
   it("keeps the daemon's counters and drops empty or malformed entries", () => {

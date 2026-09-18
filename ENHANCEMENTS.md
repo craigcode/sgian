@@ -172,6 +172,16 @@ Shipped (2026-09-16):
   `output_warning` event, in `find --json` and `ctl agent`
   (`HIDDEN-OUTPUT …`), and in the bootstrap snapshot's `output_warnings`.
 
+- **Usage from the status line.** `ctl statusline` is the command Claude
+  Code's status line runs: it records the session's model, context fill and
+  rate-limit windows against the pane that owns the calling process (same
+  process-tree placement as hooks), then prints the user's own status
+  command's output or a compact default so nothing is lost. `agent_usage`
+  in the snapshot and as an event; one shared summary line across `ctl
+  agent`, the Tauri badge and overview, the macOS row and the Windows
+  subtitle; the freshest rate-limit line per project heading. Push, not
+  poll: no credentials, no scraping. Enjoy's "usage left, resets at"
+  without its account coupling.
 - **Hook ingestion.** `ctl hook` is the command a Claude Code hook runs:
   it reads the payload from stdin, finds the pane that owns the calling
   process by walking its ancestry (this workspace's daemon first, then

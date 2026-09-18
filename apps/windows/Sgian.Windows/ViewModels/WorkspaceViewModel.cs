@@ -16,6 +16,8 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     private Dictionary<string, Project> _projects = new(StringComparer.Ordinal);
     /// <summary>Panes whose output hid something (docs/design/keyboard-lease-and-ledger.md §7).</summary>
     private readonly Dictionary<string, OutputTricks> _outputWarnings = new(StringComparer.Ordinal);
+    /// <summary>Per-pane usage from Claude Code's status line (<c>sgian ctl statusline</c>).</summary>
+    private readonly Dictionary<string, AgentUsage> _agentUsage = new(StringComparer.Ordinal);
     private DaemonClient? _client;
     private CancellationTokenSource? _connectionCancellation;
     private PaneViewModel? _selectedPane;
@@ -537,6 +539,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             _scrollback.Remove(stale.Id);
             _sizes.Remove(stale.Id);
             _outputWarnings.Remove(stale.Id);
+            _agentUsage.Remove(stale.Id);
         }
         _projects = new Dictionary<string, Project>(snapshot.Projects, StringComparer.Ordinal);
         _outputWarnings.Clear();
@@ -544,11 +547,17 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         {
             if (warning.Total > 0) _outputWarnings[warnedPaneId] = warning;
         }
+        _agentUsage.Clear();
+        foreach (var (usagePaneId, usage) in snapshot.AgentUsage)
+        {
+            if (!usage.IsEmpty) _agentUsage[usagePaneId] = usage;
+        }
         foreach (var pane in snapshot.Panes)
         {
             var item = Upsert(pane);
             item.ProjectName = ProjectBoard.ProjectFor(pane.Id, _projects);
             item.OutputWarning = _outputWarnings.GetValueOrDefault(pane.Id);
+            item.Usage = _agentUsage.GetValueOrDefault(pane.Id);
             item.State = snapshot.PaneStates.TryGetValue(pane.Id, out var state) ? state : "live";
             item.Attention = snapshot.AgentStates.TryGetValue(pane.Id, out var info)
                 ? info.Attention
@@ -618,6 +627,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                     _scrollback.Remove(closed.Id);
                     _sizes.Remove(closed.Id);
                     _outputWarnings.Remove(closed.Id);
+                    _agentUsage.Remove(closed.Id);
                     Layout = Layout?.Remove(closed.Id);
                     if (SelectedPane == closed) SelectedPane = Panes.FirstOrDefault();
                     WorkspaceChanged?.Invoke(this, EventArgs.Empty);
@@ -648,6 +658,15 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                 if (warned is not null)
                 {
                     warned.OutputWarning = _outputWarnings.GetValueOrDefault(warnedId!);
+                    WorkspaceChanged?.Invoke(this, EventArgs.Empty);
+                }
+                break;
+            case "agent_usage":
+                var usagePaneId = AgentUsage.Apply(item.Payload, _agentUsage);
+                var usagePane = usagePaneId is null ? null : Panes.FirstOrDefault(pane => pane.Id == usagePaneId);
+                if (usagePane is not null)
+                {
+                    usagePane.Usage = _agentUsage.GetValueOrDefault(usagePaneId!);
                     WorkspaceChanged?.Invoke(this, EventArgs.Empty);
                 }
                 break;

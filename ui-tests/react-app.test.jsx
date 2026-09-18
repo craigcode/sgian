@@ -58,6 +58,7 @@ function createHarness({
   leases = {},
   projects = {},
   outputWarnings = {},
+  agentUsage = {},
   writeError = null,
 } = {}) {
   const listeners = new Map();
@@ -79,6 +80,7 @@ function createHarness({
         leases,
         projects,
         output_warnings: outputWarnings,
+        agent_usage: agentUsage,
       };
     }
     if (command === "client_holder") return "me@test";
@@ -629,5 +631,44 @@ describe("project board and output guard", () => {
       "⚠ 2 concealed text, 1 clipboard writes",
     );
     expect(overview.querySelector(".overview-group-rollup")).toBeNull();
+  });
+});
+
+describe("usage from the status line", () => {
+  it("shows the usage badge from the snapshot, updates it on agent-usage, and lists it in the overview", async () => {
+    const { controller, listeners } = createHarness({
+      panes: [
+        { id: "pane-a", title: "term-a", kind: "shell", created_at_ms: 1 },
+        { id: "pane-b", title: "term-b", kind: "shell", created_at_ms: 2 },
+      ],
+      projects: { feat: { name: "feat", panes: ["pane-a", "pane-b"] } },
+      agentUsage: {
+        "pane-a": { model: "Opus", context_used_percentage: 40, five_hour: { used_percentage: 23 }, updated_at_ms: 1 },
+      },
+    });
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    const badge = view.container.querySelector('.pane[data-pane-id="pane-a"] .usage-badge');
+    expect(badge).toBeTruthy();
+    expect(badge.textContent).toBe("40% · 23% limit");
+    expect(badge.title).toBe("Opus · 40% context · 5h 23%");
+    expect(badge.classList.contains("usage-badge-hot")).toBe(false);
+    listeners.get("agent-usage")({
+      payload: {
+        pane_id: "pane-a",
+        usage: { model: "Opus", context_used_percentage: 85, five_hour: { used_percentage: 23 }, updated_at_ms: 2 },
+      },
+    });
+    await waitFor(() =>
+      expect(view.container.querySelector('.pane[data-pane-id="pane-a"] .usage-badge-hot')).toBeTruthy(),
+    );
+    const user = userEvent.setup();
+    await user.click(view.getByRole("button", { name: "Session overview" }));
+    const overview = await view.findByRole("dialog", { name: "Session overview" });
+    expect(overview.querySelector('tr[data-pane-id="pane-a"] .overview-usage').textContent).toBe(
+      "Opus · 85% context · 5h 23%",
+    );
+    expect(overview.querySelector('tr[data-pane-id="pane-b"] .overview-usage').textContent).toBe("—");
+    expect(overview.querySelector(".overview-group-limit").textContent).toBe("5h 23%");
   });
 });
