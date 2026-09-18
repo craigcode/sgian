@@ -14,6 +14,7 @@ public sealed class PaneViewModel : ObservableObject
     private AgentPaneSpec? _agentSpec;
     private string? _projectName;
     private OutputTricks? _outputWarning;
+    private AgentUsage? _usage;
 
     public PaneViewModel(Pane pane)
     {
@@ -156,6 +157,23 @@ public sealed class PaneViewModel : ObservableObject
         }
     }
 
+    /// <summary>What the session under this pane last said through the status line, or null.</summary>
+    public AgentUsage? Usage
+    {
+        get => _usage;
+        set
+        {
+            if (Set(ref _usage, value))
+            {
+                Raise(nameof(Subtitle));
+                Raise(nameof(UsageLabel));
+            }
+        }
+    }
+
+    /// <summary>"Opus · 40% context · 5h 23% ↻ 1h10m" or empty.</summary>
+    public string UsageLabel => Usage is null ? "" : Usage.Summary();
+
     /// <summary>"⚠ 3 hidden" or empty; the per-kind counts are in <see cref="OutputWarningSummary"/>.</summary>
     public string OutputWarningLabel =>
         OutputWarning is null ? "" : $"\u26A0 {OutputWarning.Total} hidden";
@@ -169,7 +187,8 @@ public sealed class PaneViewModel : ObservableObject
         {
             var mode = Mode is null ? "" : Unattended ? $" · \u26A0 {Mode} (unattended)" : $" · {Mode}";
             var warning = OutputWarning is null ? "" : $" · {OutputWarningLabel}";
-            var lease = (LeaseHolder is null ? "" : $" · {LeaseLabel}") + mode + warning;
+            var usage = Usage is null ? "" : $" · {UsageLabel}";
+            var lease = (LeaseHolder is null ? "" : $" · {LeaseLabel}") + mode + warning + usage;
             var project = ProjectName is null ? "" : $"{ProjectName} · ";
             if (State == "ended")
             {

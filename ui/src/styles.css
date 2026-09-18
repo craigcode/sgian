@@ -1033,8 +1033,15 @@ h1 {
 }
 
 .overview-keyboard,
-.overview-output {
+.overview-output,
+.overview-usage {
   white-space: nowrap;
+}
+
+.overview-group-limit {
+  margin-left: 10px;
+  color: var(--muted);
+  font-weight: 400;
 }
 
 .overview-output-warning {
@@ -1634,6 +1641,24 @@ h3.md-heading {
 
 /* An agent running tools without approval (auto / bypass): always visible. */
 .agent-badge-unattended {
+  color: var(--amber);
+  font-weight: 600;
+}
+
+/* Usage from Claude Code's status line: context fill and the tightest
+   rate-limit window; amber once either passes 80%. */
+.usage-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.usage-badge-hot {
   color: var(--amber);
   font-weight: 600;
 }

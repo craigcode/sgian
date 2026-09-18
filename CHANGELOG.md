@@ -7,6 +7,12 @@ follow SemVer once the first public tag exists.
 
 ### Added
 
+- `ctl statusline`: the command Claude Code's status line runs. Records
+  the session's model, context fill and rate-limit windows against the pane
+  that owns the calling process and prints your own status line (or a
+  compact default). Shown beside every pane in all three clients (amber
+  past 80%), in `ctl agent`, and as the freshest limit line per project
+  heading. `agent_usage` snapshot map and event.
 - `ctl hook`: the command a Claude Code hook runs. Finds the pane that
   owns the calling process and sets its badge from the hook (Notification →
   needs input, `UserPromptSubmit`/`PreToolUse` → working, `Stop` → idle)

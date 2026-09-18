@@ -333,3 +333,26 @@ func daemonRoundTrip() async throws {
     #expect(rollup.text == "3 panes · 2 live · 1 needs input · 1 working · ⚠ 1 unattended · 1 with output warnings · ⌨ alice, bob")
     #expect(ProjectRollup(panes: 1, live: 1).text == "1 pane")
 }
+
+@Test func agentUsageDecodesSummarisesAndFoldsEvents() throws {
+    let json = #"{"panes":[],"cwd":"/w","agent_usage":{"p1":{"model":"Opus","context_used_percentage":40,"five_hour":{"used_percentage":23,"resets_at":1000000},"seven_day":{"used_percentage":41},"updated_at_ms":5},"p2":{"updated_at_ms":1}}}"#
+    let snapshot = try JSONDecoder().decode(WorkspaceSnapshot.self, from: Data(json.utf8))
+    let usage = try #require(snapshot.agentUsage["p1"])
+    #expect(usage.model == "Opus")
+    #expect(usage.fiveHour == RateLimitWindow(usedPercentage: 23, resetsAt: 1000000))
+    #expect(usage.summary(now: 1000000 - 4200) == "Opus · 40% context · 5h 23% ↻ 1h10m · 7d 41%")
+    #expect(usage.summary(now: 3000000) == "Opus · 40% context · 5h 23% · 7d 41%")
+    #expect(usage.isHot == false)
+    #expect(snapshot.agentUsage["p2"] == nil, "an empty reading is not a usage")
+    #expect(AgentUsage.formatReset(100 + 90 * 60, now: 100) == " ↻ 1h30m")
+    #expect(AgentUsage.formatReset(nil, now: 0) == "")
+
+    var table: [String: AgentUsage] = [:]
+    let event = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"agent_usage","pane_id":"p1","usage":{"model":"Opus","context_used_percentage":85,"updated_at_ms":9}}"#.utf8))
+    #expect(AgentUsage.apply(event: event, to: &table))
+    #expect(table["p1"]?.contextUsedPercentage == 85)
+    #expect(table["p1"]?.isHot == true)
+    let malformed = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"agent_usage","pane_id":"p1"}"#.utf8))
+    #expect(AgentUsage.apply(event: malformed, to: &table) == false)
+    #expect(table["p1"] != nil)
+}
