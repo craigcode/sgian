@@ -12,6 +12,7 @@ import {
   handleLeaseState,
   handleOutputWarning,
   handleProjectsChanged,
+  handleAgentUsage,
   normalizeLeaseInfo,
   leaseEquals,
   normalizeAgentState,
@@ -684,5 +685,31 @@ describe("output warnings and projects", () => {
     expect(callbacks.calls.render).toBe(2);
     handleProjectsChanged(state, {}, callbacks);
     expect(callbacks.calls.render).toBe(2);
+  });
+});
+
+describe("agent usage", () => {
+  it("records a pane's usage, skips repeats and unknown panes, and drops it on close", () => {
+    const state = makeState([{ id: "pane-1" }]);
+    const callbacks = makeCallbacks();
+    const usage = { model: "Opus", context_used_percentage: 40, five_hour: { used_percentage: 23, resets_at: 7 }, updated_at_ms: 1 };
+    handleAgentUsage(state, { pane_id: "pane-1", usage }, callbacks);
+    expect(state.agentUsage.get("pane-1")).toEqual({
+      model: "Opus",
+      context: 40,
+      fiveHour: { used: 23, resetsAt: 7 },
+      sevenDay: null,
+      updatedAtMs: 1,
+    });
+    expect(callbacks.calls.render).toBe(1);
+    handleAgentUsage(state, { pane_id: "pane-1", usage }, callbacks);
+    expect(callbacks.calls.render).toBe(1);
+    handleAgentUsage(state, { pane_id: "pane-1", usage: { ...usage, context_used_percentage: 55, updated_at_ms: 2 } }, callbacks);
+    expect(state.agentUsage.get("pane-1").context).toBe(55);
+    expect(callbacks.calls.render).toBe(2);
+    handleAgentUsage(state, { pane_id: "ghost", usage }, callbacks);
+    expect(state.agentUsage.has("ghost")).toBe(false);
+    handlePaneClosed(state, { pane_id: "pane-1" }, callbacks);
+    expect(state.agentUsage.has("pane-1")).toBe(false);
   });
 });

@@ -30,6 +30,7 @@ var tests = new (string Name, Action Body)[]
     ("Keyboard lease model", KeyboardLease),
     ("Agent permission mode", AgentPermissionMode),
     ("Project board model", ProjectBoardModel),
+    ("Agent usage from the status line", AgentUsageModel),
 };
 
 var failures = new List<string>();
@@ -243,6 +244,30 @@ static void ProjectBoardModel()
     Equal(3, warnings["p1"].Total);
     Equal("p1", ProjectBoard.ApplyWarning(Json("""{"pane_id":"p1","total":{}}"""), warnings));
     Equal(0, warnings.Count);
+}
+
+static void AgentUsageModel()
+{
+    var snapshot = JsonSerializer.Deserialize<WorkspaceSnapshot>("""
+        {"panes":[],"cwd":"C:\\w","agent_usage":{"p1":{"model":"Opus","context_used_percentage":40,"five_hour":{"used_percentage":23,"resets_at":1000000},"seven_day":{"used_percentage":41},"updated_at_ms":5}}}
+        """) ?? throw new Exception("snapshot did not deserialize");
+    var usage = snapshot.AgentUsage["p1"];
+    Equal("Opus", usage.Model);
+    Equal(23, usage.FiveHour!.UsedPercentage);
+    Equal("Opus \u00B7 40% context \u00B7 5h 23% \u21BB 1h10m \u00B7 7d 41%", usage.Summary(1000000 - 4200));
+    Equal("Opus \u00B7 40% context \u00B7 5h 23% \u00B7 7d 41%", usage.Summary(3000000));
+    Equal(false, usage.IsHot);
+    Equal(" \u21BB 1h30m", AgentUsage.FormatReset(100 + 90 * 60, 100));
+    Equal("", AgentUsage.FormatReset(null, 0));
+    Equal(0, JsonSerializer.Deserialize<WorkspaceSnapshot>("""{"panes":[],"cwd":"C:\\w"}""")!.AgentUsage.Count);
+
+    var table = new Dictionary<string, AgentUsage>(StringComparer.Ordinal);
+    Equal("p1", AgentUsage.Apply(Json("""{"pane_id":"p1","usage":{"model":"Opus","context_used_percentage":85,"updated_at_ms":9}}"""), table));
+    Equal(85, table["p1"].ContextUsedPercentage);
+    Equal(true, table["p1"].IsHot);
+    Equal(true, AgentUsage.Apply(Json("""{"pane_id":"p1"}"""), table) is null);
+    Equal("p1", AgentUsage.Apply(Json("""{"pane_id":"p1","usage":{"updated_at_ms":1}}"""), table));
+    Equal(0, table.Count);
 }
 
 static void WorkspaceDefaults()

@@ -1615,6 +1615,10 @@ pub struct WorkspaceSnapshot {
     /// Output-guard counters for panes with at least one hit. Additive.
     #[serde(default)]
     pub output_warnings: HashMap<String, OutputTricks>,
+    /// Per-pane usage from Claude Code's status line (`ctl statusline`):
+    /// model, context fill, rate-limit windows. Additive.
+    #[serde(default)]
+    pub agent_usage: HashMap<String, AgentUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2355,6 +2359,13 @@ enum DaemonRequest {
         #[serde(default)]
         lines: usize,
     },
+    /// Claude Code's status-line payload from a session inside some pane
+    /// (`ctl statusline`): `pid` is the status-line process, `payload` the
+    /// JSON Claude Code wrote to it. Never an error when nothing matches.
+    AgentStatus {
+        pid: u32,
+        payload: Value,
+    },
     /// A Claude Code hook fired inside some pane (`ctl hook`): `pid` is the
     /// hook process (the daemon walks its ancestry to the pane), `event` the
     /// `hook_event_name`, `notification_type` the Notification kind. Maps to
@@ -2595,6 +2606,12 @@ enum DaemonEvent {
         added: OutputTricks,
         total: OutputTricks,
     },
+    /// A pane's usage reading changed (see `AgentUsage`). Frequent (every
+    /// turn of a session) and not the product: never ledgered.
+    AgentUsage {
+        pane_id: String,
+        usage: AgentUsage,
+    },
     /// The project table after a change (create, delete, assign, unassign,
     /// or a member pane closing): the whole map, small and idempotent, so a
     /// client renders a board without diffing. Old clients skip the tag.
@@ -2730,6 +2747,9 @@ struct FindEntry {
     /// Output-guard counters; absent when nothing was flagged.
     #[serde(skip_serializing_if = "Option::is_none")]
     output_warnings: Option<OutputTricks>,
+    /// Status-line usage; absent until a session under the pane reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<AgentUsage>,
     group: Option<String>,
     cols: u16,
     rows: u16,
@@ -2909,6 +2929,7 @@ impl PaneRegistry {
             leases: HashMap::new(),
             projects: HashMap::new(),
             output_warnings: HashMap::new(),
+            agent_usage: HashMap::new(),
         }
     }
 
@@ -3684,6 +3705,29 @@ impl OutputRouter {
 
     fn set_ledger(&self, sink: Arc<Mutex<LedgerSink>>) {
         let _ = self.ledger.set(sink);
+    }
+
+    /// A session proved an agent is running in the pane (a status-line
+    /// payload arrived from under it). Sets the agent name when the pane has
+    /// none, leaving attention and manual marks alone; broadcasts only when
+    /// something changed.
+    fn mark_agent_present(&self, pane_id: &str, agent: &str) {
+        let changed = self.agents.lock().ok().and_then(|mut tracker| {
+            let entry = tracker.panes.entry(pane_id.to_string()).or_default();
+            if entry.ended || entry.agent.is_some() {
+                return None;
+            }
+            entry.agent = Some(agent.to_string());
+            Some((entry.attention, entry.mode.clone()))
+        });
+        if let Some((attention, mode)) = changed {
+            self.broadcast(&DaemonEvent::AgentState {
+                pane_id: pane_id.to_string(),
+                agent: Some(agent.to_string()),
+                attention,
+                mode,
+            });
+        }
     }
 
     fn set_leases(&self, leases: SharedLeases) {
@@ -7522,9 +7566,141 @@ impl SubscriptionBackoff {
 // terminal tricks an agent can use to hide output from the person watching.
 // ---------------------------------------------------------------------------
 
-/// Per-pane counts of output that hides something from a human reader.
-/// Ordinary TUI redraws (cursor moves, erase-line) are deliberately NOT
-/// counted: agents repaint constantly and that would be all noise.
+/// One rate-limit window as Claude Code reports it on its status line:
+/// percent consumed (rounded) and when it resets (unix seconds).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RateLimitWindow {
+    #[serde(default)]
+    pub used_percentage: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<u64>,
+}
+
+/// What a Claude Code session says about itself after every turn, read
+/// from the status-line payload (`ctl statusline`): the model, how full the
+/// context window is, and the account's rate-limit windows (Pro/Max only).
+/// Push, not poll: no credentials, no scraping. `updated_at_ms` says how
+/// fresh it is; a client should fade a reading older than a few minutes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Percent of the context window in use (input-only, as Claude Code
+    /// computes it), rounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_used_percentage: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour: Option<RateLimitWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day: Option<RateLimitWindow>,
+    /// Session cost in US cents (Claude Code reports dollars as a float).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_cents: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+
+impl AgentUsage {
+    /// Read the fields we keep out of a status-line payload. Everything is
+    /// optional so a payload from a newer CLI still parses; a payload with
+    /// nothing we recognise yields `None`.
+    fn from_status_payload(payload: &Value) -> Option<AgentUsage> {
+        fn percent(value: &Value) -> Option<u8> {
+            value
+                .as_f64()
+                .map(|pct| pct.clamp(0.0, 100.0).round() as u8)
+        }
+        let window = |value: &Value| -> Option<RateLimitWindow> {
+            Some(RateLimitWindow {
+                used_percentage: percent(value.get("used_percentage")?)?,
+                resets_at: value.get("resets_at").and_then(Value::as_u64),
+            })
+        };
+        let usage = AgentUsage {
+            model: payload["model"]["display_name"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(str::to_string),
+            model_id: payload["model"]["id"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(str::to_string),
+            context_used_percentage: percent(&payload["context_window"]["used_percentage"]),
+            context_window_size: payload["context_window"]["context_window_size"].as_u64(),
+            five_hour: window(&payload["rate_limits"]["five_hour"]),
+            seven_day: window(&payload["rate_limits"]["seven_day"]),
+            total_cost_cents: payload["cost"]["total_cost_usd"]
+                .as_f64()
+                .filter(|usd| usd.is_finite() && *usd >= 0.0)
+                .map(|usd| (usd * 100.0).round() as u64),
+            session_id: payload["session_id"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(str::to_string),
+            updated_at_ms: 0,
+        };
+        let empty = usage.model.is_none()
+            && usage.model_id.is_none()
+            && usage.context_used_percentage.is_none()
+            && usage.five_hour.is_none()
+            && usage.seven_day.is_none()
+            && usage.total_cost_cents.is_none();
+        (!empty).then_some(usage)
+    }
+
+    /// "Opus · 40% context · 5h 23% ↻ 15:00 · 7d 41%": the one-line form the
+    /// default status line and `ctl agent` print. `now` is unix seconds.
+    fn summary(&self, now: u64) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(model) = &self.model {
+            parts.push(model.clone());
+        }
+        if let Some(pct) = self.context_used_percentage {
+            parts.push(format!("{pct}% context"));
+        }
+        if let Some(window) = &self.five_hour {
+            parts.push(format!(
+                "5h {}%{}",
+                window.used_percentage,
+                format_reset(window.resets_at, now)
+            ));
+        }
+        if let Some(window) = &self.seven_day {
+            parts.push(format!(
+                "7d {}%{}",
+                window.used_percentage,
+                format_reset(window.resets_at, now)
+            ));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// " ↻ 2h10m" (time until a window resets) or "" when unknown or past.
+fn format_reset(resets_at: Option<u64>, now: u64) -> String {
+    let Some(at) = resets_at else {
+        return String::new();
+    };
+    if at <= now {
+        return String::new();
+    }
+    let secs = at - now;
+    let (h, m) = (secs / 3600, (secs % 3600) / 60);
+    if h >= 48 {
+        format!(" ↻ {}d", h / 24)
+    } else if h > 0 {
+        format!(" ↻ {h}h{m:02}m")
+    } else {
+        format!(" ↻ {m}m")
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OutputTricks {
     /// SGR 8 (conceal): text present but invisible.
@@ -8609,6 +8785,9 @@ struct DaemonServer {
     /// Named pane groups (name → project). Leaf lock; persist() takes it after
     /// registry → terminals → leases.
     projects: Mutex<HashMap<String, Project>>,
+    /// Per-pane usage from status-line payloads (`ctl statusline`). Not
+    /// persisted: a fresh daemon waits for the next turn. Leaf lock.
+    agent_usage: Mutex<HashMap<String, AgentUsage>>,
     /// The next lease generation (see `HeldLease::generation`); seeded above
     /// every persisted lease so numbers never repeat across restarts.
     next_lease_generation: AtomicU64,
@@ -8843,6 +9022,7 @@ impl DaemonServer {
             probe_warned: AtomicBool::new(false),
             probe_mapped: Mutex::new(HashMap::new()),
             kranz_bindings: Mutex::new(HashMap::new()),
+            agent_usage: Mutex::new(HashMap::new()),
             // Members that no longer exist are dropped on load, like leases.
             projects: Mutex::new(
                 projects
@@ -9102,6 +9282,59 @@ impl DaemonServer {
             records = records.split_off(total - limit);
         }
         Ok(json!({ "project": name, "total": total, "records": records }))
+    }
+
+    fn agent_usage_snapshot(&self) -> HashMap<String, AgentUsage> {
+        self.agent_usage
+            .lock()
+            .map(|usage| usage.clone())
+            .unwrap_or_default()
+    }
+
+    /// A status-line payload from a Claude Code session under one of this
+    /// daemon's panes. Placed like a hook (process ancestry), stored per
+    /// pane, broadcast as `agent_usage`. Also proof that Claude is running
+    /// there: a pane with no agent mark gets one (attention untouched; the
+    /// status line says nothing about that). Never an error.
+    fn handle_agent_status(&self, pid: u32, payload: &Value) -> Value {
+        let Some(mut usage) = AgentUsage::from_status_payload(payload) else {
+            return json!({ "mapped": false, "reason": "payload carries nothing we keep" });
+        };
+        let Some(parent_of) = process_parent_snapshot_for_hooks() else {
+            return json!({ "mapped": false, "reason": "no process tree on this platform" });
+        };
+        let pane_pids = match self.lock_terminals() {
+            Ok(terminals) => terminals.live_pane_pids(),
+            Err(_) => return json!({ "mapped": false, "reason": "terminal store unavailable" }),
+        };
+        let Some(pane_id) = pane_for_pid(pid, &parent_of, &pane_pids) else {
+            return json!({ "mapped": false, "reason": format!("no live pane owns pid {pid}") });
+        };
+        usage.updated_at_ms = now_millis();
+        let changed = match self.agent_usage.lock() {
+            Ok(mut table) => {
+                let same = table.get(&pane_id).is_some_and(|previous| {
+                    AgentUsage {
+                        updated_at_ms: 0,
+                        ..previous.clone()
+                    } == AgentUsage {
+                        updated_at_ms: 0,
+                        ..usage.clone()
+                    }
+                });
+                table.insert(pane_id.clone(), usage.clone());
+                !same
+            }
+            Err(_) => return json!({ "mapped": false, "reason": "usage table unavailable" }),
+        };
+        self.router.mark_agent_present(&pane_id, "claude");
+        if changed {
+            self.router.broadcast(&DaemonEvent::AgentUsage {
+                pane_id: pane_id.clone(),
+                usage: usage.clone(),
+            });
+        }
+        json!({ "mapped": true, "pane_id": pane_id, "usage": usage, "changed": changed })
     }
 
     /// (M3) A Claude Code hook fired somewhere under one of this daemon's
@@ -9653,6 +9886,9 @@ impl DaemonServer {
                 self.revoke_lease_on_close(&pane_id);
                 let project_changed = self.forget_pane_in_projects(&pane_id);
                 self.router.remove_output_guard(&pane_id);
+                if let Ok(mut usage) = self.agent_usage.lock() {
+                    usage.remove(&pane_id);
+                }
                 self.lock_terminals()?.close_pane(&pane_id);
                 self.router.invalidate_append_handle(&pane_id);
                 let _ = fs::remove_file(scrollback_path(&self.scrollback_dir, &pane_id));
@@ -9751,6 +9987,9 @@ impl DaemonServer {
             DaemonRequest::ProjectShow { name } => self.handle_project_show(&name),
             DaemonRequest::ProjectDossier { name, lines } => {
                 self.handle_project_dossier(&name, lines)
+            }
+            DaemonRequest::AgentStatus { pid, payload } => {
+                Ok(self.handle_agent_status(pid, &payload))
             }
             DaemonRequest::AgentSignal {
                 pid,
@@ -10436,6 +10675,7 @@ impl DaemonServer {
         };
         // (T1) Agent state read once from the router's tracker.
         let agent_infos = self.router.agent_info_map();
+        let agent_usage = self.agent_usage_snapshot();
 
         let mut entries: Vec<FindEntry> = Vec::new();
         for pane in &panes {
@@ -10504,6 +10744,7 @@ impl DaemonServer {
                     let tricks = self.router.output_tricks(&pane.id);
                     (tricks.total() > 0).then_some(tricks)
                 },
+                usage: agent_usage.get(&pane.id).cloned(),
                 group: None,
                 cols,
                 rows,
@@ -11040,6 +11281,7 @@ impl DaemonServer {
         snapshot.leases = self.lease_infos();
         snapshot.projects = self.projects_snapshot();
         snapshot.output_warnings = self.router.output_warnings();
+        snapshot.agent_usage = self.agent_usage_snapshot();
         // (T2) Bounded conversation replay for agent panes, read back from the
         // per-pane JSONL log (covers live, ended, and not-yet-respawned panes).
         for pane in &snapshot.panes {
@@ -14275,6 +14517,9 @@ fn emit_daemon_event(app: &AppHandle, event: DaemonEvent) {
                 json!({ "pane_id": pane_id, "added": added, "total": total }),
             );
         }
+        DaemonEvent::AgentUsage { pane_id, usage } => {
+            let _ = app.emit("agent-usage", json!({ "pane_id": pane_id, "usage": usage }));
+        }
         // The whole project table after a change; the overview groups by it.
         DaemonEvent::ProjectsChanged { projects } => {
             let _ = app.emit("projects-changed", json!({ "projects": projects }));
@@ -15128,6 +15373,153 @@ fn parse_hook_args(args: &[String]) -> Result<HookArgs, String> {
     Ok(parsed)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct StatuslineArgs {
+    pid: Option<u32>,
+    /// A status-line command to run after reporting, fed the same payload;
+    /// its stdout is passed through so the user's own line still shows.
+    then: Vec<String>,
+}
+
+/// `statusline [--pid N] [--exec COMMAND [ARGS...]]`. (`--` cannot be the
+/// separator: the global ctl parser consumes it.)
+fn parse_statusline_args(args: &[String]) -> Result<StatuslineArgs, String> {
+    let mut parsed = StatuslineArgs::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--pid" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--pid requires a number".to_string())?;
+                parsed.pid = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid --pid '{value}'"))?,
+                );
+                index += 1;
+            }
+            "--exec" => {
+                parsed.then = args[index + 1..].to_vec();
+                if parsed.then.is_empty() {
+                    return Err("--exec needs a COMMAND to run".to_string());
+                }
+                break;
+            }
+            other => return Err(format!("unexpected argument for statusline: {other}")),
+        }
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+/// Send one status-line payload to the daemon that owns the calling process:
+/// the payload's own cwd first (a session's cwd is its workspace more often
+/// than not), then the ctl workspace, then every running daemon. Returns the
+/// daemon's answer, or a `mapped: false` reason.
+fn report_status_payload(workspace: PathBuf, pid: u32, payload: &Value) -> Value {
+    let request = DaemonRequest::AgentStatus {
+        pid,
+        payload: payload.clone(),
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(cwd) = payload["workspace"]["current_dir"]
+        .as_str()
+        .or_else(|| payload["cwd"].as_str())
+        .filter(|text| !text.is_empty())
+    {
+        candidates.push(PathBuf::from(cwd));
+    }
+    candidates.push(workspace);
+    let mut tried = std::collections::HashSet::new();
+    let mut answer = json!({ "mapped": false, "reason": "no running daemon" });
+    for cwd in candidates {
+        let key = workspace_key(&cwd);
+        if !tried.insert(key.clone()) {
+            continue;
+        }
+        let Ok(client) = DaemonClient::connect_existing(cwd) else {
+            continue;
+        };
+        if let Ok(result) = client.request::<Value>(request.clone()) {
+            answer = result;
+            if answer["mapped"] == json!(true) {
+                answer["workspace_key"] = json!(key);
+                return answer;
+            }
+        }
+    }
+    for key in workspace_keys() {
+        if !tried.insert(key.clone()) || !daemon_is_alive(&key) {
+            continue;
+        }
+        let Ok(response) = daemon_request_by_key(&key, request.clone()) else {
+            continue;
+        };
+        if response.ok && response.result["mapped"] == json!(true) {
+            answer = response.result;
+            answer["workspace_key"] = json!(key);
+            return answer;
+        }
+    }
+    answer
+}
+
+/// `ctl statusline`: the command Claude Code's status line runs. Reads the
+/// payload from stdin, reports it to the owning daemon, then prints a line:
+/// the output of the user's own status command when one follows `--exec` (fed
+/// the same payload), else a compact default. Always exits 0 and always
+/// prints something, so wiring Sgian in never costs the user their status
+/// line. `--json` prints the daemon's answer instead.
+fn control_statusline(
+    workspace: PathBuf,
+    parsed: StatuslineArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let mut raw = String::new();
+    let _ = std::io::stdin().read_to_string(&mut raw);
+    let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let answer = if payload.is_object() {
+        report_status_payload(
+            workspace,
+            parsed.pid.unwrap_or(std::process::id()),
+            &payload,
+        )
+    } else {
+        json!({ "mapped": false, "reason": "stdin was not a JSON object" })
+    };
+    if json_output {
+        return write_json_stdout(&answer);
+    }
+    let mut stdout = std::io::stdout();
+    if let Some((program, rest)) = parsed.then.split_first() {
+        let child = Command::new(program)
+            .args(rest)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn();
+        if let Ok(mut child) = child {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(raw.as_bytes());
+            }
+            if let Ok(output) = child.wait_with_output() {
+                let _ = stdout.write_all(&output.stdout);
+                let _ = stdout.flush();
+                return Ok(());
+            }
+        }
+        // The user's command failed: fall through to the default so the
+        // status line is never blank because of us.
+    }
+    let line = AgentUsage::from_status_payload(&payload)
+        .map(|usage| usage.summary(now_millis() / 1000))
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "sgian".to_string());
+    let _ = writeln!(stdout, "{line}");
+    Ok(())
+}
+
 /// The fields `ctl hook` reads from a Claude Code hook payload (stdin JSON).
 /// Everything is optional so a payload from a newer CLI still parses.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -15524,6 +15916,13 @@ fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             }
             let parsed = parse_hook_args(&options.args[1..])?;
             control_hook(options.workspace, parsed, options.json)
+        }
+        "statusline" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_statusline_args(&options.args[1..])?;
+            control_statusline(options.workspace, parsed, options.json)
         }
         "write-config" => {
             let client = DaemonClient::connect_or_spawn(options.workspace)?;
@@ -18616,6 +19015,10 @@ fn format_watch_event(event: &DaemonEvent, json_output: bool) -> Option<String> 
             "{pane_id}\toutput_warning{}",
             format_output_warning(&serde_json::to_value(total).unwrap_or(Value::Null))
         ),
+        DaemonEvent::AgentUsage { pane_id, usage } => format!(
+            "{pane_id}\tagent_usage\t{}",
+            usage.summary(now_millis() / 1000)
+        ),
         _ => return None,
     };
     if json_output {
@@ -18645,6 +19048,7 @@ fn format_output_warning(tricks: &Value) -> String {
 fn watch_event_pane(event: &DaemonEvent) -> Option<&str> {
     match event {
         DaemonEvent::OutputWarning { pane_id, .. }
+        | DaemonEvent::AgentUsage { pane_id, .. }
         | DaemonEvent::AgentState { pane_id, .. }
         | DaemonEvent::LeaseState { pane_id, .. }
         | DaemonEvent::PaneEnded { pane_id, .. }
@@ -18751,6 +19155,10 @@ fn query_agent_state(client: &DaemonClient, pane_id: &str) -> Result<Value, Stri
             .and_then(|entry| entry.get("output_warnings"))
             .cloned()
             .unwrap_or(Value::Null),
+        "usage": entry
+            .and_then(|entry| entry.get("usage"))
+            .cloned()
+            .unwrap_or(Value::Null),
     }))
 }
 
@@ -18793,14 +19201,20 @@ fn control_agent(client: &DaemonClient, args: &[String], json_output: bool) -> R
             },
             format_output_warning(&state["output_warnings"])
         );
+        let usage_text = serde_json::from_value::<AgentUsage>(state["usage"].clone())
+            .ok()
+            .filter(|usage| usage.updated_at_ms > 0)
+            .map(|usage| format!("\t{}", usage.summary(now_millis() / 1000)))
+            .unwrap_or_default();
         writeln!(
             stdout,
-            "{}\t{}\t{}\t{}{}",
+            "{}\t{}\t{}\t{}{}{}",
             pane_id,
             state["agent"].as_str().unwrap_or("-"),
             state["attention"].as_str().unwrap_or("-"),
             state["mode"].as_str().unwrap_or("-"),
-            suffix
+            suffix,
+            usage_text
         )
         .map_err(|error| format!("failed to write stdout: {error}"))
     }
@@ -19674,6 +20088,15 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   from the hook (Notification → needs input,
                                   UserPromptSubmit/PreToolUse → working, Stop →
                                   idle). Always exits 0; --json prints the answer.
+  statusline [--pid N] [--exec COMMAND [ARGS...]]
+                                The command Claude Code's status line runs:
+                                  reads the payload from stdin, records the
+                                  session's model, context fill and rate-limit
+                                  windows against the pane that owns the calling
+                                  process, then prints your own status command's
+                                  output (fed the same payload) or a compact
+                                  default line. Always exits 0; --json prints
+                                  the daemon's answer instead.
   lease [PANE]                  Show who holds a pane's keyboard (alias: lease status)
   lease take [PANE] [--as HOLDER] [--force --why REASON]
                                 Claim the keyboard. While held, input from anyone
@@ -37330,6 +37753,228 @@ exit 0
             1
         )
         .is_err());
+    }
+
+    #[test]
+    fn status_payload_parses_into_usage_and_summarises() {
+        let payload: Value = serde_json::from_str(
+            r#"{"hook_event_name":"Status","session_id":"s1","cwd":"/w","model":{"id":"claude-opus-5","display_name":"Opus"},"workspace":{"current_dir":"/w","project_dir":"/w"},"cost":{"total_cost_usd":1.234},"context_window":{"total_input_tokens":8000,"context_window_size":200000,"used_percentage":40.4},"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1000000},"seven_day":{"used_percentage":41.2,"resets_at":2000000}},"extra":true}"#,
+        )
+        .expect("payload");
+        let usage = AgentUsage::from_status_payload(&payload).expect("usage");
+        assert_eq!(usage.model.as_deref(), Some("Opus"));
+        assert_eq!(usage.model_id.as_deref(), Some("claude-opus-5"));
+        assert_eq!(usage.context_used_percentage, Some(40));
+        assert_eq!(usage.context_window_size, Some(200000));
+        assert_eq!(
+            usage.five_hour,
+            Some(RateLimitWindow {
+                used_percentage: 24,
+                resets_at: Some(1000000)
+            })
+        );
+        assert_eq!(usage.seven_day.map(|w| w.used_percentage), Some(41));
+        assert_eq!(usage.total_cost_cents, Some(123));
+        assert_eq!(usage.session_id.as_deref(), Some("s1"));
+        // now = 1h10m before the 5h reset, 11d before the 7d one.
+        assert_eq!(
+            usage.summary(1000000 - 4200),
+            "Opus · 40% context · 5h 24% ↻ 1h10m · 7d 41% ↻ 11d"
+        );
+        assert_eq!(
+            usage.summary(3000000),
+            "Opus · 40% context · 5h 24% · 7d 41%"
+        );
+        // Free-tier payload: no rate limits, context may be null early on.
+        let thin: Value = serde_json::from_str(
+            r#"{"model":{"display_name":"Sonnet"},"context_window":{"used_percentage":null}}"#,
+        )
+        .expect("thin");
+        let thin = AgentUsage::from_status_payload(&thin).expect("thin usage");
+        assert_eq!(thin.summary(0), "Sonnet");
+        assert!(thin.five_hour.is_none() && thin.context_used_percentage.is_none());
+        assert!(AgentUsage::from_status_payload(&json!({"foo": 1})).is_none());
+        assert!(AgentUsage::from_status_payload(&Value::Null).is_none());
+        assert_eq!(format_reset(Some(100), 50), " ↻ 0m");
+        assert_eq!(format_reset(Some(100 + 90 * 60), 100), " ↻ 1h30m");
+        assert_eq!(format_reset(None, 0), "");
+
+        let parsed = parse_statusline_args(&args(&["--pid", "9", "--exec", "sh", "-c", "echo x"]))
+            .expect("args");
+        assert_eq!(parsed.pid, Some(9));
+        assert_eq!(parsed.then, args(&["sh", "-c", "echo x"]));
+        assert!(parse_statusline_args(&args(&["--exec"])).is_err());
+        assert!(parse_statusline_args(&args(&["bogus"])).is_err());
+        assert_eq!(
+            parse_statusline_args(&[]).expect("bare"),
+            StatuslineArgs::default()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_payload_lands_on_the_owning_pane_over_ipc() {
+        let daemon = TestDaemon::spawn(Config {
+            shell: Some("/bin/sh".to_string()),
+            agent_probe_interval_ms: Some(0),
+            ..Default::default()
+        });
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        let mut stream = client
+            .authenticated_stream()
+            .expect("subscribe stream should connect");
+        write_json_line(&mut stream, &DaemonRequest::Subscribe).expect("subscribe should write");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("read timeout should apply");
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: "echo SHELLPID=$$\n".to_string(),
+            })
+            .expect("print pid");
+        let mut shell_pid: Option<u32> = None;
+        for _ in 0..200 {
+            let found: Value = client
+                .request(DaemonRequest::SearchScrollback {
+                    pane_id: pane_id.clone(),
+                    needle: "SHELLPID=".to_string(),
+                    ignore_case: false,
+                    limit: 0,
+                })
+                .expect("search");
+            shell_pid = found["matches"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|hit| hit["text"].as_str())
+                .filter_map(|text| text.strip_prefix("SHELLPID="))
+                .filter_map(|rest| rest.trim().parse::<u32>().ok())
+                .next();
+            if shell_pid.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let shell_pid = shell_pid.expect("the pane's shell printed its pid");
+
+        let payload = json!({
+            "session_id": "s1",
+            "model": { "id": "claude-opus-5", "display_name": "Opus" },
+            "context_window": { "used_percentage": 40 },
+            "rate_limits": { "five_hour": { "used_percentage": 23, "resets_at": 1000000 } }
+        });
+        let first: Value = client
+            .request(DaemonRequest::AgentStatus {
+                pid: shell_pid,
+                payload: payload.clone(),
+            })
+            .expect("status");
+        assert_eq!(first["mapped"], json!(true), "{first}");
+        assert_eq!(first["pane_id"], json!(pane_id));
+        assert_eq!(first["changed"], json!(true));
+        assert_eq!(first["usage"]["model"], json!("Opus"));
+        // Same payload again: stored, but no second event.
+        let again: Value = client
+            .request(DaemonRequest::AgentStatus {
+                pid: shell_pid,
+                payload: payload.clone(),
+            })
+            .expect("status again");
+        assert_eq!(again["changed"], json!(false));
+        // A later turn with more context: an event.
+        let mut later = payload.clone();
+        later["context_window"]["used_percentage"] = json!(55);
+        let third: Value = client
+            .request(DaemonRequest::AgentStatus {
+                pid: shell_pid,
+                payload: later,
+            })
+            .expect("status later");
+        assert_eq!(third["changed"], json!(true));
+
+        let snapshot: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap after status");
+        let usage = snapshot
+            .agent_usage
+            .get(&pane_id)
+            .expect("usage in snapshot");
+        assert_eq!(usage.context_used_percentage, Some(55));
+        assert_eq!(usage.five_hour.map(|w| w.used_percentage), Some(23));
+        assert!(usage.updated_at_ms > 0);
+        // The status line proved Claude is running here: the pane has an agent
+        // mark now, with attention still unknown (the status line says nothing
+        // about that).
+        let info = snapshot.agent_states.get(&pane_id).expect("agent state");
+        assert_eq!(info.agent.as_deref(), Some("claude"));
+        assert_eq!(info.attention, None);
+        let found: Value = client
+            .request(DaemonRequest::Find {
+                command: None,
+                title: None,
+                cwd: None,
+                state: None,
+            })
+            .expect("find");
+        let entry = found
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["id"] == json!(pane_id)))
+            .expect("entry");
+        assert_eq!(entry["usage"]["model"], json!("Opus"));
+
+        // Events: one agent_state (the mark) and two agent_usage (first, third).
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        let mut usage_events = 0;
+        let mut mark_events = 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && (usage_events < 2 || mark_events < 1) {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => match serde_json::from_str::<DaemonEvent>(&line) {
+                    Ok(DaemonEvent::AgentUsage { pane_id: id, usage }) if id == pane_id => {
+                        usage_events += 1;
+                        assert_eq!(usage.model.as_deref(), Some("Opus"));
+                    }
+                    Ok(DaemonEvent::AgentState {
+                        pane_id: id, agent, ..
+                    }) if id == pane_id && agent.as_deref() == Some("claude") => {
+                        mark_events += 1;
+                    }
+                    _ => {}
+                },
+                Err(_) => {}
+            }
+        }
+        assert_eq!((usage_events, mark_events), (2, 1));
+
+        // Unknown process and a payload with nothing we keep: acknowledged.
+        let stray: Value = client
+            .request(DaemonRequest::AgentStatus {
+                pid: u32::MAX - 9,
+                payload: payload.clone(),
+            })
+            .expect("stray");
+        assert_eq!(stray["mapped"], json!(false));
+        let empty: Value = client
+            .request(DaemonRequest::AgentStatus {
+                pid: shell_pid,
+                payload: json!({ "transcript_path": "/t" }),
+            })
+            .expect("empty");
+        assert_eq!(empty["mapped"], json!(false));
+        daemon.shutdown();
     }
 
     #[cfg(unix)]

@@ -99,6 +99,17 @@ client should mark such a pane (the Tauri client shows an amber `⚠ N` badge
 beside the agent badge, with the per-kind counts in its title; macOS an
 orange eye-slash icon in the pane row; Windows `⚠ N hidden` in the subtitle).
 
+The bootstrap snapshot may carry `agent_usage` (pane_id → `{ model?,
+model_id?, context_used_percentage?, context_window_size?, five_hour?,
+seven_day?, total_cost_cents?, session_id?, updated_at_ms }`, windows as
+`{ used_percentage, resets_at? }`), fed by `sgian ctl statusline` from a
+session's status-line payload; subscribers receive `agent_usage { pane_id,
+usage }` when a reading changes. Additive. A client shows it as one line
+("Opus · 40% context · 5h 23% ↻ 1h10m") beside the pane and treats a
+reading past 80% as hot; the Tauri overview and the macOS sidebar also show
+the freshest rate-limit line once per project heading (limits are per
+account).
+
 `agent_states` entries and `agent_state` events may carry `mode` (the
 agent's observed permission mode) and `unattended` (true when tools run
 without a person approving them); both are additive and clients must mark an
@@ -127,8 +138,8 @@ restore prompts that were never saved.
 
 The native clients handle `pty_output`, `pane_ended`, `pane_created`,
 `pane_closed`, `pane_renamed`, `agent_state`, `agent_event`, `lease_state`,
-`projects_changed` and `output_warning`. Unknown events are ignored for
-forward compatibility. Subscription disconnects are retried;
+`projects_changed`, `output_warning` and `agent_usage`. Unknown events are
+ignored for forward compatibility. Subscription disconnects are retried;
 the daemon and its sessions are never tied to the client process lifetime.
 
 Native split layouts use the same binary JSON tree as Tauri. Clients validate

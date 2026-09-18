@@ -34,12 +34,15 @@ import {
   leaseEquals,
   handleOutputWarning,
   handleProjectsChanged,
+  handleAgentUsage,
 } from "./events.js";
 import {
   normalizeOutputWarning,
   outputWarningEquals,
   normalizeProjects,
   projectsEqual,
+  normalizeUsage,
+  usageEquals,
 } from "./projects.js";
 import {
   createAgentChat,
@@ -109,6 +112,9 @@ function initialState() {
     // Output guard (docs/design/keyboard-lease-and-ledger.md §7): pane_id →
     // { counts, total } for panes whose output hid something, else absent.
     outputWarnings: new Map(),
+    // Usage per pane from Claude Code's status line (model, context fill,
+    // rate-limit windows); absent until a session under the pane reports.
+    agentUsage: new Map(),
     // Projects (name → { name, goal, repo, panes }) for the overview board.
     projects: new Map(),
     agentSpecs: new Map(),
@@ -528,6 +534,16 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
       if (outputWarningEquals(existing, next)) continue;
       if (next) state.outputWarnings.set(paneId, next);
       else state.outputWarnings.delete(paneId);
+      changed = true;
+    }
+
+    const snapshotUsage = snapshot.agent_usage || {};
+    for (const paneId of snapshotIds) {
+      const next = normalizeUsage(snapshotUsage[paneId]);
+      const existing = state.agentUsage.get(paneId) ?? null;
+      if (usageEquals(existing, next)) continue;
+      if (next) state.agentUsage.set(paneId, next);
+      else state.agentUsage.delete(paneId);
       changed = true;
     }
 
@@ -961,6 +977,7 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     state.agentStates.delete(paneId);
     state.leases.delete(paneId);
     state.outputWarnings.delete(paneId);
+    state.agentUsage.delete(paneId);
     state.agentSpecs.delete(paneId);
     state.lastActivityMs.delete(paneId);
     state.layout = pruneLeaf(state.layout, paneId);
@@ -1455,6 +1472,9 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     });
     await listen("projects-changed", (event) => {
       handleProjectsChanged(state, event.payload || {}, callbacks);
+    });
+    await listen("agent-usage", (event) => {
+      handleAgentUsage(state, event.payload || {}, callbacks);
     });
     await listen("agent-event", (event) => {
       const payload = event.payload || {};

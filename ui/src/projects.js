@@ -168,3 +168,91 @@ export function rollupText(rollup) {
   if (rollup.holders.length) parts.push(`⌨ ${rollup.holders.join(", ")}`);
   return parts.join(" · ");
 }
+
+// ---------------------------------------------------------------------------
+// Usage (docs/native-ipc.md "agent_usage"): what a Claude Code session says
+// about itself after every turn via `sgian ctl statusline`: model, context
+// fill, the account's rate-limit windows. Push from the CLI, never polled.
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalize an `agent_usage` entry (bootstrap map value or an `agent-usage`
+ * event's `usage`) into a plain object, or null when there is nothing to
+ * show. Percentages are integers 0..100; `resetsAt` is unix seconds.
+ */
+export function normalizeUsage(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const pct = (value) =>
+    Number.isFinite(value) ? Math.max(0, Math.min(100, Math.round(value))) : null;
+  const window = (value) => {
+    if (!value || typeof value !== "object") return null;
+    const used = pct(value.used_percentage);
+    if (used === null) return null;
+    return {
+      used,
+      resetsAt: Number.isFinite(value.resets_at) ? Math.floor(value.resets_at) : null,
+    };
+  };
+  const usage = {
+    model: typeof entry.model === "string" && entry.model ? entry.model : null,
+    context: pct(entry.context_used_percentage),
+    fiveHour: window(entry.five_hour),
+    sevenDay: window(entry.seven_day),
+    updatedAtMs: Number.isFinite(entry.updated_at_ms) ? entry.updated_at_ms : 0,
+  };
+  if (!usage.model && usage.context === null && !usage.fiveHour && !usage.sevenDay) return null;
+  return usage;
+}
+
+export function usageEquals(a, b) {
+  if (!a || !b) return a === b;
+  const win = (x, y) => (!x || !y ? x === y : x.used === y.used && x.resetsAt === y.resetsAt);
+  return (
+    a.model === b.model &&
+    a.context === b.context &&
+    win(a.fiveHour, b.fiveHour) &&
+    win(a.sevenDay, b.sevenDay) &&
+    a.updatedAtMs === b.updatedAtMs
+  );
+}
+
+/** " ↻ 1h10m" until a window resets, or "" when unknown or past. */
+export function formatReset(resetsAt, nowSeconds) {
+  if (!Number.isFinite(resetsAt) || resetsAt <= nowSeconds) return "";
+  const secs = resetsAt - nowSeconds;
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (h >= 48) return ` ↻ ${Math.floor(h / 24)}d`;
+  if (h > 0) return ` ↻ ${h}h${String(m).padStart(2, "0")}m`;
+  return ` ↻ ${m}m`;
+}
+
+/**
+ * "Opus · 40% context · 5h 23% ↻ 1h10m · 7d 41%" — the same line the daemon's
+ * `ctl agent` prints, so every surface agrees.
+ */
+export function usageText(usage, nowSeconds = Math.floor(Date.now() / 1000)) {
+  if (!usage) return "";
+  const parts = [];
+  if (usage.model) parts.push(usage.model);
+  if (usage.context !== null) parts.push(`${usage.context}% context`);
+  if (usage.fiveHour) parts.push(`5h ${usage.fiveHour.used}%${formatReset(usage.fiveHour.resetsAt, nowSeconds)}`);
+  if (usage.sevenDay) parts.push(`7d ${usage.sevenDay.used}%${formatReset(usage.sevenDay.resetsAt, nowSeconds)}`);
+  return parts.join(" · ");
+}
+
+/**
+ * The account-level rate-limit line for a group heading: the freshest
+ * reading among the panes (limits are per account, so one line suffices),
+ * or "" when no pane has reported.
+ */
+export function groupLimitText(panes, state, nowSeconds = Math.floor(Date.now() / 1000)) {
+  let freshest = null;
+  for (const pane of panes) {
+    const usage = state.agentUsage?.get(pane.id);
+    if (!usage || (!usage.fiveHour && !usage.sevenDay)) continue;
+    if (!freshest || usage.updatedAtMs > freshest.updatedAtMs) freshest = usage;
+  }
+  if (!freshest) return "";
+  return usageText({ ...freshest, model: null, context: null }, nowSeconds);
+}

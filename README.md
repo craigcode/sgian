@@ -177,6 +177,22 @@ A single binary runs in three modes:
 
   A pane bound to a Kranz run needs no relay from Sgian: the run registers
   its own `kranz hook-status` hooks, so both lanes see the same signal.
+- `ctl statusline`: the command Claude Code's status line runs. It reads the
+  status-line payload from stdin after every turn (debounced by Claude Code
+  at 300 ms), records the session's model, context fill and rate-limit
+  windows against the pane that owns the calling process, then prints the
+  line: your own status command's output when one follows `--exec` (fed the
+  same payload), else a compact default like `Opus · 40% context · 5h 23%
+  ↻ 1h10m`. Every client shows the same line beside the pane, amber past
+  80%, and the project heading carries the account's freshest limit line.
+  Push, not poll: no credentials, no scraping. Always exits 0.
+
+  ```json
+  { "statusLine": { "type": "command", "command": "sgian ctl statusline --exec ~/.claude/statusline-command.sh" } }
+  ```
+
+  Drop `--exec …` to use the default line. Rate limits appear
+  only for Pro and Max subscriptions and only after the first turn.
 - `ctl project new|list|show|add|rm|delete|ledger|dossier` for projects: a
   named group of panes serving one goal, persisted with the workspace, with an
   attention roll-up (needs input / working / idle / unattended / keyboard

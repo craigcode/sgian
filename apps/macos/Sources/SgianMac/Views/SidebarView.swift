@@ -33,7 +33,8 @@ struct SidebarView: View {
                             ProjectHeader(
                                 title: group.title,
                                 goal: group.goal,
-                                rollup: model.rollupText(for: group)
+                                rollup: model.rollupText(for: group),
+                                limit: model.limitText(for: group)
                             )
                         }
                     }
@@ -80,7 +81,8 @@ struct SidebarView: View {
             leaseHolder: model.lease(for: pane.id)?.holder,
             ownLease: model.isOwnLease(model.lease(for: pane.id)),
             unattended: model.agentStates[pane.id]?.isUnattended ?? false,
-            outputWarning: model.outputWarning(for: pane.id)
+            outputWarning: model.outputWarning(for: pane.id),
+            usage: model.usage(for: pane.id)
         )
         .tag(pane.id)
         .contextMenu {
@@ -125,6 +127,7 @@ private struct ProjectHeader: View {
     let title: String
     let goal: String?
     let rollup: String
+    var limit: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
@@ -139,9 +142,15 @@ private struct ProjectHeader: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
+            if let limit {
+                Text(limit)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(title). \(rollup)")
+        .accessibilityLabel("\(title). \(rollup)\(limit.map { ". " + $0 } ?? "")")
     }
 }
 
@@ -154,6 +163,7 @@ private struct PaneRow: View {
     var ownLease = false
     var unattended = false
     var outputWarning: OutputTricks? = nil
+    var usage: AgentUsage? = nil
 
     var body: some View {
         HStack(spacing: 9) {
@@ -168,6 +178,13 @@ private struct PaneRow: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                }
+                if let usage {
+                    Text(usage.summary())
+                        .font(.caption2)
+                        .foregroundStyle(usage.isHot ? Color.orange : Color.secondary)
+                        .lineLimit(1)
+                        .help("From the session's status line (sgian ctl statusline)")
                 }
             }
             Spacer(minLength: 4)
