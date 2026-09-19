@@ -47,7 +47,10 @@ credential issued by `ctl identity issue` names the connection, fixes its
 holder and limits it to its scopes (`read`, `write`, `admin`); with one, the
 workspace token may be empty, which is how a client on another machine
 connects over an SSH-forwarded socket. A presented credential is held to: a
-revoked or unknown one is refused even beside a valid workspace token. The hello response carries
+revoked or unknown one is refused even beside a valid workspace token, and
+a revocation cuts a live connection at its next request. Hook and
+status-line reports (`agent_signal`, `agent_status`) are reads for the
+workspace token but need `write` from a credential. The hello response carries
 `identity` (`credential`, `holder`, `scopes`, `root`, `identity_policy`).
 Under `identity: required` the workspace token has `read` and `admin` only.
 A refused request says `read-only credential: '<scope>' scope required for

@@ -3032,7 +3032,11 @@ fn bind_holder(request: DaemonRequest, identity: &ClientIdentity) -> Result<Daem
         format!("holder '{declared}' does not match this credential's holder '{own}'")
     };
     Ok(match request {
-        DaemonRequest::SendInput { pane_id, input } => DaemonRequest::SendInputAs {
+        DaemonRequest::SendInput { pane_id, input }
+        | DaemonRequest::WriteToPane {
+            pane_id,
+            data: input,
+        } => DaemonRequest::SendInputAs {
             pane_id,
             input,
             holder: own.to_string(),
@@ -7928,11 +7932,11 @@ impl AgentUsage {
             model: payload["model"]["display_name"]
                 .as_str()
                 .filter(|text| !text.is_empty())
-                .map(str::to_string),
+                .map(|text| text.chars().take(64).collect()),
             model_id: payload["model"]["id"]
                 .as_str()
                 .filter(|text| !text.is_empty())
-                .map(str::to_string),
+                .map(|text| text.chars().take(128).collect()),
             context_used_percentage: percent(&payload["context_window"]["used_percentage"]),
             context_window_size: payload["context_window"]["context_window_size"].as_u64(),
             five_hour: window(&payload["rate_limits"]["five_hour"]),
@@ -7944,7 +7948,7 @@ impl AgentUsage {
             session_id: payload["session_id"]
                 .as_str()
                 .filter(|text| !text.is_empty())
-                .map(str::to_string),
+                .map(|text| text.chars().take(128).collect()),
             updated_at_ms: 0,
         };
         let empty = usage.model.is_none()
@@ -9684,15 +9688,17 @@ impl DaemonServer {
             "hook",
         );
         if attention == AgentAttention::NeedsInput {
-            let message = message.map(|text| text.chars().take(200).collect::<String>());
+            // Everything ledgered from a hook payload is bounded: the ledger
+            // is append-only and a hook is any process's stdin.
+            let clip = |text: &str, max: usize| text.chars().take(max).collect::<String>();
             let _ = self.ledger_record(
                 &pane_id,
                 "hook.received",
                 json!({
-                    "event": event,
-                    "notification_type": notification_type,
-                    "message": message,
-                    "session_id": session_id,
+                    "event": clip(event, 64),
+                    "notification_type": notification_type.map(|t| clip(t, 64)),
+                    "message": message.map(|t| clip(t, 200)),
+                    "session_id": session_id.map(|t| clip(t, 128)),
                     "attention": attention,
                 }),
             );
@@ -11689,6 +11695,15 @@ impl DaemonServer {
         self.effective_config().identity_effective()
     }
 
+    fn credential_is_active(&self, id: &str) -> bool {
+        self.clients.lock().ok().is_some_and(|clients| {
+            clients
+                .clients
+                .iter()
+                .any(|record| record.id == id && record.revoked_at_ms.is_none())
+        })
+    }
+
     /// Match a presented client token against the issued records (hash
     /// compare, constant time per record) and note the sighting.
     fn identity_for_client_token(&self, presented: &str) -> Option<ClientIdentity> {
@@ -11696,14 +11711,20 @@ impl DaemonServer {
         let mut clients = self.clients.lock().ok()?;
         let now = now_millis();
         let mut found = None;
+        let mut persist = false;
         for record in clients.clients.iter_mut() {
             if record.revoked_at_ms.is_none() && constant_time_eq(&record.token_hash, &hash) {
-                record.last_seen_ms = now;
+                // A status line reports every turn; rewrite the file at most
+                // once a minute per credential.
+                if now.saturating_sub(record.last_seen_ms) >= 60_000 {
+                    record.last_seen_ms = now;
+                    persist = true;
+                }
                 found = Some(ClientIdentity::from_record(record));
                 break;
             }
         }
-        if found.is_some() {
+        if persist {
             let snapshot = clients.clone();
             drop(clients);
             // Best-effort: a failed last-seen write is not an auth failure.
@@ -11828,11 +11849,33 @@ impl DaemonServer {
         peer: Option<&TransportStream>,
         identity: &ClientIdentity,
     ) -> Result<Value, String> {
+        // Revocation takes effect on the next request, not the next hello: a
+        // long-lived framed connection from a revoked credential stops here.
+        if let Some(id) = identity.credential.as_deref() {
+            if !self.credential_is_active(id) {
+                return Err("client credential revoked".to_string());
+            }
+        }
         let needed = request_scope(&request);
         if !identity.has(needed) {
             return Err(format!(
                 "read-only credential: '{}' scope required for {}",
                 needed.name(),
+                request_name(&request)
+            ));
+        }
+        // Hook and status-line reports are reads for the root token (the
+        // session's own hooks run with it) but a read-only credential must
+        // not set badges or write `hook.received` records on panes it can
+        // only watch.
+        if matches!(
+            request,
+            DaemonRequest::AgentSignal { .. } | DaemonRequest::AgentStatus { .. }
+        ) && identity.credential.is_some()
+            && !identity.has(ClientScope::Write)
+        {
+            return Err(format!(
+                "read-only credential: 'write' scope required for {}",
                 request_name(&request)
             ));
         }
@@ -15951,6 +15994,10 @@ fn workspace_cwd_for_key(key: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The most `ctl hook` / `ctl statusline` read from stdin: a Claude Code
+/// payload is a few KiB; anything past this is not one.
+const CTL_STDIN_PAYLOAD_MAX: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct HookArgs {
     event: Option<String>,
@@ -16112,7 +16159,9 @@ fn control_statusline(
     json_output: bool,
 ) -> Result<(), String> {
     let mut raw = String::new();
-    let _ = std::io::stdin().read_to_string(&mut raw);
+    let _ = std::io::stdin()
+        .take(CTL_STDIN_PAYLOAD_MAX)
+        .read_to_string(&mut raw);
     let payload: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
     let answer = if payload.is_object() {
         report_status_payload(
@@ -16202,7 +16251,9 @@ fn hook_request(
 fn control_hook(workspace: PathBuf, parsed: HookArgs, json_output: bool) -> Result<(), String> {
     let payload: HookPayload = if parsed.read_stdin {
         let mut raw = String::new();
-        let _ = std::io::stdin().read_to_string(&mut raw);
+        let _ = std::io::stdin()
+            .take(CTL_STDIN_PAYLOAD_MAX)
+            .read_to_string(&mut raw);
         if raw.trim().is_empty() {
             HookPayload::default()
         } else {
@@ -20954,8 +21005,8 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   fixed to NAME and --as anything else is refused.
                                   Default scope: read. Config `identity: required`
                                   makes every write need a credential.
-  identity revoke <ID>          Revoke a credential (its connections end at the
-                                  next hello)
+  identity revoke <ID>          Revoke a credential (its connections are cut at
+                                  their next request)
   whoami                        This connection's credential, holder, scopes
                                   and the daemon's identity policy
   lease [PANE]                  Show who holds a pane's keyboard (alias: lease status)
@@ -38936,6 +38987,41 @@ exit 0
         assert_eq!(lease_records[0]["payload"]["credential"], laptop["id"]);
         assert_eq!(lease_records[1]["payload"]["credential"], laptop["id"]);
 
+        // A read-only credential cannot set badges through the hook or
+        // status-line reports either; a write credential can.
+        let badge = viewer_conn
+            .request(&DaemonRequest::AgentSignal {
+                pid: 1,
+                event: "Stop".into(),
+                notification_type: None,
+                message: None,
+                session_id: None,
+            })
+            .expect("refusal is a response");
+        assert!(
+            badge
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("'write' scope required for agent_signal"),
+            "{badge:?}"
+        );
+        let report = laptop_conn
+            .request(&DaemonRequest::AgentStatus {
+                pid: 1,
+                payload: json!({ "model": { "display_name": "Opus" } }),
+            })
+            .expect("write credential may report");
+        assert!(report.ok, "{report:?}");
+        // The legacy unattributed write is bound to the credential too.
+        let legacy = laptop_conn
+            .request(&DaemonRequest::WriteToPane {
+                pane_id: pane_id.clone(),
+                data: "".into(),
+            })
+            .expect("legacy write");
+        assert!(legacy.ok, "{legacy:?}");
+
         // Write is not admin: a credential cannot mint credentials.
         let mint = laptop_conn
             .request(&DaemonRequest::IdentityIssue {
@@ -38956,6 +39042,15 @@ exit 0
                 id: viewer["id"].as_str().unwrap().into(),
             })
             .expect("revoke");
+        // The viewer's live connection is cut on its next request, not only
+        // at its next hello.
+        let after_revoke = viewer_conn
+            .request(&DaemonRequest::ListPanes)
+            .expect("refusal is a response");
+        assert_eq!(
+            after_revoke.error.as_deref(),
+            Some("client credential revoked")
+        );
         assert!(connect_with_client_token(&daemon, &viewer_token).is_err());
         assert!(connect_with_client_token(&daemon, "sgc_nope").is_err());
         let stream = transport_connect(&daemon.socket_path).expect("connect");
