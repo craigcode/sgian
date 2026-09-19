@@ -7,6 +7,12 @@ follow SemVer once the first public tag exists.
 
 ### Added
 
+- Trust-surface review before launch (`docs/trust-surface-review-2026-09-19.md`):
+  hook and status-line reports need `write` from a credential, revocation
+  cuts a live connection at its next request, the legacy `write_to_pane`
+  request is bound to the credential's holder, ledgered hook strings and
+  status-line names are bounded, `ctl hook`/`ctl statusline` cap stdin at
+  1 MiB, and `clients.json` is rewritten at most once a minute.
 - Per-client identity: `ctl identity issue|list|revoke` and `ctl whoami`;
   credentials carry `read`/`write`/`admin` scopes and fix the holder the
   daemon attributes input and leases to (`credential` on lease ledger

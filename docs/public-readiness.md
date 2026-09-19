@@ -15,6 +15,9 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
 
 - [x] `LICENSE` (MIT), `SECURITY.md` with the security model and private
       reporting, `README.md` leading with the claim and the control plane.
+- [x] Trust-surface review of the credential hello, hook and status-line
+      inputs and the dossier (`docs/trust-surface-review-2026-09-19.md`);
+      six findings fixed, six risks recorded as accepted with reasons.
 - [x] `scripts/audit-public-history.sh` passes from a full clone with every
       branch and tag (`git fetch --all --tags`), with gitleaks installed.
       CI runs the same scan over every fetched ref, so a hit on any pushed
