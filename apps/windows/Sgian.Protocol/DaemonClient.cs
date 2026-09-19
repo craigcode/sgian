@@ -10,16 +10,32 @@ public sealed class DaemonClient : IAsyncDisposable
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
     private readonly NativeIpcEndpoint _endpoint;
     private readonly string _token;
+    private readonly string? _clientToken;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
     private CancellationTokenSource? _subscriptionCancellation;
 
-    private DaemonClient(NativeIpcEndpoint endpoint, string token)
+    private DaemonClient(NativeIpcEndpoint endpoint, string token, string? clientToken)
     {
         _endpoint = endpoint;
         _token = token;
+        _clientToken = clientToken;
     }
 
     public NativeIpcEndpoint Endpoint => _endpoint;
+
+    /// <summary>The holder the daemon bound this client to (from the hello's identity), or null for the workspace token.</summary>
+    public string? IdentityHolder { get; private set; }
+
+    /// <summary>(M6) The per-client credential this process presents, if any: SGIAN_CLIENT_TOKEN, else the first line of SGIAN_CLIENT_TOKEN_FILE.</summary>
+    public static string? ClientTokenFromEnvironment()
+    {
+        var token = Environment.GetEnvironmentVariable("SGIAN_CLIENT_TOKEN")?.Trim();
+        if (!string.IsNullOrEmpty(token)) return token;
+        var path = Environment.GetEnvironmentVariable("SGIAN_CLIENT_TOKEN_FILE");
+        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+        var first = File.ReadLines(path).FirstOrDefault()?.Trim();
+        return string.IsNullOrEmpty(first) ? null : first;
+    }
 
     public static async Task<DaemonClient> ConnectAsync(
         string workspace,
@@ -33,14 +49,17 @@ public sealed class DaemonClient : IAsyncDisposable
             cancellationToken,
             onProgress).ConfigureAwait(false);
         onProgress?.Invoke("Reading daemon authentication token");
-        var token = (await File.ReadAllTextAsync(endpoint.TokenPath, cancellationToken)
-            .ConfigureAwait(false)).Trim();
-        if (token.Length == 0)
+        var clientToken = ClientTokenFromEnvironment();
+        var token = File.Exists(endpoint.TokenPath)
+            ? (await File.ReadAllTextAsync(endpoint.TokenPath, cancellationToken).ConfigureAwait(false)).Trim()
+            : "";
+        // A remote client has no workspace token file; its credential rides the hello instead.
+        if (token.Length == 0 && clientToken is null)
         {
             throw new DaemonProtocolException($"Daemon token is empty at {endpoint.TokenPath}.");
         }
 
-        var client = new DaemonClient(endpoint, token);
+        var client = new DaemonClient(endpoint, token, clientToken);
         onProgress?.Invoke("Sending initial daemon ping");
         var ping = await client.RequestAsync<CommandOk>(new Dictionary<string, object?>
         {
@@ -171,13 +190,15 @@ public sealed class DaemonClient : IAsyncDisposable
                 AutoFlush = true,
                 NewLine = "\n",
             };
-            await WriteLineAsync(writer, new Dictionary<string, object?>
+            var hello = new Dictionary<string, object?>
             {
                 ["type"] = "hello",
                 ["version"] = 1,
                 ["token"] = _token,
                 ["capabilities"] = new[] { "subscribe-ack" },
-            }, timeout.Token).ConfigureAwait(false);
+            };
+            if (_clientToken is not null) hello["client_token"] = _clientToken;
+            await WriteLineAsync(writer, hello, timeout.Token).ConfigureAwait(false);
             onProgress?.Invoke("Daemon hello written; waiting for authentication response");
             var line = await ReadLineAsync(reader, timeout.Token).ConfigureAwait(false);
             onProgress?.Invoke("Daemon authentication response received");
@@ -187,6 +208,13 @@ public sealed class DaemonClient : IAsyncDisposable
             {
                 throw new DaemonProtocolException(
                     $"Daemon authentication failed: {response.Error ?? "rejected"}");
+            }
+            if (response.Result.TryGetProperty("identity", out var identity) &&
+                identity.ValueKind == JsonValueKind.Object &&
+                identity.TryGetProperty("holder", out var boundHolder) &&
+                boundHolder.ValueKind == JsonValueKind.String)
+            {
+                IdentityHolder = boundHolder.GetString();
             }
             var supportsAck = response.Result.TryGetProperty("capabilities", out var capabilities) &&
                 capabilities.ValueKind == JsonValueKind.Array &&

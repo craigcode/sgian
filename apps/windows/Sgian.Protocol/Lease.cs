@@ -74,7 +74,9 @@ public static class LeaseState
         return paneId;
     }
 
-    public static bool IsRefusal(string message) => message.Contains("pane keyboard is", StringComparison.Ordinal);
+    public static bool IsRefusal(string message) =>
+        message.Contains("pane keyboard is", StringComparison.Ordinal)
+        || message.Contains("read-only credential", StringComparison.Ordinal);
 
     public static bool NeedsForce(string message) => message.Contains("--force", StringComparison.Ordinal);
 
@@ -83,6 +85,10 @@ public static class LeaseState
 
     public static string NoticeText(string refusal)
     {
+        if (refusal.Contains("read-only credential", StringComparison.Ordinal))
+        {
+            return "Read-only: this credential cannot type (no write scope).";
+        }
         const string marker = "held by ";
         var index = refusal.IndexOf(marker, StringComparison.Ordinal);
         if (index >= 0)

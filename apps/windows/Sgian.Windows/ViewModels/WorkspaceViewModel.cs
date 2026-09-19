@@ -35,7 +35,8 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     /// </summary>
     private bool _daemonSupportsLeases = true;
     /// <summary>The holder label this client writes and takes leases as (docs/design/keyboard-lease-and-ledger.md).</summary>
-    public string Holder { get; } = LeaseState.DefaultHolder();
+    /// <summary>The credential's holder once connected with one, else <c>$SGIAN_HOLDER</c>/user@host.</summary>
+    public string Holder { get; private set; } = LeaseState.DefaultHolder();
     public PaneLayout? Layout { get; private set; }
     public bool Zoomed { get; private set; }
     public string PermissionMode { get; private set; } = "manual";
@@ -186,6 +187,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                 return;
             }
             _client = client;
+            Holder = client.IdentityHolder ?? LeaseState.DefaultHolder();
             App.TraceSmoke("Daemon client connected; requesting workspace bootstrap");
             var snapshot = await BootstrapAsync(client, token);
             if (_generation != generation) return;

@@ -193,6 +193,19 @@ A single binary runs in three modes:
 
   Drop `--exec …` to use the default line. Rate limits appear
   only for Pro and Max subscriptions and only after the first turn.
+- `ctl identity issue|list|revoke` and `ctl whoami`: per-client credentials
+  (docs/design/client-identity.md). A credential fixes the holder the daemon
+  attributes every keystroke and lease to, carries scopes (`read`, `write`,
+  `admin`; default `read`), and is the credential a second machine presents
+  over an SSH-forwarded socket. Set `identity: required` in the config and
+  the workspace token can only read and administer: every write then needs
+  a credential, so the ledger's "who" is evidence, not a claim.
+
+  ```bash
+  sgian ctl identity issue --holder craig@laptop --scope write   # prints the token once
+  ssh -N -L /tmp/sgian.sock:$(sgian ctl --json ipc-endpoint | jq -r .endpoint) desk   # on the laptop
+  SGIAN_CLIENT_TOKEN=sgc_… sgian ctl whoami
+  ```
 - `ctl project new|list|show|add|rm|delete|ledger|dossier` for projects: a
   named group of panes serving one goal, persisted with the workspace, with an
   attention roll-up (needs input / working / idle / unattended / keyboard

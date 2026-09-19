@@ -1,6 +1,13 @@
 # Per-client identity and a read-mostly remote view (M6)
 
-Status: proposal, 2026-09-18. One page. The owner picks; then it gets built.
+Status: decided and built, 2026-09-18 (decisions: bearer tokens, `open` by
+default, Kranz runs are their own holders with no impersonation, remote is an
+SSH-forwarded socket). Shipped: `ctl identity issue|list|revoke`, `ctl
+whoami`, `client_token` on the hello, scopes `read`/`write`/`admin`, holder
+bound to the credential (`--as` anything else refused; unattributed input
+becomes attributed), `credential` on lease ledger records, a peer-uid check
+on the Unix socket, `identity: open | required`. Not built, by decision: an
+`impersonate` scope. The text below is the proposal as written.
 
 ## What is wrong today
 
