@@ -262,6 +262,12 @@ A single binary runs in three modes:
   A final job verifies updater signatures against the embedded public key,
   assembles all platforms and the update feed, uploads to a draft, then publishes.
 
+### Daemon layout
+
+`src-tauri/src` is split by concern; `docs/daemon-modules.md` maps each file
+to what lives in it and says where a new request, scope, handler, ctl verb
+and test go.
+
 ### Frontend
 
 The frontend is a React view over an explicit application controller. React owns
