@@ -2025,6 +2025,21 @@ mod ledger;
 use ledger::*;
 mod probe;
 use probe::*;
+/// The v2 length-prefixed framed wire envelope (architecture.md §5.1):
+/// `MAGIC b"SGN2" | u16-BE wire version | u32-BE payload length | JSON payload`.
+///
+/// The JSON payload is the existing `DaemonRequest`/`IpcResponse`/`DaemonEvent`
+/// serde representation, byte-for-byte unchanged from the v1 newline path
+/// (`read_ipc_line`/`write_json_line`); only the envelope differs. `LENGTH` is
+/// bounded by `MAX_FRAME_BYTES` on both encode and decode, and any malformed,
+/// oversized, truncated, or unsupported-version frame is a clean bounded error:
+/// it never panics, blocks unboundedly on a closed peer, or allocates the
+/// declared size before validating it.
+///
+/// These are the foundation of the v2 protocol. The capability handshake wires
+/// `read`/`write` into the live connection path (a v2-negotiated connection serves
+/// a framed request/response via `serve_framed_request`); the persistent
+/// multi-request loop + framed event streaming extend that path next.
 mod frame;
 mod router;
 use router::*;
