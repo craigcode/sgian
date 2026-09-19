@@ -7,7 +7,15 @@ not an isolation boundary against another process running as the same user.
 
 The daemon listens on a local Unix socket or an owner-restricted Windows named
 pipe; it does not expose a TCP service. Clients must authenticate before any
-command is dispatched. On Unix, runtime and data directories are owner-only.
+command is dispatched. On Unix, runtime and data directories are owner-only
+and a connection from another uid is dropped before the hello. Beyond the
+workspace token, the daemon issues per-client credentials (`ctl identity`)
+with `read`, `write` and `admin` scopes; a credential's holder is fixed by the
+daemon, so lease and refusal records attribute actions to a credential rather
+than a self-declared name. Only credential hashes are stored. With
+`identity: required`, the workspace token can read and administer but every
+write needs a credential. Remote access is an SSH-forwarded socket presenting
+a credential; the daemon never listens on the network.
 Tokens, configuration, conversation logs, and scrollback are stored in the
 user's platform application-data directory. Conversation logs and terminal
 scrollback may contain sensitive information; do not include them in public

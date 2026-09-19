@@ -260,9 +260,9 @@ This is the milestone that makes Windows and WorkSpaces operators
 first-class and it is the one with real network risk; fuzz whatever framing
 is hand-rolled.
 
-**M6 — per-client identity (proposal: `client-identity.md`).** Per-client
-tokens or a signed hello so the lease becomes a boundary rather than a
-convention. This is also what makes
+**M6 — per-client identity (shipped 2026-09-18; `client-identity.md`).**
+Per-client bearer tokens with scopes so the lease becomes a boundary rather
+than a convention; `identity: required` makes every write need one. This is also what makes
 "agent tried to type while a human held the pane" a refusal the ledger can
 attribute honestly.
 
@@ -333,4 +333,5 @@ Ranked by leverage against effort. None are committed beyond M1.
   so a takeover cannot leave an agent running blind after the pane is gone.
 - Keystrokes are never recorded; the ledger stores counts and timestamps.
 - Ledger and scrollback files are owner-only (0600 / current-user ACL).
-- The lease is coordination until M6 lands. Say so in the README.
+- The lease is coordination under `identity: open` and a boundary under
+  `identity: required` (M6). Say so in the README.

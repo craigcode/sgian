@@ -195,6 +195,8 @@ static void KeyboardLease()
     Equal(true, LeaseState.NoticeText("pane keyboard is unheld and lease_policy is required; take it first (pane-2)").Contains("take the keyboard"));
     Equal(true, LeaseState.NeedsForce("pane keyboard is held by bob; use --force --why REASON to revoke it"));
     Equal(true, LeaseState.IsRefusal("pane keyboard is held by bob (pane-2)"));
+    Equal(true, LeaseState.IsRefusal("read-only credential: 'write' scope required for send_input"));
+    Equal("Read-only: this credential cannot type (no write scope).", LeaseState.NoticeText("read-only credential: 'write' scope required for send_input"));
     Equal(false, LeaseState.IsRefusal("terminal session ended: pane-2"));
 }
 

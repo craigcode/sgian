@@ -172,6 +172,14 @@ Shipped (2026-09-16):
   `output_warning` event, in `find --json` and `ctl agent`
   (`HIDDEN-OUTPUT …`), and in the bootstrap snapshot's `output_warnings`.
 
+- **Per-client identity (M6).** `ctl identity issue|list|revoke` mints
+  bearer credentials with `read`/`write`/`admin` scopes; a credential fixes
+  its holder (the daemon rewrites unattributed input to it and refuses any
+  other `--as`), rides the hello as `client_token`, and lands as
+  `credential` on lease ledger records. `identity: required` turns the
+  workspace token into read+admin so every write is attributed. Peer-uid
+  check on the socket. Remote is an SSH-forwarded socket, never a listener.
+  Kranz runs are their own holders; there is no impersonate scope.
 - **Usage from the status line.** `ctl statusline` is the command Claude
   Code's status line runs: it records the session's model, context fill and
   rate-limit windows against the pane that owns the calling process (same
@@ -206,8 +214,8 @@ Open, in order:
   (the Tauri client has both: `⚠ N` badge, overview grouped by project with
   the roll-up); stripping for agent panes; per-project shared context notes
   under git.
-- **M4 Kranz target**, **M5 SSM / ECS Exec target**, **M6 per-client
-  identity** (the lease becomes a boundary).
+- **M5 SSM / ECS Exec target**; **M7 a served read-mostly UI** over the
+  SSH tunnel for a phone (M6 identity is in place for it).
 
 ## 4. Workbench UX
 

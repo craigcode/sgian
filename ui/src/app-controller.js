@@ -1062,6 +1062,9 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
   }
 
   function leaseToastText(message) {
+    if (message.includes("read-only credential")) {
+      return "Read-only: this credential cannot type (no write scope).";
+    }
     const held = /held by ([^\s(]+)/.exec(message);
     if (held) return `Read-only: keyboard held by ${held[1]}. Ctrl/Cmd+Shift+T to take it.`;
     if (message.includes("unheld")) {
@@ -1232,7 +1235,7 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
       }
       // A lease refusal is a per-keystroke event: a toast, never a line in
       // the terminal (docs/design/keyboard-lease-and-ledger.md §6 M2).
-      if (message.includes("pane keyboard is")) {
+      if (message.includes("pane keyboard is") || message.includes("read-only credential")) {
         showLeaseToast(paneId, message);
         return;
       }

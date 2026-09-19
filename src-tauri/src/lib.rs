@@ -51,6 +51,9 @@ const SCROLLBACK_DIR: &str = "scrollback";
 const RUNTIME_DIR: &str = "runtime";
 const SOCKET_FILE: &str = "daemon.sock";
 const TOKEN_FILE: &str = "daemon.token";
+/// Per-client credentials (docs/design/client-identity.md): beside the
+/// workspace token, owner-only, token hashes only.
+const CLIENTS_FILE: &str = "clients.json";
 const LOG_FILE: &str = "daemon.log";
 /// Early daemon-launch diagnostics written before structured logging exists.
 /// The GUI reads this file when a freshly-spawned daemon exits or never binds,
@@ -1785,6 +1788,13 @@ struct Config {
     /// and then `kranz` on PATH.
     #[serde(default)]
     kranz_bin: Option<String>,
+    /// (M6) Client identity policy (docs/design/client-identity.md). `open`
+    /// (default): the workspace token is a full credential, as before.
+    /// `required`: the workspace token can read and administer identities but
+    /// every write needs a per-client credential, so each keystroke and lease
+    /// is attributed to one. An unrecognized value is rejected by `validate`.
+    #[serde(default)]
+    identity: Option<String>,
     /// (T2) Permission mode for agent-pane `claude` processes, passed to
     /// `--permission-mode`. Defaults to `manual`: every tool use that needs
     /// approval arrives as a `permission_request` agent event and blocks until
@@ -1874,6 +1884,7 @@ impl Config {
                 .agent_probe_interval_ms
                 .or(self.agent_probe_interval_ms),
             kranz_bin: other.kranz_bin.or(self.kranz_bin),
+            identity: other.identity.or(self.identity),
             agent_permission_mode: other.agent_permission_mode.or(self.agent_permission_mode),
             agent_claude_bin: other.agent_claude_bin.or(self.agent_claude_bin),
             agent_droid_bin: other.agent_droid_bin.or(self.agent_droid_bin),
@@ -1922,6 +1933,15 @@ impl Config {
             .as_deref()
             .and_then(LeasePolicy::parse)
             .unwrap_or(LeasePolicy::Open)
+    }
+
+    /// (M6) Effective identity policy; unset or unparseable falls back to
+    /// `open` so a stale config can never lock the operator out.
+    fn identity_effective(&self) -> IdentityPolicy {
+        self.identity
+            .as_deref()
+            .and_then(IdentityPolicy::parse)
+            .unwrap_or(IdentityPolicy::Open)
     }
 
     /// (M4) The `kranz` binary: config, then `SGIAN_KRANZ_BIN`, then PATH.
@@ -1991,6 +2011,13 @@ impl Config {
             if LeasePolicy::parse(policy).is_none() {
                 return Err(format!(
                     "invalid lease_policy '{policy}': must be 'open' or 'required'"
+                ));
+            }
+        }
+        if let Some(ref policy) = self.identity {
+            if IdentityPolicy::parse(policy).is_none() {
+                return Err(format!(
+                    "invalid identity '{policy}': must be 'open' or 'required'"
                 ));
             }
         }
@@ -2359,6 +2386,18 @@ enum DaemonRequest {
         #[serde(default)]
         lines: usize,
     },
+    /// (M6) Issue a per-client credential: the token is returned once.
+    IdentityIssue {
+        holder: String,
+        #[serde(default)]
+        scopes: Vec<String>,
+    },
+    IdentityList,
+    IdentityRevoke {
+        id: String,
+    },
+    /// Who this connection is: credential, holder, scopes, policy.
+    Whoami,
     /// Claude Code's status-line payload from a session inside some pane
     /// (`ctl statusline`): `pid` is the status-line process, `payload` the
     /// JSON Claude Code wrote to it. Never an error when nothing matches.
@@ -2775,6 +2814,257 @@ struct IpcHello {
     /// daemon today — the daemon advertises its own capabilities in the response).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     capabilities: Option<Vec<String>>,
+    /// (M6) A per-client credential issued by `ctl identity issue`
+    /// (docs/design/client-identity.md). Additive: an old daemon ignores it
+    /// and authenticates on `token` alone; a client that presents one may
+    /// leave `token` empty. A presented credential must be valid: a revoked
+    /// or unknown one is refused even beside a valid workspace token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_token: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// (M6) Per-client identity: docs/design/client-identity.md.
+// ---------------------------------------------------------------------------
+
+/// What a credential may do. `read`: snapshot, subscribe, search, dossier,
+/// hook and status-line reports. `write`: input, leases, pane lifecycle,
+/// projects. `admin`: identities, config, shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ClientScope {
+    Read,
+    Write,
+    Admin,
+}
+
+impl ClientScope {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "read" => Some(Self::Read),
+            "write" => Some(Self::Write),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityPolicy {
+    Open,
+    Required,
+}
+
+impl IdentityPolicy {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "open" => Some(Self::Open),
+            "required" => Some(Self::Required),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Required => "required",
+        }
+    }
+}
+
+/// One issued credential. The token itself is shown once at issue time and
+/// only its hash is kept.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ClientRecord {
+    id: String,
+    holder: String,
+    scopes: Vec<ClientScope>,
+    token_hash: String,
+    created_at_ms: u64,
+    #[serde(default)]
+    last_seen_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revoked_at_ms: Option<u64>,
+}
+
+impl ClientRecord {
+    /// The listing shape: everything but the hash.
+    fn public(&self) -> Value {
+        json!({
+            "id": self.id,
+            "holder": self.holder,
+            "scopes": self.scopes,
+            "created_at_ms": self.created_at_ms,
+            "last_seen_ms": self.last_seen_ms,
+            "revoked_at_ms": self.revoked_at_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct ClientsFile {
+    #[serde(default)]
+    clients: Vec<ClientRecord>,
+}
+
+const CLIENT_TOKEN_PREFIX: &str = "sgc_";
+const CLIENT_TOKEN_HASH_PREFIX: &str = "sgian.client.v1\n";
+const MAX_CLIENT_RECORDS: usize = 256;
+
+fn client_token_hash(token: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(CLIENT_TOKEN_HASH_PREFIX.as_bytes());
+    hasher.update(token.as_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+/// Who a connection is (docs/design/client-identity.md). `credential` and
+/// `holder` are `None` for the workspace token (the root credential): its
+/// holder stays self-declared, as before M6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientIdentity {
+    credential: Option<String>,
+    holder: Option<String>,
+    scopes: Vec<ClientScope>,
+}
+
+impl ClientIdentity {
+    /// The workspace token: everything under `open`; read and admin (no
+    /// writes) under `required`, so every keystroke needs a credential.
+    fn root(policy: IdentityPolicy) -> Self {
+        let scopes = match policy {
+            IdentityPolicy::Open => vec![ClientScope::Read, ClientScope::Write, ClientScope::Admin],
+            IdentityPolicy::Required => vec![ClientScope::Read, ClientScope::Admin],
+        };
+        Self {
+            credential: None,
+            holder: None,
+            scopes,
+        }
+    }
+
+    fn from_record(record: &ClientRecord) -> Self {
+        let mut scopes = record.scopes.clone();
+        if !scopes.contains(&ClientScope::Read) {
+            scopes.push(ClientScope::Read);
+        }
+        Self {
+            credential: Some(record.id.clone()),
+            holder: Some(record.holder.clone()),
+            scopes,
+        }
+    }
+
+    fn has(&self, scope: ClientScope) -> bool {
+        self.scopes.contains(&scope)
+    }
+
+    fn describe(&self, policy: IdentityPolicy) -> Value {
+        json!({
+            "credential": self.credential,
+            "holder": self.holder,
+            "scopes": self.scopes,
+            "root": self.credential.is_none(),
+            "identity_policy": policy.name(),
+        })
+    }
+}
+
+/// The scope a request needs. Reads include the hook and status-line
+/// reports (observations, not keystrokes). Anything not listed is a write.
+fn request_scope(request: &DaemonRequest) -> ClientScope {
+    match request {
+        DaemonRequest::Ping
+        | DaemonRequest::BootstrapWorkspace
+        | DaemonRequest::ListPanes
+        | DaemonRequest::PaneStatus { .. }
+        | DaemonRequest::LeaseStatus { .. }
+        | DaemonRequest::KranzBindings
+        | DaemonRequest::ProjectList
+        | DaemonRequest::ProjectShow { .. }
+        | DaemonRequest::ProjectLedger { .. }
+        | DaemonRequest::ProjectDossier { .. }
+        | DaemonRequest::AgentStatus { .. }
+        | DaemonRequest::AgentSignal { .. }
+        | DaemonRequest::GetScrollback { .. }
+        | DaemonRequest::SearchScrollback { .. }
+        | DaemonRequest::ScrollbackLines { .. }
+        | DaemonRequest::GetConfig
+        | DaemonRequest::StatusVerbose
+        | DaemonRequest::Wait { .. }
+        | DaemonRequest::Snapshot { .. }
+        | DaemonRequest::Find { .. }
+        | DaemonRequest::Subscribe
+        | DaemonRequest::Whoami => ClientScope::Read,
+        DaemonRequest::WriteConfig { .. }
+        | DaemonRequest::Shutdown
+        | DaemonRequest::IdentityIssue { .. }
+        | DaemonRequest::IdentityList
+        | DaemonRequest::IdentityRevoke { .. } => ClientScope::Admin,
+        _ => ClientScope::Write,
+    }
+}
+
+fn request_name(request: &DaemonRequest) -> String {
+    serde_json::to_value(request)
+        .ok()
+        .and_then(|value| value["command"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "request".to_string())
+}
+
+/// Bind a credentialed connection's writes to its holder: unattributed input
+/// becomes attributed input, a declared holder must match, and broadcast (no
+/// holder) is refused. The root credential passes through unchanged.
+fn bind_holder(request: DaemonRequest, identity: &ClientIdentity) -> Result<DaemonRequest, String> {
+    let Some(own) = identity.holder.as_deref() else {
+        return Ok(request);
+    };
+    let mismatch = |declared: &str| {
+        format!("holder '{declared}' does not match this credential's holder '{own}'")
+    };
+    Ok(match request {
+        DaemonRequest::SendInput { pane_id, input } => DaemonRequest::SendInputAs {
+            pane_id,
+            input,
+            holder: own.to_string(),
+            generation: None,
+        },
+        DaemonRequest::SendInputAs { ref holder, .. }
+        | DaemonRequest::TakeLease { ref holder, .. }
+        | DaemonRequest::ReleaseLease { ref holder, .. }
+            if holder != own =>
+        {
+            return Err(mismatch(holder));
+        }
+        DaemonRequest::Broadcast { .. } => {
+            return Err(
+                "broadcast has no holder; a credentialed client sends per pane".to_string(),
+            );
+        }
+        other => other,
+    })
+}
+
+/// The per-client token this process presents, if any: `SGIAN_CLIENT_TOKEN`,
+/// else the first line of the file named by `SGIAN_CLIENT_TOKEN_FILE`.
+fn client_token_from_env() -> Option<String> {
+    if let Ok(token) = std::env::var("SGIAN_CLIENT_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+    let path = std::env::var_os("SGIAN_CLIENT_TOKEN_FILE")?;
+    read_token(Path::new(&path)).ok().flatten()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7290,7 +7580,13 @@ impl DaemonClient {
         // tampering) is refused with a clear error rather than silently serving
         // another workspace's data.
         check_persisted_cwd(&cwd, &data_dir)?;
-        let token = read_token(&data_dir.join(TOKEN_FILE))?.ok_or_else(|| no_daemon_error(&cwd))?;
+        // (M6) A remote client has no workspace token file; its per-client
+        // credential rides the hello instead and the daemon decides.
+        let token = match read_token(&data_dir.join(TOKEN_FILE))? {
+            Some(token) => token,
+            None if client_token_from_env().is_some() => String::new(),
+            None => return Err(no_daemon_error(&cwd)),
+        };
 
         let client = Self {
             cwd,
@@ -7299,9 +7595,15 @@ impl DaemonClient {
             token,
             auto_spawn: false,
         };
-        client
-            .raw_request(DaemonRequest::Ping)
-            .map_err(|_| no_daemon_error(&client.cwd))?;
+        client.raw_request(DaemonRequest::Ping).map_err(|error| {
+            // (M6) A presented credential that the daemon refused is not a
+            // missing daemon; say which it was.
+            if client_token_from_env().is_some() && error.contains("authentication") {
+                format!("client credential refused: {error}")
+            } else {
+                no_daemon_error(&client.cwd)
+            }
+        })?;
         Ok(client)
     }
 
@@ -8788,6 +9090,9 @@ struct DaemonServer {
     /// Per-pane usage from status-line payloads (`ctl statusline`). Not
     /// persisted: a fresh daemon waits for the next turn. Leaf lock.
     agent_usage: Mutex<HashMap<String, AgentUsage>>,
+    /// (M6) Issued client credentials, mirrored to `clients.json`. Leaf lock.
+    clients: Mutex<ClientsFile>,
+    clients_path: PathBuf,
     /// The next lease generation (see `HeldLease::generation`); seeded above
     /// every persisted lease so numbers never repeat across restarts.
     next_lease_generation: AtomicU64,
@@ -8831,6 +9136,8 @@ impl DaemonServer {
         ensure_private_dir(&ledger_dir)?;
         let ledger = Arc::new(Mutex::new(LedgerSink::new(ledger_dir)));
         let token = load_or_create_token(&data_dir)?;
+        let clients_path = data_dir.join(CLIENTS_FILE);
+        let clients = load_clients_file(&clients_path);
 
         let persist_path = data_dir.join(WORKSPACE_FILE);
         let loaded = load_workspace(&persist_path, cwd.display().to_string());
@@ -9023,6 +9330,8 @@ impl DaemonServer {
             probe_mapped: Mutex::new(HashMap::new()),
             kranz_bindings: Mutex::new(HashMap::new()),
             agent_usage: Mutex::new(HashMap::new()),
+            clients: Mutex::new(clients),
+            clients_path,
             // Members that no longer exist are dropped on load, like leases.
             projects: Mutex::new(
                 projects
@@ -9965,13 +10274,22 @@ impl DaemonServer {
                 holder,
                 force,
                 why,
-            } => self.handle_take_lease(&pane_id, &holder, force, why.as_deref()),
+            } => self.handle_take_lease(&pane_id, &holder, force, why.as_deref(), None),
             DaemonRequest::ReleaseLease {
                 pane_id,
                 holder,
                 note,
                 generation,
-            } => self.handle_release_lease(&pane_id, &holder, &note, generation),
+            } => self.handle_release_lease(&pane_id, &holder, &note, generation, None),
+            DaemonRequest::IdentityIssue { holder, scopes } => {
+                self.handle_identity_issue(&holder, &scopes)
+            }
+            DaemonRequest::IdentityList => self.handle_identity_list(),
+            DaemonRequest::IdentityRevoke { id } => self.handle_identity_revoke(&id),
+            DaemonRequest::Whoami => {
+                let policy = self.identity_policy();
+                Ok(ClientIdentity::root(policy).describe(policy))
+            }
             DaemonRequest::KranzBind { pane_id, repo } => self.handle_kranz_bind(&pane_id, repo),
             DaemonRequest::KranzUnbind { pane_id } => self.handle_kranz_unbind(&pane_id),
             DaemonRequest::KranzBindings => Ok(json!(self.kranz_bindings_snapshot())),
@@ -10899,6 +11217,7 @@ impl DaemonServer {
         holder: &str,
         force: bool,
         why: Option<&str>,
+        credential: Option<&str>,
     ) -> Result<Value, String> {
         self.ensure_pane_exists(pane_id)?;
         let holder = validate_holder(holder)?;
@@ -10934,6 +11253,7 @@ impl DaemonServer {
                 json!({
                     "holder": revoked,
                     "by": holder,
+                    "credential": credential,
                     "why": why,
                     "held_ms": now.saturating_sub(prior.since_ms),
                     "writes": prior.writes,
@@ -10947,6 +11267,7 @@ impl DaemonServer {
             "lease.taken",
             json!({
                 "holder": holder,
+                "credential": credential,
                 "force": force,
                 "why": why,
                 "previous_holder": previous.as_ref().map(|prior| prior.holder.clone()),
@@ -11009,6 +11330,7 @@ impl DaemonServer {
         holder: &str,
         note: &str,
         generation: Option<u64>,
+        credential: Option<&str>,
     ) -> Result<Value, String> {
         self.ensure_pane_exists(pane_id)?;
         let holder = validate_holder(holder)?;
@@ -11027,6 +11349,7 @@ impl DaemonServer {
             "lease.released",
             json!({
                 "holder": holder,
+                "credential": credential,
                 "note": note,
                 "held_ms": now.saturating_sub(released.since_ms),
                 "writes": released.writes,
@@ -11337,15 +11660,211 @@ impl DaemonServer {
     /// `version` field is NO LONGER hard-rejected (Invariant 8 / VAL-IPC-021):
     /// instead the wire version is negotiated from the additive `max_wire_version`.
     /// Returns the negotiated wire version on success.
-    fn authenticate(&self, hello: &IpcHello) -> Result<u16, String> {
+    /// The hello gate. A presented per-client credential must be valid and
+    /// names the connection (a revoked or unknown one is refused even beside
+    /// a valid workspace token: the client chose to be held to it); with no
+    /// credential the workspace token is the root credential; else refused.
+    /// The generic error never says which check failed (VAL-SEC-009).
+    fn authenticate(&self, hello: &IpcHello) -> Result<(u16, ClientIdentity), String> {
         if hello.frame_type != "hello" {
             return Err("first daemon frame must be hello".to_string());
+        }
+        let policy = self.identity_policy();
+        if let Some(presented) = hello.client_token.as_deref().filter(|t| !t.is_empty()) {
+            return match self.identity_for_client_token(presented) {
+                Some(identity) => Ok((negotiate_wire_version(hello.max_wire_version), identity)),
+                None => Err("daemon authentication failed".to_string()),
+            };
         }
         if !constant_time_eq(&hello.token, &self.token) {
             return Err("daemon authentication failed".to_string());
         }
+        Ok((
+            negotiate_wire_version(hello.max_wire_version),
+            ClientIdentity::root(policy),
+        ))
+    }
 
-        Ok(negotiate_wire_version(hello.max_wire_version))
+    fn identity_policy(&self) -> IdentityPolicy {
+        self.effective_config().identity_effective()
+    }
+
+    /// Match a presented client token against the issued records (hash
+    /// compare, constant time per record) and note the sighting.
+    fn identity_for_client_token(&self, presented: &str) -> Option<ClientIdentity> {
+        let hash = client_token_hash(presented);
+        let mut clients = self.clients.lock().ok()?;
+        let now = now_millis();
+        let mut found = None;
+        for record in clients.clients.iter_mut() {
+            if record.revoked_at_ms.is_none() && constant_time_eq(&record.token_hash, &hash) {
+                record.last_seen_ms = now;
+                found = Some(ClientIdentity::from_record(record));
+                break;
+            }
+        }
+        if found.is_some() {
+            let snapshot = clients.clone();
+            drop(clients);
+            // Best-effort: a failed last-seen write is not an auth failure.
+            let _ = save_clients_file(&self.clients_path, &snapshot);
+        }
+        found
+    }
+
+    fn handle_identity_issue(&self, holder: &str, scopes: &[String]) -> Result<Value, String> {
+        let holder = validate_holder(holder)?;
+        let mut parsed: Vec<ClientScope> = Vec::new();
+        for raw in scopes {
+            for part in raw.split(',') {
+                if part.trim().is_empty() {
+                    continue;
+                }
+                let scope = ClientScope::parse(part).ok_or_else(|| {
+                    format!("unknown scope '{}': read, write or admin", part.trim())
+                })?;
+                if !parsed.contains(&scope) {
+                    parsed.push(scope);
+                }
+            }
+        }
+        if parsed.is_empty() {
+            parsed.push(ClientScope::Read);
+        }
+        let mut raw = [0u8; 32];
+        fill_secure_random(&mut raw)?;
+        let token = format!("{CLIENT_TOKEN_PREFIX}{}", hex_encode(&raw));
+        let mut id_bytes = [0u8; 6];
+        fill_secure_random(&mut id_bytes)?;
+        let id = hex_encode(&id_bytes);
+        let record = ClientRecord {
+            id: id.clone(),
+            holder: holder.clone(),
+            scopes: parsed.clone(),
+            token_hash: client_token_hash(&token),
+            created_at_ms: now_millis(),
+            last_seen_ms: 0,
+            revoked_at_ms: None,
+        };
+        let snapshot = {
+            let mut clients = self
+                .clients
+                .lock()
+                .map_err(|_| "client table lock poisoned".to_string())?;
+            let active = clients
+                .clients
+                .iter()
+                .filter(|c| c.revoked_at_ms.is_none())
+                .count();
+            if active >= MAX_CLIENT_RECORDS {
+                return Err(format!(
+                    "credential limit reached ({MAX_CLIENT_RECORDS}); revoke some"
+                ));
+            }
+            clients.clients.push(record.clone());
+            clients.clone()
+        };
+        if let Err(error) = save_clients_file(&self.clients_path, &snapshot) {
+            if let Ok(mut clients) = self.clients.lock() {
+                clients.clients.retain(|c| c.id != id);
+            }
+            return Err(error);
+        }
+        tracing::info!(
+            workspace_key = %self.workspace_key,
+            event = "identity_issued",
+            credential = %id,
+            holder = %holder,
+            "client credential issued"
+        );
+        let mut public = record.public();
+        public["token"] = json!(token);
+        Ok(public)
+    }
+
+    fn handle_identity_list(&self) -> Result<Value, String> {
+        let clients = self
+            .clients
+            .lock()
+            .map_err(|_| "client table lock poisoned".to_string())?;
+        Ok(json!(clients
+            .clients
+            .iter()
+            .map(ClientRecord::public)
+            .collect::<Vec<_>>()))
+    }
+
+    fn handle_identity_revoke(&self, id: &str) -> Result<Value, String> {
+        let (record, snapshot) = {
+            let mut clients = self
+                .clients
+                .lock()
+                .map_err(|_| "client table lock poisoned".to_string())?;
+            let record = clients
+                .clients
+                .iter_mut()
+                .find(|c| c.id == id)
+                .ok_or_else(|| format!("unknown credential '{id}'"))?;
+            if record.revoked_at_ms.is_none() {
+                record.revoked_at_ms = Some(now_millis());
+            }
+            (record.clone(), clients.clone())
+        };
+        save_clients_file(&self.clients_path, &snapshot)?;
+        tracing::info!(
+            workspace_key = %self.workspace_key,
+            event = "identity_revoked",
+            credential = %id,
+            "client credential revoked"
+        );
+        Ok(record.public())
+    }
+
+    /// (M6) Dispatch as a known identity: scope check, holder binding, and
+    /// the credential id on lease records; everything else as before.
+    fn handle_as(
+        &self,
+        request: DaemonRequest,
+        peer: Option<&TransportStream>,
+        identity: &ClientIdentity,
+    ) -> Result<Value, String> {
+        let needed = request_scope(&request);
+        if !identity.has(needed) {
+            return Err(format!(
+                "read-only credential: '{}' scope required for {}",
+                needed.name(),
+                request_name(&request)
+            ));
+        }
+        let request = bind_holder(request, identity)?;
+        match request {
+            DaemonRequest::TakeLease {
+                pane_id,
+                holder,
+                force,
+                why,
+            } => self.handle_take_lease(
+                &pane_id,
+                &holder,
+                force,
+                why.as_deref(),
+                identity.credential.as_deref(),
+            ),
+            DaemonRequest::ReleaseLease {
+                pane_id,
+                holder,
+                note,
+                generation,
+            } => self.handle_release_lease(
+                &pane_id,
+                &holder,
+                &note,
+                generation,
+                identity.credential.as_deref(),
+            ),
+            DaemonRequest::Whoami => Ok(identity.describe(self.identity_policy())),
+            other => self.handle_with_peer(other, peer),
+        }
     }
 
     fn ensure_pane_exists(&self, pane_id: &str) -> Result<(), String> {
@@ -12161,7 +12680,7 @@ fn write_to_pane(
     match client.request(DaemonRequest::SendInputAs {
         pane_id: pane_id.clone(),
         input: data.clone(),
-        holder: default_holder(),
+        holder: effective_holder(&client),
         generation: None,
     }) {
         Err(error) if error.contains("unknown variant") => {
@@ -12171,10 +12690,14 @@ fn write_to_pane(
     }
 }
 
-/// The holder label this client writes and takes leases as.
+/// The holder label this client writes and takes leases as: the credential's
+/// holder when `SGIAN_CLIENT_TOKEN` names one, else `$SGIAN_HOLDER`/user@host.
 #[tauri::command]
-fn client_holder() -> String {
-    default_holder()
+fn client_holder(state: State<'_, AppState>) -> String {
+    match state.client() {
+        Ok(client) => effective_holder(&client),
+        Err(_) => default_holder(),
+    }
 }
 
 #[tauri::command]
@@ -12184,9 +12707,11 @@ fn take_lease(
     why: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<LeaseInfo, String> {
-    state.client()?.request(DaemonRequest::TakeLease {
+    let client = state.client()?;
+    let holder = effective_holder(&client);
+    client.request(DaemonRequest::TakeLease {
         pane_id,
-        holder: default_holder(),
+        holder,
         force,
         why,
     })
@@ -12198,9 +12723,11 @@ fn release_lease(
     note: String,
     state: State<'_, AppState>,
 ) -> Result<LeaseInfo, String> {
-    state.client()?.request(DaemonRequest::ReleaseLease {
+    let client = state.client()?;
+    let holder = effective_holder(&client);
+    client.request(DaemonRequest::ReleaseLease {
         pane_id,
-        holder: default_holder(),
+        holder,
         note,
         generation: None,
     })
@@ -13030,6 +13557,24 @@ fn run_daemon_with_config_and_warnings(
         match listener.accept() {
             Ok((stream, _address)) => {
                 idle_since = None;
+                // (M6) Same-user boundary made explicit: a peer running as
+                // another uid is dropped before the hello (Unix only; Windows
+                // pipes are owner-restricted at creation).
+                #[cfg(unix)]
+                if let Some(uid) = peer_uid(&stream) {
+                    // SAFETY: getuid has no preconditions and cannot fail.
+                    let own = unsafe { libc::getuid() };
+                    if uid != own {
+                        tracing::warn!(
+                            workspace_key = %server.workspace_key,
+                            event = "peer_uid_rejected",
+                            peer_uid = uid,
+                            "dropping connection from another user"
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                }
                 // Concurrency cap (L18): refuse connections beyond the bound
                 // instead of pinning an unbounded number of threads.
                 let active_count = active_connections.load(Ordering::SeqCst);
@@ -13317,8 +13862,8 @@ fn handle_daemon_client_with_handshake_budget(
     let hello: IpcHello = serde_json::from_str(&hello_line)
         .map_err(|error| format!("invalid daemon hello: {error}"))?;
 
-    let (hello_response, negotiated_wire_version) = match server.authenticate(&hello) {
-        Ok(negotiated) => (
+    let (hello_response, negotiated_wire_version, identity) = match server.authenticate(&hello) {
+        Ok((negotiated, identity)) => (
             IpcResponse {
                 ok: true,
                 // Extend (do NOT replace) the pre-existing protocol_version field
@@ -13327,10 +13872,12 @@ fn handle_daemon_client_with_handshake_budget(
                     "protocol_version": PROTOCOL_VERSION,
                     "negotiated_wire_version": negotiated,
                     "capabilities": daemon_capabilities(),
+                    "identity": identity.describe(server.identity_policy()),
                 }),
                 error: None,
             },
             negotiated,
+            identity,
         ),
         Err(error) => {
             // Never log the token value (VAL-SEC-009): the error message is a
@@ -13347,6 +13894,7 @@ fn handle_daemon_client_with_handshake_budget(
                     error: Some(error),
                 },
                 1,
+                ClientIdentity::root(IdentityPolicy::Required),
             )
         }
     };
@@ -13387,6 +13935,7 @@ fn handle_daemon_client_with_handshake_budget(
             stream,
             negotiated_wire_version,
             client_wants_subscribe_ack,
+            identity,
         );
     }
 
@@ -13414,7 +13963,7 @@ fn handle_daemon_client_with_handshake_budget(
         return Ok(());
     }
 
-    let response = match server.handle_with_peer(request, Some(&stream)) {
+    let response = match server.handle_as(request, Some(&stream), &identity) {
         Ok(result) => IpcResponse {
             ok: true,
             result,
@@ -13605,6 +14154,7 @@ fn serve_framed_connection(
     mut stream: TransportStream,
     wire_version: u16,
     client_wants_subscribe_ack: bool,
+    identity: ClientIdentity,
 ) -> Result<(), String> {
     // A persistent connection may sit idle between requests, so the handshake read
     // timeout must not kill it; the loop blocks until the next request or EOF/close.
@@ -13639,7 +14189,7 @@ fn serve_framed_connection(
             return Ok(());
         }
 
-        let response = match server.handle_with_peer(request, Some(&stream)) {
+        let response = match server.handle_as(request, Some(&stream), &identity) {
             Ok(result) => IpcResponse {
                 ok: true,
                 result,
@@ -13842,6 +14392,7 @@ fn authenticate_stream_at(socket_path: &Path, token: &str) -> Result<TransportSt
         token: token.to_string(),
         max_wire_version: None,
         capabilities: None,
+        client_token: None,
     };
     write_json_line(&mut stream, &hello)?;
 
@@ -13911,7 +14462,7 @@ impl DaemonConnection {
         // Best-effort: a transport that cannot set timeouts still works, it just
         // keeps the old blocking behavior.
         let _ = stream.set_read_timeout(read_timeout);
-        Self::handshake(stream, token)
+        Self::handshake(stream, token, client_token_from_env().as_deref())
     }
 
     /// Adjust this connection's read deadline. Event subscriptions clear it
@@ -13927,7 +14478,11 @@ impl DaemonConnection {
     /// wire version, read the newline-JSON handshake response, and record the
     /// negotiated wire version + whether framing was advertised. Hello and response
     /// stay newline-JSON so a v1 peer can read them (VAL-IPC-012/024).
-    fn handshake(stream: TransportStream, token: &str) -> Result<Self, String> {
+    fn handshake(
+        stream: TransportStream,
+        token: &str,
+        client_token: Option<&str>,
+    ) -> Result<Self, String> {
         let mut reader = BufReader::new(stream);
         let hello = IpcHello {
             frame_type: "hello".to_string(),
@@ -13935,6 +14490,7 @@ impl DaemonConnection {
             token: token.to_string(),
             max_wire_version: Some(frame::WIRE_VERSION),
             capabilities: Some(client_capabilities()),
+            client_token: client_token.map(str::to_string),
         };
         write_json_line(reader.get_mut(), &hello)?;
 
@@ -14398,6 +14954,85 @@ fn read_token(path: &Path) -> Result<Option<String>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("failed to read daemon token: {error}")),
     }
+}
+
+/// (M6) Load `clients.json`; missing means none, unreadable means none with a
+/// warning (a corrupt file must not lock the operator out of the root token).
+fn load_clients_file(path: &Path) -> ClientsFile {
+    match fs::read_to_string(path) {
+        Ok(data) => match serde_json::from_str::<ClientsFile>(&data) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(
+                    event = "clients_file_unreadable",
+                    path = %path.display(),
+                    error = %error,
+                    "clients.json is unreadable; no client credentials are active"
+                );
+                ClientsFile::default()
+            }
+        },
+        Err(_) => ClientsFile::default(),
+    }
+}
+
+/// Write `clients.json` owner-only through a temp file and rename.
+fn save_clients_file(path: &Path, file: &ClientsFile) -> Result<(), String> {
+    let encoded = serde_json::to_vec_pretty(file)
+        .map_err(|error| format!("failed to encode clients file: {error}"))?;
+    let temp = path.with_extension("json.tmp");
+    {
+        let mut out = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .private_mode()
+            .open(&temp)
+            .map_err(|error| format!("failed to write {}: {error}", temp.display()))?;
+        out.write_all(&encoded)
+            .and_then(|_| out.sync_all())
+            .map_err(|error| format!("failed to write {}: {error}", temp.display()))?;
+    }
+    set_private_file_permissions(&temp)?;
+    fs::rename(&temp, path)
+        .map_err(|error| format!("failed to replace {}: {error}", path.display()))
+}
+
+/// (M6) The uid of the process at the other end of a Unix socket.
+#[cfg(target_os = "macos")]
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: the fd is open for the stream's lifetime and both out-pointers
+    // are valid for the call.
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    (rc == 0).then_some(uid)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: ucred is plain data; a zeroed value is a valid out-buffer.
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the fd is open, `cred` is a struct we own and `len` says how
+    // large it is.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(cred.uid)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn peer_uid(_stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    None
 }
 
 /// Fill `bytes` with cryptographically secure randomness from the OS.
@@ -15623,6 +16258,163 @@ fn control_hook(workspace: PathBuf, parsed: HookArgs, json_output: bool) -> Resu
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityVerb {
+    List,
+    Issue,
+    Revoke,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdentityArgs {
+    verb: IdentityVerb,
+    holder: Option<String>,
+    scopes: Vec<String>,
+    id: Option<String>,
+}
+
+/// `identity [list] | issue --holder H [--scope read,write,admin] | revoke ID`.
+fn parse_identity_args(args: &[String]) -> Result<IdentityArgs, String> {
+    let verb = match args.first().map(String::as_str) {
+        None | Some("list") => IdentityVerb::List,
+        Some("issue") => IdentityVerb::Issue,
+        Some("revoke") => IdentityVerb::Revoke,
+        Some(other) => return Err(format!("unknown identity command: {other}")),
+    };
+    let mut parsed = IdentityArgs {
+        verb,
+        holder: None,
+        scopes: Vec::new(),
+        id: None,
+    };
+    let mut positionals: Vec<String> = Vec::new();
+    let mut index = if args.is_empty() { 0 } else { 1 };
+    while index < args.len() {
+        match args[index].as_str() {
+            "--holder" => {
+                parsed.holder = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .ok_or_else(|| "--holder requires a NAME".to_string())?,
+                );
+                index += 1;
+            }
+            "--scope" | "--scopes" => {
+                parsed.scopes.push(
+                    args.get(index + 1)
+                        .cloned()
+                        .ok_or_else(|| "--scope requires a list".to_string())?,
+                );
+                index += 1;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(format!("unexpected argument for identity: {other}"));
+            }
+            other => positionals.push(other.to_string()),
+        }
+        index += 1;
+    }
+    match verb {
+        IdentityVerb::List => {
+            if !positionals.is_empty() || parsed.holder.is_some() || !parsed.scopes.is_empty() {
+                return Err("identity list takes no arguments".to_string());
+            }
+        }
+        IdentityVerb::Issue => {
+            if !positionals.is_empty() {
+                return Err("identity issue takes --holder and --scope only".to_string());
+            }
+            if parsed.holder.is_none() {
+                return Err("identity issue needs --holder NAME".to_string());
+            }
+        }
+        IdentityVerb::Revoke => {
+            if positionals.len() != 1 || parsed.holder.is_some() || !parsed.scopes.is_empty() {
+                return Err("identity revoke needs exactly one credential ID".to_string());
+            }
+            parsed.id = positionals.pop();
+        }
+    }
+    Ok(parsed)
+}
+
+fn control_identity(
+    client: &DaemonClient,
+    parsed: IdentityArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let mut stdout = std::io::stdout();
+    let scopes_text = |record: &Value| {
+        record["scopes"]
+            .as_array()
+            .map(|scopes| {
+                scopes
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default()
+    };
+    match parsed.verb {
+        IdentityVerb::List => {
+            let records: Value = client.request(DaemonRequest::IdentityList)?;
+            if json_output {
+                return write_json_stdout(&records);
+            }
+            for record in records.as_array().into_iter().flatten() {
+                writeln!(
+                    stdout,
+                    "{}\t{}\t{}\t{}",
+                    record["id"].as_str().unwrap_or("-"),
+                    record["holder"].as_str().unwrap_or("-"),
+                    scopes_text(record),
+                    if record["revoked_at_ms"].is_null() {
+                        "active"
+                    } else {
+                        "revoked"
+                    }
+                )
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+            }
+            Ok(())
+        }
+        IdentityVerb::Issue => {
+            let record: Value = client.request(DaemonRequest::IdentityIssue {
+                holder: parsed.holder.unwrap_or_default(),
+                scopes: parsed.scopes,
+            })?;
+            if json_output {
+                return write_json_stdout(&record);
+            }
+            writeln!(
+                stdout,
+                "{}\t{}\t{}\n{}\n(shown once; export SGIAN_CLIENT_TOKEN=… on the client)",
+                record["id"].as_str().unwrap_or("-"),
+                record["holder"].as_str().unwrap_or("-"),
+                scopes_text(&record),
+                record["token"].as_str().unwrap_or("-")
+            )
+            .map_err(|error| format!("failed to write stdout: {error}"))
+        }
+        IdentityVerb::Revoke => {
+            let record: Value = client.request(DaemonRequest::IdentityRevoke {
+                id: parsed.id.unwrap_or_default(),
+            })?;
+            if json_output {
+                return write_json_stdout(&record);
+            }
+            writeln!(
+                stdout,
+                "{}\t{}\trevoked",
+                record["id"].as_str().unwrap_or("-"),
+                record["holder"].as_str().unwrap_or("-")
+            )
+            .map_err(|error| format!("failed to write stdout: {error}"))
+        }
+    }
+}
+
 fn control_list_daemons(json_output: bool) -> Result<(), String> {
     let daemons = workspace_keys()
         .into_iter()
@@ -15923,6 +16715,45 @@ fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             }
             let parsed = parse_statusline_args(&options.args[1..])?;
             control_statusline(options.workspace, parsed, options.json)
+        }
+        "identity" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_identity_args(&options.args[1..])?;
+            let client = DaemonClient::connect_existing(options.workspace)?;
+            control_identity(&client, parsed, options.json)
+        }
+        "whoami" => {
+            ensure_no_extra_args("whoami", &options.args[1..])?;
+            let client = DaemonClient::connect_existing(options.workspace)?;
+            let identity: Value = client.request(DaemonRequest::Whoami)?;
+            if options.json {
+                return write_json_stdout(&identity);
+            }
+            let scopes = identity["scopes"]
+                .as_array()
+                .map(|scopes| {
+                    scopes
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let mut stdout = std::io::stdout();
+            writeln!(
+                stdout,
+                "{}\t{}\t{}\tidentity={}",
+                identity["credential"].as_str().unwrap_or("root"),
+                identity["holder"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(default_holder),
+                scopes,
+                identity["identity_policy"].as_str().unwrap_or("open")
+            )
+            .map_err(|error| format!("failed to write stdout: {error}"))
         }
         "write-config" => {
             let client = DaemonClient::connect_or_spawn(options.workspace)?;
@@ -16452,6 +17283,20 @@ fn control_status_verbose(client: &DaemonClient, json_output: bool) -> Result<()
 // ----- ctl: keyboard lease and ledger (docs/design/keyboard-lease-and-ledger.md) -----
 
 /// The holder label `ctl` attributes its writes and lease claims to:
+/// (M6) The holder this process acts as: with a client credential in the
+/// environment, the credential's holder (the daemon would refuse any other);
+/// else the self-declared default. One `whoami` round trip when credentialed.
+fn effective_holder(client: &DaemonClient) -> String {
+    if client_token_from_env().is_some() {
+        if let Ok(identity) = client.request::<Value>(DaemonRequest::Whoami) {
+            if let Some(holder) = identity["holder"].as_str().filter(|h| !h.is_empty()) {
+                return holder.to_string();
+            }
+        }
+    }
+    default_holder()
+}
+
 /// `$SGIAN_HOLDER` when set and valid, else `user@host`.
 fn default_holder() -> String {
     if let Ok(configured) = std::env::var("SGIAN_HOLDER") {
@@ -16702,7 +17547,10 @@ fn control_lease(
     json_output: bool,
 ) -> Result<(), String> {
     let pane_id = resolve_pane_ref(client, &parsed.pane_ref)?;
-    let holder = parsed.holder.clone().unwrap_or_else(default_holder);
+    let holder = parsed
+        .holder
+        .clone()
+        .unwrap_or_else(|| effective_holder(client));
     let info: LeaseInfo = match parsed.verb {
         LeaseVerb::Status => client.request(DaemonRequest::LeaseStatus { pane_id })?,
         LeaseVerb::Take => client.request(DaemonRequest::TakeLease {
@@ -20097,6 +20945,19 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   output (fed the same payload) or a compact
                                   default line. Always exits 0; --json prints
                                   the daemon's answer instead.
+  identity [list]               Issued client credentials (id, holder, scopes)
+  identity issue --holder NAME [--scope read,write,admin]
+                                Issue a per-client credential; the token is
+                                  printed once. The client exports it as
+                                  SGIAN_CLIENT_TOKEN (or names a file in
+                                  SGIAN_CLIENT_TOKEN_FILE); its holder is then
+                                  fixed to NAME and --as anything else is refused.
+                                  Default scope: read. Config `identity: required`
+                                  makes every write need a credential.
+  identity revoke <ID>          Revoke a credential (its connections end at the
+                                  next hello)
+  whoami                        This connection's credential, holder, scopes
+                                  and the daemon's identity policy
   lease [PANE]                  Show who holds a pane's keyboard (alias: lease status)
   lease take [PANE] [--as HOLDER] [--force --why REASON]
                                 Claim the keyboard. While held, input from anyone
@@ -20996,6 +21857,7 @@ mod tests {
                 token: "wrong-token".to_string(),
                 max_wire_version: None,
                 capabilities: None,
+                client_token: None,
             },
         )
         .expect("hello should write");
@@ -22454,6 +23316,7 @@ mod tests {
             token: token.to_string(),
             max_wire_version,
             capabilities: Some(vec!["framed".to_string()]),
+            client_token: None,
         };
         write_json_line(&mut stream, &hello)?;
 
@@ -22583,6 +23446,7 @@ mod tests {
             token: "tok-123".to_string(),
             max_wire_version: Some(2),
             capabilities: Some(vec!["framed".to_string()]),
+            client_token: None,
         };
         let (mut writer, peer) = test_transport_pair().expect("transport pair should be available");
         write_json_line(&mut writer, &hello).expect("hello writes");
@@ -22613,6 +23477,7 @@ mod tests {
             token: "tok".to_string(),
             max_wire_version: Some(2),
             capabilities: None,
+            client_token: None,
         };
         let value = serde_json::to_value(&hello).expect("hello serializes");
         assert_eq!(value.get("version").and_then(Value::as_u64), Some(1));
@@ -22822,6 +23687,7 @@ mod tests {
             token: token.clone(),
             max_wire_version: None,
             capabilities: None,
+            client_token: None,
         };
         write_json_line(&mut client, &hello).expect("legacy hello writes");
         let mut reader = BufReader::new(client);
@@ -22862,6 +23728,7 @@ mod tests {
             token: token.clone(),
             max_wire_version: Some(2),
             capabilities: None,
+            client_token: None,
         };
         write_json_line(&mut client, &hello).expect("hello writes");
         let mut reader = BufReader::new(client);
@@ -22899,6 +23766,7 @@ mod tests {
                 token: bad_token.clone(),
                 max_wire_version: max_wire,
                 capabilities: None,
+                client_token: None,
             };
             write_json_line(&mut client, &hello).expect("hello writes");
             let mut reader = BufReader::new(client);
@@ -22932,6 +23800,7 @@ mod tests {
             token: "0".repeat(64),
             max_wire_version: Some(2),
             capabilities: None,
+            client_token: None,
         };
         write_json_line(&mut client, &hello).expect("hello writes");
         let mut reader = BufReader::new(client);
@@ -22965,6 +23834,7 @@ mod tests {
             token: token.clone(),
             max_wire_version: Some(2),
             capabilities: None,
+            client_token: None,
         };
         write_json_line(&mut client, &hello).expect("hello writes");
         let mut reader = BufReader::new(client);
@@ -23040,7 +23910,8 @@ mod tests {
         // a real in-process daemon and round-trips MULTIPLE requests over the SAME
         // persistent connection (architecture.md §5.2/§5.3).
         let (client, token, _data_dir, handle) = pair_daemon_connection();
-        let mut conn = DaemonConnection::handshake(client, &token).expect("handshake completes");
+        let mut conn =
+            DaemonConnection::handshake(client, &token, None).expect("handshake completes");
         assert_eq!(
             conn.wire_version,
             frame::WIRE_VERSION,
@@ -23121,7 +23992,8 @@ mod tests {
             .expect("v1 daemon writes the newline response");
         });
 
-        let mut conn = DaemonConnection::handshake(client, "tok").expect("handshake completes");
+        let mut conn =
+            DaemonConnection::handshake(client, "tok", None).expect("handshake completes");
         assert_eq!(
             conn.wire_version, 1,
             "absent negotiation defaults to wire v1"
@@ -25585,6 +26457,7 @@ mod tests {
             lease_policy: None,
             agent_probe_interval_ms: None,
             kranz_bin: None,
+            identity: None,
             agent_permission_mode: Some("manual".to_string()),
             agent_claude_bin: Some("/opt/claude/bin/claude".to_string()),
             agent_droid_bin: Some("/opt/factory/bin/droid".to_string()),
@@ -37753,6 +38626,420 @@ exit 0
             1
         )
         .is_err());
+    }
+
+    #[test]
+    fn identity_scopes_and_holder_binding_are_pure() {
+        // Scope classification: reads, admin, and everything else writes.
+        assert_eq!(request_scope(&DaemonRequest::Ping), ClientScope::Read);
+        assert_eq!(request_scope(&DaemonRequest::Subscribe), ClientScope::Read);
+        assert_eq!(
+            request_scope(&DaemonRequest::AgentSignal {
+                pid: 1,
+                event: "Stop".into(),
+                notification_type: None,
+                message: None,
+                session_id: None
+            }),
+            ClientScope::Read
+        );
+        assert_eq!(
+            request_scope(&DaemonRequest::SendInput {
+                pane_id: "p".into(),
+                input: "x".into()
+            }),
+            ClientScope::Write
+        );
+        assert_eq!(
+            request_scope(&DaemonRequest::ProjectCreate {
+                name: "f".into(),
+                goal: None,
+                repo: None
+            }),
+            ClientScope::Write
+        );
+        assert_eq!(request_scope(&DaemonRequest::Shutdown), ClientScope::Admin);
+        assert_eq!(
+            request_scope(&DaemonRequest::IdentityList),
+            ClientScope::Admin
+        );
+        assert_eq!(request_name(&DaemonRequest::IdentityList), "identity_list");
+
+        assert_eq!(ClientScope::parse(" write "), Some(ClientScope::Write));
+        assert_eq!(ClientScope::parse("root"), None);
+        assert_eq!(
+            IdentityPolicy::parse("required"),
+            Some(IdentityPolicy::Required)
+        );
+        assert_eq!(IdentityPolicy::parse("closed"), None);
+        let root_open = ClientIdentity::root(IdentityPolicy::Open);
+        assert!(root_open.has(ClientScope::Write) && root_open.has(ClientScope::Admin));
+        let root_required = ClientIdentity::root(IdentityPolicy::Required);
+        assert!(!root_required.has(ClientScope::Write) && root_required.has(ClientScope::Admin));
+        assert_eq!(client_token_hash("a"), client_token_hash("a"));
+        assert_ne!(client_token_hash("a"), client_token_hash("b"));
+
+        // Holder binding for a credentialed connection.
+        let record = ClientRecord {
+            id: "c1".into(),
+            holder: "phone".into(),
+            scopes: vec![ClientScope::Write],
+            token_hash: String::new(),
+            created_at_ms: 1,
+            last_seen_ms: 0,
+            revoked_at_ms: None,
+        };
+        let identity = ClientIdentity::from_record(&record);
+        assert!(identity.has(ClientScope::Read), "read is implied");
+        let bound = bind_holder(
+            DaemonRequest::SendInput {
+                pane_id: "p".into(),
+                input: "hi".into(),
+            },
+            &identity,
+        )
+        .expect("bind");
+        assert_eq!(
+            bound,
+            DaemonRequest::SendInputAs {
+                pane_id: "p".into(),
+                input: "hi".into(),
+                holder: "phone".into(),
+                generation: None
+            }
+        );
+        let mismatch = bind_holder(
+            DaemonRequest::TakeLease {
+                pane_id: "p".into(),
+                holder: "bob".into(),
+                force: false,
+                why: None,
+            },
+            &identity,
+        )
+        .expect_err("holder mismatch");
+        assert!(mismatch.contains("does not match"), "{mismatch}");
+        assert!(bind_holder(DaemonRequest::Broadcast { input: "x".into() }, &identity).is_err());
+        // The root credential is left alone.
+        let root_bound = bind_holder(
+            DaemonRequest::TakeLease {
+                pane_id: "p".into(),
+                holder: "bob".into(),
+                force: false,
+                why: None,
+            },
+            &root_open,
+        )
+        .expect("root passes");
+        assert!(
+            matches!(root_bound, DaemonRequest::TakeLease { ref holder, .. } if holder == "bob")
+        );
+
+        // Config rejects an unknown policy.
+        let bad = Config {
+            identity: Some("closed".into()),
+            ..Default::default()
+        };
+        assert!(bad.validate().expect_err("invalid").contains("identity"));
+        assert_eq!(
+            Config {
+                identity: Some("required".into()),
+                ..Default::default()
+            }
+            .identity_effective(),
+            IdentityPolicy::Required
+        );
+
+        // ctl argument shapes.
+        let issue = parse_identity_args(&args(&[
+            "issue",
+            "--holder",
+            "phone",
+            "--scope",
+            "read,write",
+        ]))
+        .expect("issue");
+        assert_eq!(issue.verb, IdentityVerb::Issue);
+        assert_eq!(issue.holder.as_deref(), Some("phone"));
+        assert_eq!(issue.scopes, args(&["read,write"]));
+        assert_eq!(
+            parse_identity_args(&[]).expect("bare").verb,
+            IdentityVerb::List
+        );
+        assert_eq!(
+            parse_identity_args(&args(&["revoke", "abc"]))
+                .expect("revoke")
+                .id
+                .as_deref(),
+            Some("abc")
+        );
+        assert!(parse_identity_args(&args(&["issue"])).is_err());
+        assert!(parse_identity_args(&args(&["revoke"])).is_err());
+        assert!(parse_identity_args(&args(&["list", "x"])).is_err());
+        assert!(parse_identity_args(&args(&["bogus"])).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_uid_matches_own_uid_on_a_socketpair() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        // SAFETY: getuid has no preconditions.
+        let own = unsafe { libc::getuid() };
+        assert_eq!(peer_uid(&a), Some(own));
+    }
+
+    /// Hello with a client credential and an empty workspace token, the way a
+    /// remote client without the token file connects.
+    #[cfg(unix)]
+    fn connect_with_client_token(
+        daemon: &TestDaemon,
+        token: &str,
+    ) -> Result<DaemonConnection, String> {
+        let stream = transport_connect(&daemon.socket_path).map_err(|e| e.to_string())?;
+        DaemonConnection::handshake(stream, "", Some(token))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_credentials_gate_writes_and_attribute_leases_over_ipc() {
+        let daemon = TestDaemon::spawn(Config::default());
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+
+        // The workspace token is root under the default policy.
+        let me: Value = client.request(DaemonRequest::Whoami).expect("whoami");
+        assert_eq!(me["root"], json!(true));
+        assert_eq!(me["identity_policy"], json!("open"));
+        assert_eq!(me["scopes"], json!(["read", "write", "admin"]));
+
+        // A read-only credential can look but not type.
+        let viewer: Value = client
+            .request(DaemonRequest::IdentityIssue {
+                holder: "phone".into(),
+                scopes: vec![],
+            })
+            .expect("issue viewer");
+        let viewer_token = viewer["token"].as_str().expect("token").to_string();
+        assert!(viewer_token.starts_with(CLIENT_TOKEN_PREFIX));
+        assert_eq!(viewer["scopes"], json!(["read"]));
+        let mut viewer_conn =
+            connect_with_client_token(&daemon, &viewer_token).expect("viewer hello");
+        let who = viewer_conn.request(&DaemonRequest::Whoami).expect("whoami");
+        assert_eq!(who.result["holder"], json!("phone"));
+        assert_eq!(who.result["credential"], viewer["id"]);
+        assert_eq!(who.result["root"], json!(false));
+        let seen = viewer_conn
+            .request(&DaemonRequest::ListPanes)
+            .expect("list");
+        assert!(seen.ok, "{seen:?}");
+        let refused = viewer_conn
+            .request(&DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: "echo no\n".into(),
+            })
+            .expect("refusal is a response");
+        assert!(!refused.ok);
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("read-only credential"),
+            "{refused:?}"
+        );
+        let refused_admin = viewer_conn
+            .request(&DaemonRequest::IdentityList)
+            .expect("refusal is a response");
+        assert!(refused_admin
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("'admin' scope"));
+
+        // A write credential types as its holder and its leases carry its id.
+        let laptop: Value = client
+            .request(DaemonRequest::IdentityIssue {
+                holder: "laptop".into(),
+                scopes: vec!["write".into()],
+            })
+            .expect("issue laptop");
+        let laptop_token = laptop["token"].as_str().expect("token").to_string();
+        let mut laptop_conn =
+            connect_with_client_token(&daemon, &laptop_token).expect("laptop hello");
+        let typed = laptop_conn
+            .request(&DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: "".into(),
+            })
+            .expect("send");
+        assert!(typed.ok, "{typed:?}");
+        let wrong = laptop_conn
+            .request(&DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "bob".into(),
+                force: false,
+                why: None,
+            })
+            .expect("mismatch is a response");
+        assert!(
+            wrong
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("does not match"),
+            "{wrong:?}"
+        );
+        let taken = laptop_conn
+            .request(&DaemonRequest::TakeLease {
+                pane_id: pane_id.clone(),
+                holder: "laptop".into(),
+                force: false,
+                why: None,
+            })
+            .expect("take");
+        assert!(taken.ok, "{taken:?}");
+        assert_eq!(taken.result["holder"], json!("laptop"));
+        // Root cannot type into the held pane unattributed, as before.
+        let held = client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: "x".into(),
+            })
+            .expect_err("held by laptop");
+        assert!(held.contains("held by laptop"), "{held}");
+        let released = laptop_conn
+            .request(&DaemonRequest::ReleaseLease {
+                pane_id: pane_id.clone(),
+                holder: "laptop".into(),
+                note: "done".into(),
+                generation: None,
+            })
+            .expect("release");
+        assert!(released.ok, "{released:?}");
+        let records = read_ledger_tail(
+            &ledger_path(&daemon.data_dir.path().join(LEDGER_DIR), &pane_id),
+            0,
+        );
+        let lease_records: Vec<&Value> = records
+            .iter()
+            .filter(|r| r["type"] == json!("lease.taken") || r["type"] == json!("lease.released"))
+            .collect();
+        assert_eq!(lease_records.len(), 2, "{records:?}");
+        assert_eq!(lease_records[0]["payload"]["credential"], laptop["id"]);
+        assert_eq!(lease_records[1]["payload"]["credential"], laptop["id"]);
+
+        // Write is not admin: a credential cannot mint credentials.
+        let mint = laptop_conn
+            .request(&DaemonRequest::IdentityIssue {
+                holder: "x".into(),
+                scopes: vec![],
+            })
+            .expect("refusal is a response");
+        assert!(!mint.ok);
+
+        // Revocation ends at the next hello; a presented credential is held
+        // to, so a revoked or bogus token is refused even beside the
+        // workspace token (drop the credential to be root again).
+        let listed: Value = client.request(DaemonRequest::IdentityList).expect("list");
+        assert_eq!(listed.as_array().map_or(0, Vec::len), 2);
+        assert!(listed[0].get("token_hash").is_none() && listed[0].get("token").is_none());
+        client
+            .request::<Value>(DaemonRequest::IdentityRevoke {
+                id: viewer["id"].as_str().unwrap().into(),
+            })
+            .expect("revoke");
+        assert!(connect_with_client_token(&daemon, &viewer_token).is_err());
+        assert!(connect_with_client_token(&daemon, "sgc_nope").is_err());
+        let stream = transport_connect(&daemon.socket_path).expect("connect");
+        assert!(
+            DaemonConnection::handshake(stream, &daemon.token, Some(&viewer_token)).is_err(),
+            "a revoked credential is not quietly root"
+        );
+        let stream = transport_connect(&daemon.socket_path).expect("connect");
+        let mut root_again = DaemonConnection::handshake(stream, &daemon.token, None)
+            .expect("root without credential");
+        assert_eq!(
+            root_again
+                .request(&DaemonRequest::Whoami)
+                .expect("whoami")
+                .result["root"],
+            json!(true)
+        );
+        // The file keeps hashes, never tokens, and is owner-only.
+        let on_disk =
+            fs::read_to_string(daemon.data_dir.path().join(CLIENTS_FILE)).expect("clients.json");
+        assert!(on_disk.contains("token_hash") && !on_disk.contains(&laptop_token));
+        let mode = fs::metadata(daemon.data_dir.path().join(CLIENTS_FILE))
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        daemon.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_required_makes_the_root_token_read_and_admin_only() {
+        let daemon = TestDaemon::spawn(Config {
+            identity: Some("required".into()),
+            ..Default::default()
+        });
+        let client = daemon.client();
+        let initial: WorkspaceSnapshot = client
+            .request(DaemonRequest::BootstrapWorkspace)
+            .expect("bootstrap");
+        let pane_id = initial.panes[0].id.clone();
+        let me: Value = client.request(DaemonRequest::Whoami).expect("whoami");
+        assert_eq!(me["identity_policy"], json!("required"));
+        assert_eq!(me["scopes"], json!(["read", "admin"]));
+        let refused = client
+            .request::<CommandOk>(DaemonRequest::SendInput {
+                pane_id: pane_id.clone(),
+                input: "x".into(),
+            })
+            .expect_err("root cannot type under required");
+        assert!(
+            refused.contains("'write' scope required for send_input"),
+            "{refused}"
+        );
+        let issued: Value = client
+            .request(DaemonRequest::IdentityIssue {
+                holder: "craig@desk".into(),
+                scopes: vec!["write".into()],
+            })
+            .expect("root can still issue");
+        let mut conn =
+            connect_with_client_token(&daemon, issued["token"].as_str().unwrap()).expect("hello");
+        // Spawning a shell is a write too: root is refused, the credential is not.
+        let root_spawn = client
+            .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect_err("root cannot spawn under required");
+        assert!(root_spawn.contains("ensure_pane_terminal"), "{root_spawn}");
+        let spawned = conn
+            .request(&DaemonRequest::EnsurePaneTerminal {
+                pane_id: pane_id.clone(),
+            })
+            .expect("ensure terminal");
+        assert!(spawned.ok, "{spawned:?}");
+        let typed = conn
+            .request(&DaemonRequest::SendInput {
+                pane_id,
+                input: "".into(),
+            })
+            .expect("send");
+        assert!(typed.ok, "{typed:?}");
+        daemon.shutdown();
     }
 
     #[test]

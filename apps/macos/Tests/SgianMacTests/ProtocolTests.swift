@@ -356,3 +356,8 @@ func daemonRoundTrip() async throws {
     #expect(AgentUsage.apply(event: malformed, to: &table) == false)
     #expect(table["p1"] != nil)
 }
+
+@Test func readOnlyCredentialRefusalsReadAsNotices() {
+    #expect(LeaseText.noticeText(for: "read-only credential: 'write' scope required for send_input_as") == "Read-only: this credential cannot type (no write scope).")
+    #expect(LeaseText.noticeText(for: "pane keyboard is held by bob (pane-2)") == "Read-only: keyboard held by bob. ⇧⌘T to take it.")
+}

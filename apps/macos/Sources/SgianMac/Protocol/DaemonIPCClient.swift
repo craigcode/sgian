@@ -121,19 +121,38 @@ final class DaemonIPCClient: @unchecked Sendable {
         return try JSONDecoder.ipc.decode(type, from: resultData)
     }
 
+    /// (M6) The per-client credential this process presents, if any:
+    /// `SGIAN_CLIENT_TOKEN`, else the first line of `SGIAN_CLIENT_TOKEN_FILE`.
+    static func clientTokenFromEnvironment() -> String? {
+        let environment = ProcessInfo.processInfo.environment
+        if let token = environment["SGIAN_CLIENT_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+            return token
+        }
+        guard let path = environment["SGIAN_CLIENT_TOKEN_FILE"],
+              let contents = try? String(contentsOfFile: path, encoding: .utf8)
+        else { return nil }
+        let first = contents.split(whereSeparator: \.isNewline).first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+        return first.isEmpty ? nil : first
+    }
+
     private static func authenticatedSocket(locator: WorkspaceLocator) throws -> AuthenticatedSocket {
-        guard let token = try? String(contentsOf: locator.tokenURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !token.isEmpty
+        let clientToken = clientTokenFromEnvironment()
+        let fileToken = (try? String(contentsOf: locator.tokenURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // A remote client has no workspace token file; its credential rides
+        // the hello instead (docs/design/client-identity.md).
+        guard !fileToken.isEmpty || clientToken != nil
         else { throw DaemonClientError.tokenUnavailable(locator.tokenURL) }
 
         let socket = try UnixSocket(path: locator.socketURL.path)
-        let hello = JSONValue.object([
+        var fields: [String: JSONValue] = [
             "type": .string("hello"),
             "version": .number(1),
-            "token": .string(token),
+            "token": .string(fileToken),
             "capabilities": .array([.string("subscribe-ack")]),
-        ])
+        ]
+        if let clientToken { fields["client_token"] = .string(clientToken) }
+        let hello = JSONValue.object(fields)
         try socket.writeLine(JSONEncoder.ipc.encode(hello))
         let response = try JSONDecoder.ipc.decode(IPCResponse.self, from: socket.readLine())
         guard response.ok else {

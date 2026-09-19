@@ -37,12 +37,24 @@ performs the same startup and legacy-data migration work before returning.
 Every connection begins with one newline-terminated JSON hello:
 
 ```json
-{"type":"hello","version":1,"token":"<workspace token>"}
+{"type":"hello","version":1,"token":"<workspace token>","client_token":"<optional per-client credential>"}
 ```
 
 The daemon answers with an `IpcResponse`. The native client deliberately uses
 the compatibility v1 wire: one newline-delimited request and response per
-connection. A subscription sends `{"command":"subscribe"}` after the hello and
+connection. `client_token` is additive (docs/design/client-identity.md): a
+credential issued by `ctl identity issue` names the connection, fixes its
+holder and limits it to its scopes (`read`, `write`, `admin`); with one, the
+workspace token may be empty, which is how a client on another machine
+connects over an SSH-forwarded socket. A presented credential is held to: a
+revoked or unknown one is refused even beside a valid workspace token. The hello response carries
+`identity` (`credential`, `holder`, `scopes`, `root`, `identity_policy`).
+Under `identity: required` the workspace token has `read` and `admin` only.
+A refused request says `read-only credential: '<scope>' scope required for
+<command>`; clients show it as the same read-only notice a lease refusal
+gets. Clients read `SGIAN_CLIENT_TOKEN` (or `SGIAN_CLIENT_TOKEN_FILE`) and
+take their holder from the hello.
+A subscription sends `{"command":"subscribe"}` after the hello and
 then receives newline-delimited events until disconnect. The native client
 advertises `subscribe-ack`; when the daemon advertises the same capability, the
 first event confirms registration before the client treats the stream as live.

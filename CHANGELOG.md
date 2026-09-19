@@ -7,6 +7,14 @@ follow SemVer once the first public tag exists.
 
 ### Added
 
+- Per-client identity: `ctl identity issue|list|revoke` and `ctl whoami`;
+  credentials carry `read`/`write`/`admin` scopes and fix the holder the
+  daemon attributes input and leases to (`credential` on lease ledger
+  records); `client_token` on the hello lets a second machine connect over
+  an SSH-forwarded socket without the workspace token; `identity: required`
+  makes every write need a credential; connections from another uid are
+  dropped. All three clients read `SGIAN_CLIENT_TOKEN` and show a scope
+  refusal as the read-only notice.
 - `ctl statusline`: the command Claude Code's status line runs. Records
   the session's model, context fill and rate-limit windows against the pane
   that owns the calling process and prints your own status line (or a

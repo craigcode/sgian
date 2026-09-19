@@ -21,7 +21,9 @@ final class WorkspaceModel: ObservableObject {
     @Published var leaseDialog: LeaseDialog?
     /// The label this client writes and takes leases as: the same `user@host`
     /// the `ctl` default uses, so the operator is one principal across surfaces.
-    let holder: String = WorkspaceModel.defaultHolder()
+    /// The label this client writes and takes leases as: the credential's
+    /// holder once a `whoami` after connect names one, else the default.
+    @Published private(set) var holder: String = WorkspaceModel.defaultHolder()
     @Published private(set) var agentSpecs: [String: AgentPaneSpec] = [:]
     @Published private(set) var chats: [String: AgentChatState] = [:]
     @Published private(set) var terminals: [String: TerminalSurface] = [:]
@@ -140,6 +142,12 @@ final class WorkspaceModel: ObservableObject {
                 guard currentGeneration == generation else { return }
                 apply(snapshot)
                 status = .connected
+                if DaemonIPCClient.clientTokenFromEnvironment() != nil,
+                   let identity = try? await client.request(["command": .string("whoami")], as: JSONValue.self),
+                   let credentialHolder = identity["holder"]?.stringValue, !credentialHolder.isEmpty,
+                   currentGeneration == generation {
+                    holder = credentialHolder
+                }
                 beginSubscription(client: client, generation: currentGeneration)
                 _ = try? await readConfiguration()
                 try await completeUISmokeIfRequested()
@@ -656,7 +664,7 @@ final class WorkspaceModel: ObservableObject {
                     let message = error.localizedDescription
                     // A lease refusal is per keystroke and expected: a transient
                     // notice on the pane, not the modal error alert.
-                    if message.contains("pane keyboard is") {
+                    if message.contains("pane keyboard is") || message.contains("read-only credential") {
                         showLeaseNotice(paneID: paneID, refusal: message)
                         continue
                     }
@@ -941,6 +949,9 @@ enum LeaseText {
     }
 
     static func noticeText(for refusal: String) -> String {
+        if refusal.contains("read-only credential") {
+            return "Read-only: this credential cannot type (no write scope)."
+        }
         if let range = refusal.range(of: "held by ") {
             let rest = refusal[range.upperBound...]
             let name = rest.prefix { !$0.isWhitespace && $0 != "(" && $0 != ";" }
