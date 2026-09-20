@@ -2,10 +2,15 @@
 
 Status: decided and built, 2026-09-19 (decisions: a `sgian ctl serve`
 subcommand, read-only by default with `--allow-write`, assets embedded with
-`include_dir`, `tiny_http`). Shipped: `serve_http.rs`, `ui/src/web-bridge.js`
-(fetch + SSE behind the existing controller), loopback-only with a Host
-check, CSP headers, the same event and command contract as the Tauri host.
-The text below is the proposal as written.
+`include_dir`). Decision 4 changed in the build: not `tiny_http`, which
+buffers a chunked body behind an 8 KiB writer and only exposes the socket
+through an upgrade that writes a terminated body first, so server-sent
+events would never reach the page in time; the HTTP loop is std-only (the
+alternative listed below), three routes, one request per connection, a
+flush per event. Shipped: `serve_http.rs`, `ui/src/web-bridge.js` (fetch +
+SSE behind the existing controller), loopback-only with a Host check, CSP
+headers, the same event and command contract as the Tauri host. The text
+below is the proposal as written.
 
 ## Why
 
