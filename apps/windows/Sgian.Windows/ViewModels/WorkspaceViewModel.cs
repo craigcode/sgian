@@ -48,6 +48,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     public WorkspaceViewModel(DispatcherQueue dispatcher)
     {
         _dispatcher = dispatcher;
+        DaemonClient.ClientTokenLookup ??= CredentialStore.Load;
         var settings = AppSettings.Load();
         RecentWorkspaces = settings.RecentWorkspaces ?? [];
         var environment = Environment.GetEnvironmentVariable("SGIAN_WORKSPACE");
@@ -133,6 +134,19 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     }
 
     public async Task StartAsync() => await ConnectAsync(WorkspacePath);
+
+    /// <summary>Whether the environment supplies the credential (it then overrides the vault).</summary>
+    public bool CredentialFromEnvironment => DaemonClient.ClientTokenFromEnvironment() is not null;
+
+    public bool HasStoredCredential => CredentialStore.Load(WorkspacePath) is not null;
+
+    /// <summary>Store (or, with null, forget) this workspace's credential in the vault and reconnect so the daemon binds the connection to it.</summary>
+    public async Task SetClientCredentialAsync(string? token)
+    {
+        try { CredentialStore.Save(WorkspacePath, token); }
+        catch (Exception error) { ErrorMessage = $"The credential could not be saved: {error.Message}"; return; }
+        await ConnectAsync(WorkspacePath);
+    }
 
     public async Task ConnectAsync(string workspace)
     {

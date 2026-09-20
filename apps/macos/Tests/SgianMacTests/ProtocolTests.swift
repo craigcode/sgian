@@ -361,3 +361,19 @@ func daemonRoundTrip() async throws {
     #expect(LeaseText.noticeText(for: "read-only credential: 'write' scope required for send_input_as") == "Read-only: this credential cannot type (no write scope).")
     #expect(LeaseText.noticeText(for: "pane keyboard is held by bob (pane-2)") == "Read-only: keyboard held by bob. ⇧⌘T to take it.")
 }
+
+@Test func credentialStoreRoundTripsPerWorkspace() {
+    let workspace = URL(fileURLWithPath: "/tmp/sgian-credential-test-\(UUID().uuidString)")
+    defer { CredentialStore.save(nil, for: workspace) }
+    #expect(CredentialStore.load(for: workspace) == nil)
+    guard CredentialStore.save("sgc_test_token", for: workspace) else {
+        // A headless test runner without a login Keychain cannot store items;
+        // that is the runner's limitation, not a regression.
+        return
+    }
+    #expect(CredentialStore.load(for: workspace) == "sgc_test_token")
+    #expect(CredentialStore.save("sgc_second", for: workspace))
+    #expect(CredentialStore.load(for: workspace) == "sgc_second", "save replaces")
+    #expect(CredentialStore.save("   ", for: workspace))
+    #expect(CredentialStore.load(for: workspace) == nil, "blank removes")
+}

@@ -55,8 +55,9 @@ workspace token but need `write` from a credential. The hello response carries
 Under `identity: required` the workspace token has `read` and `admin` only.
 A refused request says `read-only credential: '<scope>' scope required for
 <command>`; clients show it as the same read-only notice a lease refusal
-gets. Clients read `SGIAN_CLIENT_TOKEN` (or `SGIAN_CLIENT_TOKEN_FILE`) and
-take their holder from the hello.
+gets. Clients read `SGIAN_CLIENT_TOKEN` (or `SGIAN_CLIENT_TOKEN_FILE`), then
+a per-workspace stored credential (macOS login Keychain, Windows credential
+vault), and take their holder from the hello.
 A subscription sends `{"command":"subscribe"}` after the hello and
 then receives newline-delimited events until disconnect. The native client
 advertises `subscribe-ack`; when the daemon advertises the same capability, the
