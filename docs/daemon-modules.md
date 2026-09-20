@@ -23,9 +23,9 @@ API: the wire contract is the JSON in `docs/native-ipc.md`.
 | `serve.rs` | 1,453 | `run_daemon`, the accept loop (peer-uid check), the hello gate, subscriptions, the framed request loop. |
 | `daemon_client.rs` | 1,418 | `DaemonConnection` and the ctl-side `DaemonClient`, token and data-dir helpers. |
 | `ctl.rs` | 5,370 | `sgian ctl`: option parsing, every command, its argument parser and printer, the help text. |
-| `tests.rs` | 19,632 | The whole unit and in-process integration suite (`TestDaemon`). |
+| `tests/` | 19,704 | The unit and in-process integration suite: `mod.rs` (shared transport helpers), `harness.rs` (`TestDaemon`), and one file per area (terminal, env_scrub, ctl_parsers, ctl_run, observability, lifecycle, config, agents, lease_identity). |
 
 Where to start for a change: a new request is a variant in `lib.rs`, a
 scope in `identity.rs::request_scope`, a handler on `DaemonServer`, a ctl
-verb in `ctl.rs`, and a test in `tests.rs`. A new client-visible field is
+verb in `ctl.rs`, and a test in the matching `tests/` file. A new client-visible field is
 additive on the snapshot or an event, mirrored in `docs/native-ipc.md`.
