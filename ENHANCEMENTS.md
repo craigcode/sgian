@@ -172,6 +172,10 @@ Shipped (2026-09-16):
   `output_warning` event, in `find --json` and `ctl agent`
   (`HIDDEN-OUTPUT …`), and in the bootstrap snapshot's `output_warnings`.
 
+- **Served view (M7).** `ctl serve` hosts the web client on loopback for
+  a device that reaches the machine over `ssh -L`: the same controller over
+  fetch + SSE, read-only unless `--allow-write`, acting as the process's
+  credential so every action is attributed (`docs/design/served-view.md`).
 - **Per-client identity (M6).** `ctl identity issue|list|revoke` mints
   bearer credentials with `read`/`write`/`admin` scopes; a credential fixes
   its holder (the daemon rewrites unattributed input to it and refuses any
@@ -214,9 +218,7 @@ Open, in order:
   (the Tauri client has both: `⚠ N` badge, overview grouped by project with
   the roll-up); stripping for agent panes; per-project shared context notes
   under git.
-- **M5 SSM / ECS Exec target**; **M7 a served read-mostly UI** over the
-  SSH tunnel for a phone (proposal: `docs/design/served-view.md`; M6
-  identity is in place for it).
+- **M5 SSM / ECS Exec target**.
 
 ## 4. Workbench UX
 

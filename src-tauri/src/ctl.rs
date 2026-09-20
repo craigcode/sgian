@@ -915,6 +915,13 @@ pub(crate) fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             let parsed = parse_statusline_args(&options.args[1..])?;
             control_statusline(options.workspace, parsed, options.json)
         }
+        "serve" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_serve_args(options.workspace, &options.args[1..])?;
+            control_serve(parsed)
+        }
         "identity" => {
             if has_help_flag(&options.args[1..]) {
                 return print_control_help();
@@ -5178,6 +5185,13 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   output (fed the same payload) or a compact
                                   default line. Always exits 0; --json prints
                                   the daemon's answer instead.
+  serve [--port N] [--allow-write]
+                                Host the web client on http://127.0.0.1:N
+                                  (default 8321) for a device that reaches this
+                                  machine over `ssh -L`. Read-only unless
+                                  --allow-write; acts as this process's
+                                  credential (SGIAN_CLIENT_TOKEN) or the
+                                  workspace token. Never binds beyond loopback.
   identity [list]               Issued client credentials (id, holder, scopes)
   identity issue --holder NAME [--scope read,write,admin]
                                 Issue a per-client credential; the token is

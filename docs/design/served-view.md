@@ -1,6 +1,11 @@
 # A served read-mostly view over the tunnel (M7)
 
-Status: proposal, 2026-09-19. One page. The owner picks; then it gets built.
+Status: decided and built, 2026-09-19 (decisions: a `sgian ctl serve`
+subcommand, read-only by default with `--allow-write`, assets embedded with
+`include_dir`, `tiny_http`). Shipped: `serve_http.rs`, `ui/src/web-bridge.js`
+(fetch + SSE behind the existing controller), loopback-only with a Host
+check, CSP headers, the same event and command contract as the Tauri host.
+The text below is the proposal as written.
 
 ## Why
 

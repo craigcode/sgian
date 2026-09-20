@@ -36,6 +36,10 @@ regex = "1"
 vt100 = "0.16.2"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
+# The built web client embedded for `sgian serve` (docs/design/served-view.md);
+# build.rs makes sure the directory exists so a daemon-only build without a
+# frontend still compiles. The HTTP loop itself is std-only (serve_http.rs).
+include_dir = "0.7"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

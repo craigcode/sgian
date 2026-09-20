@@ -693,26 +693,23 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
-pub(crate) fn emit_daemon_event(app: &AppHandle, event: DaemonEvent) {
-    match event {
+/// The frontend-facing name and payload for a daemon event, shared by the
+/// Tauri host (`emit_daemon_event`) and `sgian serve` (server-sent events)
+/// so both clients see the same contract. `None` for events the frontend
+/// never needs (`subscribe_ack`).
+pub(crate) fn frontend_event(event: DaemonEvent) -> Option<(&'static str, Value)> {
+    Some(match event {
         DaemonEvent::PtyOutput { pane_id, data } => {
-            emit_pty_output(app, &pane_id, data);
+            ("pty-output", json!({ "pane_id": pane_id, "data": data }))
         }
-        DaemonEvent::PaneEnded { pane_id, exit_code } => {
-            let _ = app.emit("pane-ended", PaneEnded { pane_id, exit_code });
-        }
-        DaemonEvent::PaneCreated { pane } => {
-            let _ = app.emit("pane-created", pane);
-        }
-        DaemonEvent::PaneClosed { pane_id } => {
-            let _ = app.emit("pane-closed", PaneClosed { pane_id });
-        }
-        DaemonEvent::PaneRenamed { pane } => {
-            let _ = app.emit("pane-renamed", pane);
-        }
-        DaemonEvent::ConfigChanged { config } => {
-            let _ = app.emit("config-changed", config);
-        }
+        DaemonEvent::PaneEnded { pane_id, exit_code } => (
+            "pane-ended",
+            json!({ "pane_id": pane_id, "exit_code": exit_code }),
+        ),
+        DaemonEvent::PaneCreated { pane } => ("pane-created", json!(pane)),
+        DaemonEvent::PaneClosed { pane_id } => ("pane-closed", json!({ "pane_id": pane_id })),
+        DaemonEvent::PaneRenamed { pane } => ("pane-renamed", json!(pane)),
+        DaemonEvent::ConfigChanged { config } => ("config-changed", json!(config)),
         // (T1) Agent state transitions ride through to the frontend verbatim.
         DaemonEvent::AgentState {
             pane_id,
@@ -721,7 +718,7 @@ pub(crate) fn emit_daemon_event(app: &AppHandle, event: DaemonEvent) {
             mode,
         } => {
             let unattended = is_unattended_mode(mode.as_deref());
-            let _ = app.emit(
+            (
                 "agent-state",
                 json!({
                     "pane_id": pane_id,
@@ -730,62 +727,56 @@ pub(crate) fn emit_daemon_event(app: &AppHandle, event: DaemonEvent) {
                     "mode": mode,
                     "unattended": unattended,
                 }),
-            );
+            )
         }
         DaemonEvent::OutputWarning {
             pane_id,
             added,
             total,
-        } => {
-            let _ = app.emit(
-                "output-warning",
-                json!({ "pane_id": pane_id, "added": added, "total": total }),
-            );
-        }
+        } => (
+            "output-warning",
+            json!({ "pane_id": pane_id, "added": added, "total": total }),
+        ),
         DaemonEvent::AgentUsage { pane_id, usage } => {
-            let _ = app.emit("agent-usage", json!({ "pane_id": pane_id, "usage": usage }));
+            ("agent-usage", json!({ "pane_id": pane_id, "usage": usage }))
         }
         // The whole project table after a change; the overview groups by it.
         DaemonEvent::ProjectsChanged { projects } => {
-            let _ = app.emit("projects-changed", json!({ "projects": projects }));
+            ("projects-changed", json!({ "projects": projects }))
         }
         // Keyboard lease transitions ride to the frontend as `lease-state`
-        // (docs/design/keyboard-lease-and-ledger.md); the M2 client work
-        // renders them. Unknown to older frontends, which ignore the name.
+        // (docs/design/keyboard-lease-and-ledger.md). Unknown to older
+        // frontends, which ignore the name.
         DaemonEvent::LeaseState {
             pane_id,
             transition,
             holder,
             since_ms,
             note,
-        } => {
-            let _ = app.emit(
-                "lease-state",
-                json!({
-                    "pane_id": pane_id,
-                    "transition": transition,
-                    "holder": holder,
-                    "since_ms": since_ms,
-                    "note": note,
-                }),
-            );
-        }
-        // (T2) Normalized agent conversation events. The Tauri payload keeps
+        } => (
+            "lease-state",
+            json!({
+                "pane_id": pane_id,
+                "transition": transition,
+                "holder": holder,
+                "since_ms": since_ms,
+                "note": note,
+            }),
+        ),
+        // (T2) Normalized agent conversation events. The frontend payload keeps
         // the contract's {pane_id, event} shape (the daemon-wire field is
-        // `payload` only because of the enum's internal tag — see the
-        // AgentEvent variant's comment).
+        // `payload` only because of the enum's internal tag).
         DaemonEvent::AgentEvent { pane_id, event } => {
-            let _ = app.emit(
-                "agent-event",
-                json!({
-                    "pane_id": pane_id,
-                    "event": event,
-                }),
-            );
+            ("agent-event", json!({ "pane_id": pane_id, "event": event }))
         }
-        // Consumed by await_subscribe_ack before the event loop starts; if one
-        // ever reaches here it carries nothing the GUI needs.
-        DaemonEvent::SubscribeAck => {}
+        // Consumed by await_subscribe_ack before the event loop starts.
+        DaemonEvent::SubscribeAck => return None,
+    })
+}
+
+pub(crate) fn emit_daemon_event(app: &AppHandle, event: DaemonEvent) {
+    if let Some((name, payload)) = frontend_event(event) {
+        let _ = app.emit(name, payload);
     }
 }
 
