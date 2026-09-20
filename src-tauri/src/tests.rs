@@ -7342,8 +7342,28 @@ fn spawn_run_daemon(shell: &str) -> (TestDaemon, DaemonClient, String) {
         })
         .expect("create should succeed");
 
-    // Brief settle so the shell is ready to accept input on the PTY.
-    thread::sleep(Duration::from_millis(100));
+    // Wait for the prompt to draw and the pane to go quiet before anyone
+    // types: a write that races the shell's startup terminal handshake can
+    // be partly swallowed under heavy parallel load (the same race
+    // `await_shell_ready` closes for the in-process server), which showed
+    // up as a rare failure in `control_run_across_posix_shells`.
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        let snapshot: Value = client
+            .request(DaemonRequest::Snapshot {
+                pane_id: pane.id.clone(),
+            })
+            .unwrap_or(Value::Null);
+        if snapshot["revision"].as_u64().unwrap_or(0) > 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+    let _ = client.request::<Value>(DaemonRequest::Wait {
+        pane_id: pane.id.clone(),
+        condition: WaitCondition::Idle(120),
+        timeout_ms: Some(5000),
+    });
 
     (daemon, client, pane.id)
 }
