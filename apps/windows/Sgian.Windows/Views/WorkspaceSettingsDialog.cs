@@ -1,6 +1,7 @@
 using System.Text.Json.Nodes;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Sgian.Protocol;
 using Sgian.Windows.ViewModels;
 
 namespace Sgian.Windows.Views;
@@ -71,6 +72,28 @@ internal static class WorkspaceSettingsDialog
             profiles.Add(profile); RefreshProfiles(); name.Text = ""; message.Text = "Save to apply the new profile.";
         };
         panel.Children.Add(add); panel.Children.Add(message);
+        panel.Children.Add(new TextBlock { Text = "Identity", FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
+        panel.Children.Add(new TextBlock { Text = $"Acting as {model.Holder}", TextWrapping = TextWrapping.Wrap });
+        PasswordBox? credential = null;
+        var forgetCredential = false;
+        if (model.CredentialFromEnvironment)
+        {
+            panel.Children.Add(new TextBlock { Text = "The credential comes from SGIAN_CLIENT_TOKEN in this app's environment and overrides the vault.", TextWrapping = TextWrapping.Wrap });
+        }
+        else
+        {
+            credential = new PasswordBox { Header = "Client credential (sgc_…, from `sgian ctl identity issue`)" };
+            panel.Children.Add(credential);
+            if (model.HasStoredCredential)
+            {
+                var forget = new Button { Content = "Forget credential" };
+                forget.Click += (_, _) => { forgetCredential = true; credential.Password = ""; message.Text = "The credential will be removed when you save."; };
+                panel.Children.Add(forget);
+            }
+            panel.Children.Add(new TextBlock { Text = model.HasStoredCredential
+                ? "A credential is stored for this workspace; the daemon attributes your input and leases to it."
+                : $"Without a credential this PC connects with the workspace token as {LeaseState.DefaultHolder()}.", TextWrapping = TextWrapping.Wrap });
+        }
         var dialog = new ContentDialog { XamlRoot = root, Title = $"Settings · {Path.GetFileName(model.WorkspacePath)}",
             Content = new ScrollViewer { Content = panel, MaxHeight = 520 }, PrimaryButtonText = "Save", CloseButtonText = "Cancel" };
         dialog.PrimaryButtonClick += async (_, args) =>
@@ -88,6 +111,8 @@ internal static class WorkspaceSettingsDialog
                 next["restore_policy"] = restore.SelectedItem as string;
                 next["profiles"] = profiles.DeepClone();
                 await model.WriteConfigurationAsync(next, generation);
+                if (forgetCredential) await model.SetClientCredentialAsync(null);
+                else if (credential is not null && !string.IsNullOrWhiteSpace(credential.Password)) await model.SetClientCredentialAsync(credential.Password);
             }
             catch (Exception error) { args.Cancel = true; message.Text = error.Message; }
             finally { dialog.IsPrimaryButtonEnabled = true; deferral.Complete(); }

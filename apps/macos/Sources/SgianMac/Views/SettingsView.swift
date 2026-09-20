@@ -16,6 +16,7 @@ struct SettingsView: View {
     @State private var profileKind = "shell"
     @State private var profileBackend = "claude"
     @State private var profileModel = ""
+    @State private var credential = ""
     @State private var message = ""
     @State private var loaded = false
     @State private var saving = false
@@ -80,6 +81,33 @@ struct SettingsView: View {
                         TextField("Model (optional)", text: $profileModel)
                     }
                     Button("Add Profile", action: addProfile).disabled(profileName.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                Section("Identity") {
+                    Text("Acting as \(model.holder)")
+                    if model.credentialFromEnvironment {
+                        Text("The credential comes from SGIAN_CLIENT_TOKEN in this app’s environment and overrides the Keychain.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        SecureField("Client credential (sgc_…, from `sgian ctl identity issue`)", text: $credential)
+                        HStack {
+                            Button("Use Credential") {
+                                model.setClientCredential(credential)
+                                credential = ""
+                                message = "Credential stored in the login Keychain; reconnecting."
+                            }
+                            .disabled(credential.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            if model.hasStoredCredential {
+                                Button("Forget Credential") {
+                                    model.setClientCredential(nil)
+                                    message = "Credential removed; reconnecting with the workspace token."
+                                }
+                            }
+                        }
+                        Text(model.hasStoredCredential
+                             ? "A credential is stored for this workspace; the daemon attributes your input and leases to it."
+                             : "Without a credential this Mac connects with the workspace token as \(WorkspaceModel.defaultHolder()).")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 Section("Workspace") {
                     Text(model.workspaceURL.path).textSelection(.enabled)

@@ -26,6 +26,12 @@ public sealed class DaemonClient : IAsyncDisposable
     /// <summary>The holder the daemon bound this client to (from the hello's identity), or null for the workspace token.</summary>
     public string? IdentityHolder { get; private set; }
 
+    /// <summary>
+    /// An app-supplied lookup for a stored per-workspace credential (the Windows credential
+    /// vault in the native app); consulted after the environment. Takes the workspace path.
+    /// </summary>
+    public static Func<string, string?>? ClientTokenLookup { get; set; }
+
     /// <summary>(M6) The per-client credential this process presents, if any: SGIAN_CLIENT_TOKEN, else the first line of SGIAN_CLIENT_TOKEN_FILE.</summary>
     public static string? ClientTokenFromEnvironment()
     {
@@ -49,7 +55,7 @@ public sealed class DaemonClient : IAsyncDisposable
             cancellationToken,
             onProgress).ConfigureAwait(false);
         onProgress?.Invoke("Reading daemon authentication token");
-        var clientToken = ClientTokenFromEnvironment();
+        var clientToken = ClientTokenFromEnvironment() ?? ClientTokenLookup?.Invoke(workspace);
         var token = File.Exists(endpoint.TokenPath)
             ? (await File.ReadAllTextAsync(endpoint.TokenPath, cancellationToken).ConfigureAwait(false)).Trim()
             : "";

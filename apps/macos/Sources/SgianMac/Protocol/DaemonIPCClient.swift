@@ -135,8 +135,14 @@ final class DaemonIPCClient: @unchecked Sendable {
         return first.isEmpty ? nil : first
     }
 
+    /// The credential this client presents for a workspace: the environment
+    /// first, then the login Keychain (`CredentialStore`).
+    static func clientToken(for workspace: URL) -> String? {
+        clientTokenFromEnvironment() ?? CredentialStore.load(for: workspace)
+    }
+
     private static func authenticatedSocket(locator: WorkspaceLocator) throws -> AuthenticatedSocket {
-        let clientToken = clientTokenFromEnvironment()
+        let clientToken = clientToken(for: locator.workspaceURL)
         let fileToken = (try? String(contentsOf: locator.tokenURL, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // A remote client has no workspace token file; its credential rides
