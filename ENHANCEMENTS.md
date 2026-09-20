@@ -215,7 +215,8 @@ Open, in order:
   the roll-up); stripping for agent panes; per-project shared context notes
   under git.
 - **M5 SSM / ECS Exec target**; **M7 a served read-mostly UI** over the
-  SSH tunnel for a phone (M6 identity is in place for it).
+  SSH tunnel for a phone (proposal: `docs/design/served-view.md`; M6
+  identity is in place for it).
 
 ## 4. Workbench UX
 
