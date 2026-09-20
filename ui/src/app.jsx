@@ -1238,22 +1238,27 @@ function SessionOverview({ state, controller }) {
         data-pane-id={pane.id}
         data-active={pane.id === state.activePaneId ? "true" : undefined}
       >
-        <td>{paneLabel(pane, index)}</td>
-        <td>{pane.kind}</td>
-        <td>{runtime}</td>
-        <td>{agentAttentionLabel(agentInfo)}</td>
-        <td className="overview-keyboard">{holderText(state.leases.get(pane.id))}</td>
-        <td className={warning ? "overview-output overview-output-warning" : "overview-output"}>
+        <td className="overview-pane" data-label="Pane">{paneLabel(pane, index)}</td>
+        <td data-label="Kind">{pane.kind}</td>
+        <td data-label="Runtime">{runtime}</td>
+        <td data-label="Agent">{agentAttentionLabel(agentInfo)}</td>
+        <td className="overview-keyboard" data-label="Keyboard">{holderText(state.leases.get(pane.id))}</td>
+        <td
+          className={warning ? "overview-output overview-output-warning" : "overview-output"}
+          data-label="Output"
+        >
           {warning ? `⚠ ${outputWarningSummary(warning)}` : "—"}
         </td>
-        <td className="overview-usage">{usage ? usageText(usage) : "—"}</td>
-        <td>{formatLastActivity(lastActivity, now)}</td>
-        <td className="overview-actions">
+        <td className="overview-usage" data-label="Usage">{usage ? usageText(usage) : "—"}</td>
+        <td data-label="Activity">{formatLastActivity(lastActivity, now)}</td>
+        <td className="overview-actions" data-label="Actions">
           <button
             type="button"
             className="overview-action"
             onClick={() => {
-              controller.focusPane(pane.id);
+              const narrow = window.matchMedia?.("(max-width: 760px)")?.matches;
+              if (narrow) controller.focusPaneZoomed(pane.id);
+              else controller.focusPane(pane.id);
               controller.closeOverview();
             }}
           >

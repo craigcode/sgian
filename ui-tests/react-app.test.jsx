@@ -4,6 +4,7 @@ import { cleanup, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "../ui/src/app.jsx";
 import { createAppController } from "../ui/src/app-controller.js";
+import { isZoomed } from "../ui/src/zoom.js";
 
 class FakeTerminal {
   static instances = [];
@@ -53,6 +54,7 @@ class FakeResizeObserver {
 }
 
 function createHarness({
+  landing,
   panes = [{ id: "pane-a", title: "term-a", kind: "shell", created_at_ms: 1 }],
   activePaneId = panes[0]?.id ?? null,
   leases = {},
@@ -106,7 +108,7 @@ function createHarness({
     listeners.set(name, handler);
     return unlisten;
   });
-  const controller = createAppController({ nativeInvoke: invoke, nativeListen: listen });
+  const controller = createAppController({ nativeInvoke: invoke, nativeListen: listen, landing });
   return { controller, invoke, listeners, unlisten };
 }
 
@@ -670,5 +672,38 @@ describe("usage from the status line", () => {
     );
     expect(overview.querySelector('tr[data-pane-id="pane-b"] .overview-usage').textContent).toBe("—");
     expect(overview.querySelector(".overview-group-limit").textContent).toBe("5h 23%");
+  });
+});
+
+describe("served page landing", () => {
+  it("opens the overview after boot when landing is overview, with labelled cells for the card layout", async () => {
+    const { controller } = createHarness({ landing: "overview" });
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    await waitFor(() => expect(controller.state.overviewOpen).toBe(true));
+    const overview = view.getByRole("dialog", { name: "Session overview" });
+    const labels = Array.from(overview.querySelectorAll('tr[data-pane-id="pane-a"] td')).map(
+      (cell) => cell.dataset.label,
+    );
+    expect(labels).toEqual(["Pane", "Kind", "Runtime", "Agent", "Keyboard", "Output", "Usage", "Activity", "Actions"]);
+    // Focus is one tap: it closes the overview and shows the pane, zoomed
+    // when the screen is narrow.
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = () => ({ matches: true });
+    try {
+      const user = userEvent.setup();
+      await user.click(overview.querySelector('tr[data-pane-id="pane-a"] .overview-action'));
+      await waitFor(() => expect(controller.state.overviewOpen).toBe(false));
+      expect(isZoomed(controller.state.zoom)).toBe(true);
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
+  });
+
+  it("stays on the panes by default", async () => {
+    const { controller } = createHarness();
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    expect(controller.state.overviewOpen).toBe(false);
   });
 });

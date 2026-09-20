@@ -9,7 +9,8 @@ events would never reach the page in time; the HTTP loop is std-only (the
 alternative listed below), three routes, one request per connection, a
 flush per event. Shipped: `serve_http.rs`, `ui/src/web-bridge.js` (fetch +
 SSE behind the existing controller), loopback-only with a Host check, CSP
-headers, the same event and command contract as the Tauri host. The text
+headers, the same event and command contract as the Tauri host; the served
+page lands on the overview, which is a stack of cards under 760 px. The text
 below is the proposal as written.
 
 ## Why
