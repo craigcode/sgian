@@ -218,6 +218,9 @@ A single binary runs in three modes:
   credential in `SGIAN_CLIENT_TOKEN` (or the workspace token), so everything
   it does is attributed like any other client. The web client is embedded in
   the binary when it was built before the daemon (`npm run frontend:build`).
+  The served page opens on the session overview, which becomes a stack of
+  cards at phone width; a pane is one tap away and the overview is one tap
+  back.
 
   ```bash
   sgian ctl serve                                   # on the desk machine

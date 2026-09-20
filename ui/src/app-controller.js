@@ -160,7 +160,15 @@ function initialState() {
   };
 }
 
-export function createAppController({ nativeInvoke, nativeListen } = {}) {
+/**
+ * @param {object} [options]
+ * @param {Function} [options.nativeInvoke]
+ * @param {Function} [options.nativeListen]
+ * @param {"panes"|"overview"} [options.landing] The first screen after boot.
+ *   The served page (`sgian ctl serve`) lands on the overview: on a phone the
+ *   board is the useful screen and a pane is one tap away.
+ */
+export function createAppController({ nativeInvoke, nativeListen, landing = "panes" } = {}) {
   const state = initialState();
   const fallbackPanes = new Map();
   const subscribers = new Set();
@@ -705,6 +713,7 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     state.booted = true;
     await loadAppearanceConfig();
     void loadClientHolder();
+    if (landing === "overview" && !state.overviewOpen) openOverview();
     notify();
     void persistWorkspaceLayout();
     for (const pane of snapshot.panes || []) {
@@ -1181,6 +1190,18 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     if (isZoomed(state.zoom)) syncZoomWithActive(state.zoom, id);
     notify();
     void syncActivePane(id);
+  }
+
+  /**
+   * Focus a pane and show only it. The overview's Focus does this on a
+   * narrow screen (the served page on a phone), where a split layout is
+   * unreadable; the zoom toggle in the toolbar leaves it again.
+   */
+  function focusPaneZoomed(id) {
+    if (!state.panes.has(id)) return;
+    focusPane(id);
+    if (!isZoomed(state.zoom)) toggleZoom(state.zoom, id);
+    notify();
   }
 
   function focusPaneByIndex(index) {
@@ -1680,6 +1701,7 @@ export function createAppController({ nativeInvoke, nativeListen } = {}) {
     openPalette,
     closePalette,
     openOverview,
+    focusPaneZoomed,
     closeOverview,
     focusNextAttentionPane,
     takeLease,

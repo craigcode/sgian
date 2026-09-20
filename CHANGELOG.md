@@ -10,7 +10,9 @@ follow SemVer once the first public tag exists.
 - `ctl serve [--port N] [--allow-write]`: host the web client on loopback
   for a phone or laptop over an SSH tunnel; read-only by default, acts as
   the process's credential, embedded assets, loopback-only with a Host
-  check. The web client gains a fetch + SSE bridge for the served page.
+  check. The web client gains a fetch + SSE bridge for the served page,
+  lands on the session overview, and renders the overview as a stack of
+  cards at phone width.
 - Native clients store a client credential per workspace (macOS login
   Keychain, Windows credential vault) behind Settings → Identity, with a
   Forget button; `SGIAN_CLIENT_TOKEN` still overrides when set.

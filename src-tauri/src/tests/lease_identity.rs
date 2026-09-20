@@ -3384,6 +3384,18 @@ fn serve_answers_invokes_streams_events_and_stays_read_only_by_default() {
             .contains("read-only view"),
         "{body}"
     );
+    // View-local writes succeed silently for a viewer instead of refusing:
+    // the page calls them for every pane on boot.
+    let (_, _, body) = http(
+        viewer.addr,
+        &post(&format!(
+            r#"{{"command":"ensure_pane_terminal","args":{{"paneId":"{pane_id}"}}}}"#
+        )),
+        "",
+    );
+    let answer: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(answer["ok"], json!(true), "{body}");
+    assert!(is_view_local_write("resize_pane_terminal") && !is_view_local_write("write_to_pane"));
     // Not a loopback host: refused.
     let (status, _, _) = http(
         viewer.addr,

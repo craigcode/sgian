@@ -1060,13 +1060,112 @@ h1 {
     display: none;
   }
 
+  /* Every toolbar control stays reachable by scrolling sideways: on a phone
+     the overview button is the way back from a pane. */
   .toolbar {
     gap: 4px;
+    overflow-x: auto;
+    flex-wrap: nowrap;
   }
 
   .icon-button {
     width: 30px;
     height: 30px;
+  }
+
+  /* The overview as a stack of cards: nine columns do not fit a phone. Each
+     row becomes a card, each cell a "label  value" line, the project heading
+     a card divider. The served page lands here (docs/design/served-view.md). */
+  .overview-modal {
+    width: 100vw;
+    max-height: 100vh;
+    border-radius: 0;
+  }
+
+  .overview-body {
+    padding: 8px 10px 12px;
+    overflow-x: hidden;
+  }
+
+  .overview-table,
+  .overview-table tbody,
+  .overview-table tr,
+  .overview-table td {
+    display: block;
+    width: 100%;
+  }
+
+  .overview-table thead {
+    display: none;
+  }
+
+  .overview-table tbody tr[data-pane-id] {
+    margin: 8px 0;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-soft);
+  }
+
+  .overview-table tbody tr[data-active="true"] {
+    border-color: var(--green);
+  }
+
+  .overview-table td {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 3px 0;
+    border-bottom: 0;
+    white-space: normal;
+    word-break: break-word;
+  }
+
+  .overview-table td::before {
+    content: attr(data-label);
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+  }
+
+  .overview-table td.overview-pane {
+    font-weight: 650;
+    font-size: 14px;
+  }
+
+  .overview-table td.overview-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    padding-top: 8px;
+  }
+
+  .overview-table td.overview-actions::before {
+    display: none;
+  }
+
+  .overview-action {
+    min-height: 36px;
+    padding: 6px 14px;
+  }
+
+  .overview-group-row th {
+    display: block;
+    padding: 12px 2px 4px;
+    border-bottom: 0;
+  }
+
+  .overview-group-name {
+    display: block;
+    font-size: 14px;
+  }
+
+  .overview-group-goal,
+  .overview-group-rollup,
+  .overview-group-limit {
+    display: block;
+    margin: 2px 0 0;
   }
 }
 

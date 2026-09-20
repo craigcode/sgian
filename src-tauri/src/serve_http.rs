@@ -56,6 +56,20 @@ pub(crate) fn parse_serve_args(
     Ok(options)
 }
 
+/// Commands a read-only view answers locally with success instead of
+/// forwarding: they shape the desk's workspace (spawn a shell, resize the
+/// shared PTY, move the active pane, rewrite the layout) and a viewer must
+/// neither do that nor see a refusal for it in every pane on boot.
+pub(crate) fn is_view_local_write(command: &str) -> bool {
+    matches!(
+        command,
+        "ensure_pane_terminal"
+            | "resize_pane_terminal"
+            | "set_active_pane"
+            | "update_workspace_layout"
+    )
+}
+
 /// What a frontend `invoke` turns into. The names and camelCase argument
 /// keys are the Tauri command contract (`generate_handler!` in lib.rs and
 /// `ui/src/app-controller.js`), so the served page needs no changes.
@@ -468,7 +482,9 @@ fn handle_connection(
                     "{command} is not available in a served view: {why}"
                 )),
                 Ok(FrontendCall::Request(daemon_request)) => {
-                    if !allow_write && request_scope(&daemon_request) != ClientScope::Read {
+                    if !allow_write && is_view_local_write(command) {
+                        Ok(json!({ "ok": true }))
+                    } else if !allow_write && request_scope(&daemon_request) != ClientScope::Read {
                         Err(format!(
                             "read-only view: {command} needs `sgian ctl serve --allow-write` on the desk machine"
                         ))

@@ -22,8 +22,11 @@ async function initializeApplication() {
   const rootElement = document.querySelector("#root");
   if (!rootElement) throw new Error("Sgian root element is missing");
 
-  // Served by `sgian serve` (no Tauri): the same controller over fetch + SSE.
-  controller = createAppController(isServedPage() ? createWebBridge() : {});
+  // Served by `sgian ctl serve` (no Tauri): the same controller over fetch +
+  // SSE, landing on the overview (the board is what a phone wants first).
+  controller = createAppController(
+    isServedPage() ? { ...createWebBridge(), landing: "overview" } : {},
+  );
   // Begin native event subscription/snapshot loading before the initial xterm
   // layout effect can emit a resize. start() is idempotent when App mounts.
   controller.start();
