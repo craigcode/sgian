@@ -210,6 +210,19 @@ A single binary runs in three modes:
   The native apps also take a credential in Settings → Identity and keep it
   per workspace in the login Keychain (macOS) or the credential vault
   (Windows); the environment variable, when set, overrides the stored one.
+- `ctl serve [--port N] [--allow-write]`: host the web client on
+  `http://127.0.0.1:8321` for a phone or another laptop that reaches this
+  machine over an SSH tunnel (docs/design/served-view.md). It never binds
+  beyond loopback; the tunnel is the only door. The page is read-only unless
+  `--allow-write` is given on the desk machine, and it acts as the
+  credential in `SGIAN_CLIENT_TOKEN` (or the workspace token), so everything
+  it does is attributed like any other client. The web client is embedded in
+  the binary when it was built before the daemon (`npm run frontend:build`).
+
+  ```bash
+  sgian ctl serve                                   # on the desk machine
+  ssh -N -L 8321:127.0.0.1:8321 desk                # on the phone/laptop, then open http://localhost:8321
+  ```
 - `ctl project new|list|show|add|rm|delete|ledger|dossier` for projects: a
   named group of panes serving one goal, persisted with the workspace, with an
   attention roll-up (needs input / working / idle / unattended / keyboard

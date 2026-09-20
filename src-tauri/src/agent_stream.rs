@@ -1757,16 +1757,6 @@ impl OutputRouter {
     }
 }
 
-pub(crate) fn emit_pty_output(app: &AppHandle, pane_id: &str, data: String) {
-    let _ = app.emit(
-        "pty-output",
-        PtyOutput {
-            pane_id: pane_id.to_string(),
-            data,
-        },
-    );
-}
-
 pub(crate) fn drain_complete_utf8(pending: &mut Vec<u8>) -> Vec<String> {
     let mut chunks = Vec::new();
 

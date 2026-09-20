@@ -1,4 +1,11 @@
 fn main() {
+    // `sgian serve` embeds ../dist with include_dir!, which needs the directory
+    // to exist at compile time. A daemon-only build (cargo test in CI) has no
+    // frontend build; an empty directory then serves nothing, and `serve`
+    // says so at runtime.
+    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist");
+    let _ = std::fs::create_dir_all(&dist);
+    println!("cargo:rerun-if-changed={}", dist.display());
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "bootstrap_workspace",

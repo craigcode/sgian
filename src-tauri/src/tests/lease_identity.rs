@@ -3167,3 +3167,284 @@ fn lease_survives_daemon_restart_via_workspace_json() {
     .expect("server restarted again");
     assert_eq!(server.lease_infos().len(), 1, "ghost lease filtered");
 }
+
+#[test]
+fn serve_maps_frontend_commands_and_guards_assets() {
+    let call = frontend_command(
+        "write_to_pane",
+        &json!({ "paneId": "p1", "data": "ls\n" }),
+        "phone",
+    )
+    .expect("map");
+    assert_eq!(
+        call,
+        FrontendCall::Request(DaemonRequest::SendInputAs {
+            pane_id: "p1".into(),
+            input: "ls\n".into(),
+            holder: "phone".into(),
+            generation: None
+        })
+    );
+    let call = frontend_command(
+        "resize_pane_terminal",
+        &json!({ "paneId": "p1", "cols": 120, "rows": 0 }),
+        "phone",
+    )
+    .expect("resize");
+    assert!(matches!(
+        call,
+        FrontendCall::Request(DaemonRequest::ResizePaneTerminal {
+            cols: 120,
+            rows: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        frontend_command("take_lease", &json!({ "paneId": "p1", "force": true }), "phone").expect("take"),
+        FrontendCall::Request(DaemonRequest::TakeLease { ref holder, force: true, .. }) if holder == "phone"
+    ));
+    assert!(matches!(
+        frontend_command("create_agent_pane", &json!({ "backend": "droid" }), "x").expect("agent"),
+        FrontendCall::Request(DaemonRequest::CreateAgentPaneWithSpec {
+            backend: Some(AgentBackendKind::Droid),
+            ..
+        })
+    ));
+    assert!(frontend_command("create_agent_pane", &json!({ "backend": "nope" }), "x").is_err());
+    assert_eq!(
+        frontend_command("client_holder", &Value::Null, "x").expect("holder"),
+        FrontendCall::Holder
+    );
+    assert_eq!(
+        frontend_command("ui_smoke_enabled", &Value::Null, "x").expect("smoke"),
+        FrontendCall::SmokeDisabled
+    );
+    assert!(matches!(
+        frontend_command("install_update", &Value::Null, "x").expect("update"),
+        FrontendCall::Unsupported(_)
+    ));
+    assert!(
+        frontend_command("close_pane", &json!({}), "x").is_err(),
+        "missing paneId"
+    );
+    assert!(
+        frontend_command("shutdown", &Value::Null, "x").is_err(),
+        "not a frontend command"
+    );
+
+    assert_eq!(
+        sse_frame("pty-output", &json!({ "a": 1 })),
+        "event: pty-output\ndata: {\"a\":1}\n\n"
+    );
+    let (name, payload) = frontend_event(DaemonEvent::PaneClosed {
+        pane_id: "p".into(),
+    })
+    .expect("event");
+    assert_eq!((name, payload), ("pane-closed", json!({ "pane_id": "p" })));
+    assert!(frontend_event(DaemonEvent::SubscribeAck).is_none());
+
+    assert!(embedded_asset("/../Cargo.toml").is_none());
+    assert!(
+        host_is_loopback(Some("localhost:8321"))
+            && host_is_loopback(Some("127.0.0.1"))
+            && host_is_loopback(Some("[::1]:1"))
+    );
+    assert!(
+        !host_is_loopback(Some("evil.example"))
+            && !host_is_loopback(Some("localhost.evil:1"))
+            && !host_is_loopback(None)
+    );
+    let head = parse_request_head(
+        "POST /api/invoke?x=1 HTTP/1.1\r\nHost: localhost:8321\r\ncontent-length: 12\r\n",
+    )
+    .expect("parse");
+    assert_eq!(
+        head,
+        HttpRequest {
+            method: "POST".into(),
+            path: "/api/invoke".into(),
+            host: Some("localhost:8321".into()),
+            content_length: 12
+        }
+    );
+    assert!(parse_request_head("GARBAGE").is_none());
+    assert!(parse_request_head("GET / HTTP/1.1\r\nContent-Length: x\r\n").is_none());
+    assert!(embedded_asset("/assets//x.js").is_none());
+    let opts = parse_serve_args(
+        PathBuf::from("/w"),
+        &args(&["--port", "9000", "--allow-write"]),
+    )
+    .expect("args");
+    assert_eq!((opts.port, opts.allow_write), (9000, true));
+    assert_eq!(
+        parse_serve_args(PathBuf::from("/w"), &[])
+            .expect("bare")
+            .port,
+        SERVE_DEFAULT_PORT
+    );
+    assert!(parse_serve_args(PathBuf::from("/w"), &args(&["--port", "x"])).is_err());
+    assert!(parse_serve_args(PathBuf::from("/w"), &args(&["--bogus"])).is_err());
+}
+
+/// One HTTP exchange over a raw socket: status line, headers, body. For a
+/// streaming response, stop once the body contains `until`.
+#[cfg(unix)]
+fn http(addr: std::net::SocketAddr, request: &str, until: &str) -> (u16, String, String) {
+    use std::io::{Read as _, Write as _};
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if !until.is_empty() && String::from_utf8_lossy(&raw).contains(until) {
+                    break;
+                }
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&raw[..pos]).to_string();
+                    if let Some(len) = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Length: "))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                    {
+                        if raw.len() >= pos + 4 + len {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, head.to_string(), body.to_string())
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_answers_invokes_streams_events_and_stays_read_only_by_default() {
+    let daemon = TestDaemon::spawn(Config::default());
+    let client = daemon.client();
+    let initial: WorkspaceSnapshot = client
+        .request(DaemonRequest::BootstrapWorkspace)
+        .expect("bootstrap");
+    let pane_id = initial.panes[0].id.clone();
+
+    let viewer = start_serve_with(daemon.client(), 0, false).expect("serve");
+    let post = |body: &str| {
+        format!(
+            "POST /api/invoke HTTP/1.1\r\nHost: localhost:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            viewer.addr.port(),
+            body.len(),
+            body
+        )
+    };
+    let (status, _, body) = http(
+        viewer.addr,
+        &post(r#"{"command":"bootstrap_workspace","args":{}}"#),
+        "",
+    );
+    assert_eq!(status, 200);
+    let answer: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(answer["ok"], json!(true), "{body}");
+    assert_eq!(answer["result"]["panes"][0]["id"], json!(pane_id));
+    let (_, _, body) = http(
+        viewer.addr,
+        &post(r#"{"command":"client_holder","args":{}}"#),
+        "",
+    );
+    let answer: Value = serde_json::from_str(&body).expect("json");
+    assert!(answer["result"].as_str().is_some_and(|h| !h.is_empty()));
+    // Read-only by default: a write is refused before it reaches the daemon.
+    let (_, _, body) = http(
+        viewer.addr,
+        &post(&format!(
+            r#"{{"command":"write_to_pane","args":{{"paneId":"{pane_id}","data":"x"}}}}"#
+        )),
+        "",
+    );
+    let answer: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(answer["ok"], json!(false));
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("read-only view"),
+        "{body}"
+    );
+    // Not a loopback host: refused.
+    let (status, _, _) = http(
+        viewer.addr,
+        &format!(
+            "GET /api/events HTTP/1.1\r\nHost: evil.example:{}\r\nConnection: close\r\n\r\n",
+            viewer.addr.port()
+        ),
+        "",
+    );
+    assert_eq!(status, 403);
+    // Events stream: the connected comment arrives, then a real event after a change.
+    let (status, head, body) = http(
+        viewer.addr,
+        &format!(
+            "GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            viewer.addr.port()
+        ),
+        ": connected",
+    );
+    assert_eq!(status, 200);
+    assert!(head.contains("text/event-stream"), "{head}");
+    assert!(body.contains(": connected"), "{body}");
+    viewer.stop();
+
+    // With writes allowed the same call lands (attributed to the holder).
+    let writer = start_serve_with(daemon.client(), 0, true).expect("serve rw");
+    client
+        .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
+            pane_id: pane_id.clone(),
+        })
+        .expect("ensure terminal");
+    let post_rw = |body: String| {
+        format!(
+            "POST /api/invoke HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    };
+    let (_, _, body) = http(
+        writer.addr,
+        &post_rw(format!(
+            r#"{{"command":"write_to_pane","args":{{"paneId":"{pane_id}","data":""}}}}"#
+        )),
+        "",
+    );
+    let answer: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(answer["ok"], json!(true), "{body}");
+    // Unsupported desktop command: a clean error, not a crash.
+    let (_, _, body) = http(
+        writer.addr,
+        &post_rw(r#"{"command":"install_update","args":{}}"#.to_string()),
+        "",
+    );
+    let answer: Value = serde_json::from_str(&body).expect("json");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not available"),
+        "{body}"
+    );
+    writer.stop();
+    daemon.shutdown();
+}

@@ -3,6 +3,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./app.jsx";
 import { createAppController } from "./app-controller.js";
+import { createWebBridge, isServedPage } from "./web-bridge.js";
 import "./styles.css";
 
 export let controller = null;
@@ -21,7 +22,8 @@ async function initializeApplication() {
   const rootElement = document.querySelector("#root");
   if (!rootElement) throw new Error("Sgian root element is missing");
 
-  controller = createAppController();
+  // Served by `sgian serve` (no Tauri): the same controller over fetch + SSE.
+  controller = createAppController(isServedPage() ? createWebBridge() : {});
   // Begin native event subscription/snapshot loading before the initial xterm
   // layout effect can emit a resize. start() is idempotent when App mounts.
   controller.start();

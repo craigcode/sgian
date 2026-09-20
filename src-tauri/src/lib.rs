@@ -5905,6 +5905,8 @@ mod daemon_client;
 use daemon_client::*;
 mod ctl;
 use ctl::*;
+mod serve_http;
+use serve_http::*;
 /// (M12) One-click install from the update banner: re-check the feed and, when
 /// an update is available, download + install it, then restart the app. No
 /// update available (a stale banner or a raced check) is a no-op. Errors
