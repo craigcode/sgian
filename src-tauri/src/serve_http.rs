@@ -239,14 +239,20 @@ pub(crate) fn assets_present() -> bool {
     WEB_ASSETS.get_file("index.html").is_some()
 }
 
-/// One parsed HTTP/1.1 request: enough for three routes.
+/// One parsed HTTP/1.1 request: enough for three routes plus the session
+/// key, which arrives once in the URL (`?key=`) and afterwards as the
+/// `sgian_serve` cookie or the `X-Sgian-Key` header (curl, tests).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HttpRequest {
     pub(crate) method: String,
     pub(crate) path: String,
     pub(crate) host: Option<String>,
     pub(crate) content_length: usize,
+    pub(crate) query_key: Option<String>,
+    pub(crate) presented_key: Option<String>,
 }
+
+pub(crate) const SERVE_COOKIE: &str = "sgian_serve";
 
 const HEAD_MAX: usize = 64 * 1024;
 
@@ -264,6 +270,8 @@ pub(crate) fn parse_request_head(head: &str) -> Option<HttpRequest> {
     }
     let mut host = None;
     let mut content_length = 0;
+    let mut presented_key = None;
+    let mut cookie_key = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -273,13 +281,29 @@ pub(crate) fn parse_request_head(head: &str) -> Option<HttpRequest> {
             host = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("content-length") {
             content_length = value.parse().ok()?;
+        } else if name.eq_ignore_ascii_case("x-sgian-key") {
+            presented_key = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("cookie") {
+            cookie_key = value
+                .split(';')
+                .filter_map(|pair| pair.trim().split_once('='))
+                .find(|(k, _)| *k == SERVE_COOKIE)
+                .map(|(_, v)| v.trim().to_string());
         }
     }
+    let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+    let query_key = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == "key")
+        .map(|(_, v)| v.to_string());
     Some(HttpRequest {
         method,
-        path: target.split('?').next().unwrap_or("/").to_string(),
+        path: path.to_string(),
         host,
         content_length,
+        query_key,
+        presented_key: presented_key.or(cookie_key),
     })
 }
 
@@ -340,13 +364,35 @@ fn write_json(stream: &mut std::net::TcpStream, status: u16, body: &Value) -> st
     )
 }
 
-/// A running server: the bound address and the accept thread. `ctl serve`
-/// runs until its process ends; `stop` exists for embedders and tests.
+/// A running server: the bound address, the per-run session key and the
+/// accept thread. `ctl serve` runs until its process ends; `stop` exists for
+/// embedders and tests.
 pub(crate) struct ServeHandle {
     pub(crate) addr: std::net::SocketAddr,
+    /// Loopback TCP has no peer identity, so another local account could
+    /// otherwise drive the desk user's daemon through this port (S2 of the
+    /// 2026-09-20 review). The key is printed once with the URL, becomes an
+    /// HttpOnly SameSite=Strict cookie on first load, and every request
+    /// must carry it.
+    pub(crate) key: String,
     #[allow(dead_code)]
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ServeHandle {
+    /// The URL to open once: it sets the cookie and redirects to `/`.
+    pub(crate) fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/?key={}", self.addr.port(), self.key)
+    }
+}
+
+/// What every connection thread shares.
+struct ServeSession {
+    client: DaemonClient,
+    holder: String,
+    allow_write: bool,
+    key: String,
 }
 
 impl ServeHandle {
@@ -384,8 +430,17 @@ pub(crate) fn start_serve_with(
     let addr = listener
         .local_addr()
         .map_err(|error| format!("cannot read the listen address: {error}"))?;
+    let mut raw_key = [0u8; 24];
+    fill_secure_random(&mut raw_key)?;
+    let key = hex_encode(&raw_key);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::clone(&stop);
+    let session = Arc::new(ServeSession {
+        client,
+        holder,
+        allow_write,
+        key: key.clone(),
+    });
     let thread = thread::spawn(move || {
         for incoming in listener.incoming() {
             if stop_flag.load(Ordering::SeqCst) {
@@ -394,24 +449,22 @@ pub(crate) fn start_serve_with(
             let Ok(stream) = incoming else {
                 continue;
             };
-            let client = client.clone();
-            let holder = holder.clone();
-            thread::spawn(move || handle_connection(stream, &client, &holder, allow_write));
+            let session = Arc::clone(&session);
+            thread::spawn(move || handle_connection(stream, &session));
         }
     });
     Ok(ServeHandle {
         addr,
+        key,
         stop,
         thread: Some(thread),
     })
 }
 
-fn handle_connection(
-    mut stream: std::net::TcpStream,
-    client: &DaemonClient,
-    holder: &str,
-    allow_write: bool,
-) {
+fn handle_connection(mut stream: std::net::TcpStream, session: &ServeSession) {
+    let client = &session.client;
+    let holder = session.holder.as_str();
+    let allow_write = session.allow_write;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     // Read the head, then exactly Content-Length bytes of body.
     let mut raw: Vec<u8> = Vec::new();
@@ -459,6 +512,54 @@ fn handle_connection(
         );
         return;
     }
+    // The session key: `?key=` once (sets the cookie and redirects to `/`),
+    // then the cookie or header on everything. Anything else is refused
+    // before it can touch the daemon.
+    if let Some(offered) = request.query_key.as_deref() {
+        if constant_time_eq(offered, &session.key) {
+            let cookie = format!(
+                "{SERVE_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/",
+                session.key
+            );
+            let _ = write_response(
+                &mut stream,
+                303,
+                "See Other",
+                &[
+                    ("Location", "/"),
+                    ("Set-Cookie", &cookie),
+                    ("Cache-Control", "no-store"),
+                ],
+                b"",
+            );
+            return;
+        }
+    }
+    let keyed = request
+        .presented_key
+        .as_deref()
+        .is_some_and(|presented| constant_time_eq(presented, &session.key));
+    if !keyed {
+        let (kind, body): (&str, &[u8]) = if request.path.starts_with("/api/") {
+            (
+                "application/json",
+                br#"{"ok":false,"error":"missing or wrong session key"}"#,
+            )
+        } else {
+            (
+                "text/plain; charset=utf-8",
+                b"Open the URL that `sgian ctl serve` printed (it carries this run's key).",
+            )
+        };
+        let _ = write_response(
+            &mut stream,
+            401,
+            "Unauthorized",
+            &[("Content-Type", kind), ("Cache-Control", "no-store")],
+            body,
+        );
+        return;
+    }
     let mut body = raw[head_end + 4..].to_vec();
     while body.len() < request.content_length {
         match stream.read(&mut buf) {
@@ -488,6 +589,10 @@ fn handle_connection(
                         Err(format!(
                             "read-only view: {command} needs `sgian ctl serve --allow-write` on the desk machine"
                         ))
+                    } else if request_scope(&daemon_request) == ClientScope::Admin {
+                        // --allow-write is typing and leases, never configuration
+                        // or shutdown from a served page (S5 of the review).
+                        Err(format!("{command} is not available from a served view"))
                     } else {
                         client.request::<Value>(daemon_request)
                     }
@@ -609,8 +714,9 @@ pub(crate) fn control_serve(options: ServeOptions) -> Result<(), String> {
     let mut stdout = std::io::stdout();
     let _ = writeln!(
         stdout,
-        "serving the Sgian web client on http://127.0.0.1:{port} ({}); from another machine:\n  ssh -N -L {port}:127.0.0.1:{port} <this-host>   then open http://localhost:{port}",
-        if allow_write { "writes allowed" } else { "read-only; add --allow-write to type" }
+        "serving the Sgian web client ({}). Open this once; it sets this run's session cookie:\n  {}\nfrom another machine, first: ssh -N -L {port}:127.0.0.1:{port} <this-host>  then open the same URL with localhost",
+        if allow_write { "writes allowed" } else { "read-only; add --allow-write to type" },
+        handle.url()
     );
     let _ = stdout.flush();
     if let Some(thread) = handle.thread.take() {

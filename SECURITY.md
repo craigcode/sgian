@@ -15,7 +15,13 @@ daemon, so lease and refusal records attribute actions to a credential rather
 than a self-declared name. Only credential hashes are stored. With
 `identity: required`, the workspace token can read and administer but every
 write needs a credential. Remote access is an SSH-forwarded socket presenting
-a credential; the daemon never listens on the network.
+a credential; the daemon never listens on the network. `sgian ctl serve` is
+the one loopback HTTP listener in the binary: it hosts the web client on
+`127.0.0.1` for a device on an SSH tunnel, acts as its own process's
+credential, is read-only unless `--allow-write` (typing and leases, never
+configuration), and requires a per-run session key that it prints once as a
+URL and keeps as an `HttpOnly` `SameSite=Strict` cookie, because loopback TCP
+has no peer identity and another local account could otherwise reach it.
 Tokens, configuration, conversation logs, and scrollback are stored in the
 user's platform application-data directory. Conversation logs and terminal
 scrollback may contain sensitive information; do not include them in public

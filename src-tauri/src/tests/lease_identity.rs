@@ -3264,8 +3264,25 @@ fn serve_maps_frontend_commands_and_guards_assets() {
             method: "POST".into(),
             path: "/api/invoke".into(),
             host: Some("localhost:8321".into()),
-            content_length: 12
+            content_length: 12,
+            query_key: None,
+            presented_key: None,
         }
+    );
+    let keyed = parse_request_head(
+        "GET /api/events?key=abc HTTP/1.1\r\nHost: localhost\r\nCookie: a=b; sgian_serve=k1\r\n",
+    )
+    .expect("parse");
+    assert_eq!(keyed.query_key.as_deref(), Some("abc"));
+    assert_eq!(keyed.presented_key.as_deref(), Some("k1"));
+    let header = parse_request_head(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Sgian-Key: k2\r\nCookie: sgian_serve=k1\r\n",
+    )
+    .expect("parse");
+    assert_eq!(
+        header.presented_key.as_deref(),
+        Some("k2"),
+        "the header wins"
     );
     assert!(parse_request_head("GARBAGE").is_none());
     assert!(parse_request_head("GET / HTTP/1.1\r\nContent-Length: x\r\n").is_none());
@@ -3287,9 +3304,26 @@ fn serve_maps_frontend_commands_and_guards_assets() {
 }
 
 /// One HTTP exchange over a raw socket: status line, headers, body. For a
-/// streaming response, stop once the body contains `until`.
+/// streaming response, stop once the body contains `until`. `key` is sent
+/// as the `X-Sgian-Key` header (empty = none).
 #[cfg(unix)]
 fn http(addr: std::net::SocketAddr, request: &str, until: &str) -> (u16, String, String) {
+    http_keyed(addr, request, until, "")
+}
+
+#[cfg(unix)]
+fn http_keyed(
+    addr: std::net::SocketAddr,
+    request: &str,
+    until: &str,
+    key: &str,
+) -> (u16, String, String) {
+    let request = if key.is_empty() {
+        request.to_string()
+    } else {
+        request.replacen("\r\n", &format!("\r\nX-Sgian-Key: {key}\r\n"), 1)
+    };
+    let request = request.as_str();
     use std::io::{Read as _, Write as _};
     let mut stream = std::net::TcpStream::connect(addr).expect("connect");
     stream
@@ -3343,37 +3377,90 @@ fn serve_answers_invokes_streams_events_and_stays_read_only_by_default() {
     let pane_id = initial.panes[0].id.clone();
 
     let viewer = start_serve_with(daemon.client(), 0, false).expect("serve");
+    let key = viewer.key.clone();
+    let port = viewer.addr.port();
     let post = |body: &str| {
         format!(
-            "POST /api/invoke HTTP/1.1\r\nHost: localhost:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            viewer.addr.port(),
+            "POST /api/invoke HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         )
     };
+    // No key: nothing reaches the daemon, page or API.
     let (status, _, body) = http(
         viewer.addr,
         &post(r#"{"command":"bootstrap_workspace","args":{}}"#),
         "",
     );
+    assert_eq!(status, 401, "{body}");
+    let (status, _, body) = http(
+        viewer.addr,
+        &format!("GET / HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"),
+        "",
+    );
+    assert_eq!(status, 401);
+    assert!(body.contains("sgian ctl serve"), "{body}");
+    let (status, _, _) = http_keyed(
+        viewer.addr,
+        &post(r#"{"command":"bootstrap_workspace","args":{}}"#),
+        "",
+        "not-the-key",
+    );
+    assert_eq!(status, 401);
+    // The printed URL sets the cookie and redirects; the cookie then works.
+    assert!(viewer.url().ends_with(&format!("/?key={key}")));
+    let (status, head, _) = http(
+        viewer.addr,
+        &format!("GET /?key={key} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"),
+        "",
+    );
+    assert_eq!(status, 303, "{head}");
+    assert!(
+        head.contains(&format!(
+            "Set-Cookie: {SERVE_COOKIE}={key}; HttpOnly; SameSite=Strict; Path=/"
+        )),
+        "{head}"
+    );
+    assert!(head.contains("Location: /"), "{head}");
+    let cookie_body = r#"{"command":"client_holder","args":{}}"#;
+    let (status, _, body) = http(
+        viewer.addr,
+        &format!(
+            "POST /api/invoke HTTP/1.1\r\nHost: localhost:{port}\r\nCookie: other=1; {SERVE_COOKIE}={key}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{cookie_body}",
+            cookie_body.len()
+        ),
+        "",
+    );
+    assert_eq!(status, 200, "{body}");
+    let answer: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(answer["ok"], json!(true), "{body}");
+
+    let (status, _, body) = http_keyed(
+        viewer.addr,
+        &post(r#"{"command":"bootstrap_workspace","args":{}}"#),
+        "",
+        &key,
+    );
     assert_eq!(status, 200);
     let answer: Value = serde_json::from_str(&body).expect("json");
     assert_eq!(answer["ok"], json!(true), "{body}");
     assert_eq!(answer["result"]["panes"][0]["id"], json!(pane_id));
-    let (_, _, body) = http(
+    let (_, _, body) = http_keyed(
         viewer.addr,
         &post(r#"{"command":"client_holder","args":{}}"#),
         "",
+        &key,
     );
     let answer: Value = serde_json::from_str(&body).expect("json");
     assert!(answer["result"].as_str().is_some_and(|h| !h.is_empty()));
     // Read-only by default: a write is refused before it reaches the daemon.
-    let (_, _, body) = http(
+    let (_, _, body) = http_keyed(
         viewer.addr,
         &post(&format!(
             r#"{{"command":"write_to_pane","args":{{"paneId":"{pane_id}","data":"x"}}}}"#
         )),
         "",
+        &key,
     );
     let answer: Value = serde_json::from_str(&body).expect("json");
     assert_eq!(answer["ok"], json!(false));
@@ -3386,42 +3473,43 @@ fn serve_answers_invokes_streams_events_and_stays_read_only_by_default() {
     );
     // View-local writes succeed silently for a viewer instead of refusing:
     // the page calls them for every pane on boot.
-    let (_, _, body) = http(
+    let (_, _, body) = http_keyed(
         viewer.addr,
         &post(&format!(
             r#"{{"command":"ensure_pane_terminal","args":{{"paneId":"{pane_id}"}}}}"#
         )),
         "",
+        &key,
     );
     let answer: Value = serde_json::from_str(&body).expect("json");
     assert_eq!(answer["ok"], json!(true), "{body}");
     assert!(is_view_local_write("resize_pane_terminal") && !is_view_local_write("write_to_pane"));
-    // Not a loopback host: refused.
-    let (status, _, _) = http(
+    // Not a loopback host: refused before the key is even looked at.
+    let (status, _, _) = http_keyed(
         viewer.addr,
         &format!(
-            "GET /api/events HTTP/1.1\r\nHost: evil.example:{}\r\nConnection: close\r\n\r\n",
-            viewer.addr.port()
+            "GET /api/events HTTP/1.1\r\nHost: evil.example:{port}\r\nConnection: close\r\n\r\n"
         ),
         "",
+        &key,
     );
     assert_eq!(status, 403);
-    // Events stream: the connected comment arrives, then a real event after a change.
-    let (status, head, body) = http(
+    // Events stream: the connected comment arrives.
+    let (status, head, body) = http_keyed(
         viewer.addr,
-        &format!(
-            "GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
-            viewer.addr.port()
-        ),
+        &format!("GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
         ": connected",
+        &key,
     );
     assert_eq!(status, 200);
     assert!(head.contains("text/event-stream"), "{head}");
     assert!(body.contains(": connected"), "{body}");
     viewer.stop();
 
-    // With writes allowed the same call lands (attributed to the holder).
+    // With writes allowed the same call lands (attributed to the holder),
+    // but admin never does.
     let writer = start_serve_with(daemon.client(), 0, true).expect("serve rw");
+    let wkey = writer.key.clone();
     client
         .request::<CommandOk>(DaemonRequest::EnsurePaneTerminal {
             pane_id: pane_id.clone(),
@@ -3434,20 +3522,36 @@ fn serve_answers_invokes_streams_events_and_stays_read_only_by_default() {
             body
         )
     };
-    let (_, _, body) = http(
+    let (_, _, body) = http_keyed(
         writer.addr,
         &post_rw(format!(
             r#"{{"command":"write_to_pane","args":{{"paneId":"{pane_id}","data":""}}}}"#
         )),
         "",
+        &wkey,
     );
     let answer: Value = serde_json::from_str(&body).expect("json");
     assert_eq!(answer["ok"], json!(true), "{body}");
+    let (_, _, body) = http_keyed(
+        writer.addr,
+        &post_rw(r#"{"command":"write_config","args":{"config":{}}}"#.to_string()),
+        "",
+        &wkey,
+    );
+    let answer: Value = serde_json::from_str(&body).expect("json");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not available from a served view"),
+        "{body}"
+    );
     // Unsupported desktop command: a clean error, not a crash.
-    let (_, _, body) = http(
+    let (_, _, body) = http_keyed(
         writer.addr,
         &post_rw(r#"{"command":"install_update","args":{}}"#.to_string()),
         "",
+        &wkey,
     );
     let answer: Value = serde_json::from_str(&body).expect("json");
     assert!(

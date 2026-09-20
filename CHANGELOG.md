@@ -7,6 +7,12 @@ follow SemVer once the first public tag exists.
 
 ### Added
 
+- Review fixes (2026-09-20 full-repo audit, P1): revoking a credential now
+  refuses new subscriptions and ends the event streams it opened; agent
+  prompts, approvals and interrupts honour the keyboard lease for a
+  credentialed connection; `ctl serve` requires a per-run session key (URL
+  once, then a cookie) so another local account cannot drive the daemon
+  through the loopback port, and `--allow-write` never allows admin.
 - `ctl serve [--port N] [--allow-write]`: host the web client on loopback
   for a phone or laptop over an SSH tunnel; read-only by default, acts as
   the process's credential, embedded assets, loopback-only with a Host
