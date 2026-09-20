@@ -393,6 +393,20 @@ struct ServeSession {
     holder: String,
     allow_write: bool,
     key: String,
+    /// Open connections, including event streams; over the cap a request is
+    /// answered 503 and dropped (S13 of the 2026-09-20 review).
+    active: AtomicUsize,
+}
+
+/// One viewer needs a handful; a tunnel from a phone will not open sixty.
+const SERVE_MAX_CONNECTIONS: usize = 64;
+
+struct ConnectionSlot<'a>(&'a AtomicUsize);
+
+impl Drop for ConnectionSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl ServeHandle {
@@ -440,6 +454,7 @@ pub(crate) fn start_serve_with(
         holder,
         allow_write,
         key: key.clone(),
+        active: AtomicUsize::new(0),
     });
     let thread = thread::spawn(move || {
         for incoming in listener.incoming() {
@@ -462,6 +477,18 @@ pub(crate) fn start_serve_with(
 }
 
 fn handle_connection(mut stream: std::net::TcpStream, session: &ServeSession) {
+    if session.active.fetch_add(1, Ordering::SeqCst) >= SERVE_MAX_CONNECTIONS {
+        session.active.fetch_sub(1, Ordering::SeqCst);
+        let _ = write_response(
+            &mut stream,
+            503,
+            "Service Unavailable",
+            &[("Content-Type", "text/plain; charset=utf-8")],
+            b"too many connections",
+        );
+        return;
+    }
+    let _slot = ConnectionSlot(&session.active);
     let client = &session.client;
     let holder = session.holder.as_str();
     let allow_write = session.allow_write;

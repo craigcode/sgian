@@ -223,21 +223,42 @@ pub(crate) fn check_persisted_cwd(cwd: &Path, data_dir: &Path) -> Result<(), Str
         Ok(data) => data,
         Err(_) => return Ok(()), // no persisted file — fresh workspace
     };
-    let persisted: PersistedWorkspace = match serde_json::from_str(&data) {
-        Ok(p) => p,
-        Err(_) => return Ok(()), // corrupt — handled by load_workspace's fallback
+    let persisted_cwd = match serde_json::from_str::<PersistedWorkspace>(&data) {
+        Ok(p) => p.cwd,
+        // Corrupt: load_workspace starts fresh, but the guard must not go
+        // with it. The cwd marker written at daemon start still says whose
+        // data dir this is.
+        Err(_) => match fs::read_to_string(data_dir.join(WORKSPACE_CWD_FILE)) {
+            Ok(marker) => marker.trim().to_string(),
+            Err(_) => return Ok(()),
+        },
     };
     let connecting = canonical_workspace_path(cwd);
-    if !persisted.cwd.is_empty() && !workspace_cwds_match(Path::new(&persisted.cwd), cwd) {
+    if !persisted_cwd.is_empty() && !workspace_cwds_match(Path::new(&persisted_cwd), cwd) {
         return Err(format!(
             "workspace_key collision detected: the persisted workspace cwd '{}' does not match \
              the connecting cwd '{}'; refusing to serve mismatched workspace data. \
              If this is intentional, remove the workspace data for this key.",
-            persisted.cwd,
+            persisted_cwd,
             connecting.display()
         ));
     }
     Ok(())
+}
+
+/// Best-effort: the marker is a hint for `check_persisted_cwd`, never the
+/// source of truth while `workspace.json` parses.
+pub(crate) fn write_workspace_cwd_marker(data_dir: &Path, cwd: &Path) {
+    let path = data_dir.join(WORKSPACE_CWD_FILE);
+    if let Ok(mut file) = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .private_mode()
+        .open(&path)
+    {
+        let _ = file.write_all(cwd.display().to_string().as_bytes());
+    }
 }
 
 /// Resolve the identity used by both workspace-key derivation and BOTH cwd
@@ -587,6 +608,13 @@ pub(crate) fn save_clients_file(path: &Path, file: &ClientsFile) -> Result<(), S
     fs::rename(&temp, path)
         .map_err(|error| format!("failed to replace {}: {error}", path.display()))
 }
+
+/// Whether `peer_uid` can answer on this platform; where it can, a failed
+/// read refuses the connection (S7 of the 2026-09-20 review).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) const PEER_UID_SUPPORTED: bool = true;
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+pub(crate) const PEER_UID_SUPPORTED: bool = false;
 
 /// (M6) The uid of the process at the other end of a Unix socket.
 #[cfg(target_os = "macos")]

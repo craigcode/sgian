@@ -74,7 +74,15 @@ pub(crate) fn transport_endpoint(path: &Path) -> std::io::Result<String> {
 pub(crate) fn transport_bind(path: &Path) -> std::io::Result<TransportListener> {
     #[cfg(unix)]
     {
-        std::os::unix::net::UnixListener::bind(path)
+        // The socket must never exist with a permissive mode, even between
+        // bind and the owner-only chmod that follows: create it under an
+        // owner-only umask (S12 of the 2026-09-20 review).
+        // SAFETY: umask has no preconditions; the previous mask is restored
+        // before returning on every path.
+        let previous = unsafe { libc::umask(0o077) };
+        let bound = std::os::unix::net::UnixListener::bind(path);
+        unsafe { libc::umask(previous) };
+        bound
     }
     #[cfg(windows)]
     {

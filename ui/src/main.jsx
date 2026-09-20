@@ -25,7 +25,12 @@ async function initializeApplication() {
   // Served by `sgian ctl serve` (no Tauri): the same controller over fetch +
   // SSE, landing on the overview (the board is what a phone wants first).
   controller = createAppController(
-    isServedPage() ? { ...createWebBridge(), landing: "overview" } : {},
+    isServedPage()
+      ? (() => {
+          const bridge = createWebBridge();
+          return { ...bridge, nativeClose: bridge.close, landing: "overview" };
+        })()
+      : {},
   );
   // Begin native event subscription/snapshot loading before the initial xterm
   // layout effect can emit a resize. start() is idempotent when App mounts.

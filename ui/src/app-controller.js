@@ -168,7 +168,12 @@ function initialState() {
  *   The served page (`sgian ctl serve`) lands on the overview: on a phone the
  *   board is the useful screen and a pane is one tap away.
  */
-export function createAppController({ nativeInvoke, nativeListen, landing = "panes" } = {}) {
+export function createAppController({
+  nativeInvoke,
+  nativeListen,
+  nativeClose,
+  landing = "panes",
+} = {}) {
   const state = initialState();
   const fallbackPanes = new Map();
   const subscribers = new Set();
@@ -604,6 +609,11 @@ export function createAppController({ nativeInvoke, nativeListen, landing = "pan
         state.agentStates.delete(paneId);
         state.agentSpecs.delete(paneId);
         state.lastActivityMs.delete(paneId);
+        // The same per-pane maps handlePaneClosed drops: a dead id must not
+        // keep a badge, and a reused id must not inherit one (S10).
+        state.leases.delete(paneId);
+        state.outputWarnings.delete(paneId);
+        state.agentUsage.delete(paneId);
         changed = true;
       }
     }
@@ -1658,6 +1668,12 @@ export function createAppController({ nativeInvoke, nativeListen, landing = "pan
     if (leaseToastTimer) window.clearTimeout(leaseToastTimer);
     leaseToastTimer = null;
     for (const unlisten of unlisteners.splice(0)) unlisten();
+    // A served page's EventSource is closed with the controller (S14).
+    try {
+      nativeClose?.();
+    } catch {
+      // A bridge that is already gone is fine.
+    }
     for (const frame of chatRenderFrames.values()) window.cancelAnimationFrame(frame);
     chatRenderFrames.clear();
     terminals.disposeAll();

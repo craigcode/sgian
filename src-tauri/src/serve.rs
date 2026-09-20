@@ -725,18 +725,32 @@ pub(crate) fn run_daemon_with_config_and_warnings(
                 // another uid is dropped before the hello (Unix only; Windows
                 // pipes are owner-restricted at creation).
                 #[cfg(unix)]
-                if let Some(uid) = peer_uid(&stream) {
+                {
                     // SAFETY: getuid has no preconditions and cannot fail.
                     let own = unsafe { libc::getuid() };
-                    if uid != own {
-                        tracing::warn!(
-                            workspace_key = %server.workspace_key,
-                            event = "peer_uid_rejected",
-                            peer_uid = uid,
-                            "dropping connection from another user"
-                        );
-                        drop(stream);
-                        continue;
+                    match peer_uid(&stream) {
+                        Some(uid) if uid != own => {
+                            tracing::warn!(
+                                workspace_key = %server.workspace_key,
+                                event = "peer_uid_rejected",
+                                peer_uid = uid,
+                                "dropping connection from another user"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                        // Where the platform can answer, an unanswered
+                        // question is a refusal, not a pass (S7).
+                        None if PEER_UID_SUPPORTED => {
+                            tracing::warn!(
+                                workspace_key = %server.workspace_key,
+                                event = "peer_uid_unreadable",
+                                "dropping connection whose peer uid could not be read"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                        _ => {}
                     }
                 }
                 // Concurrency cap (L18): refuse connections beyond the bound
