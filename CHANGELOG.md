@@ -7,6 +7,9 @@ follow SemVer once the first public tag exists.
 
 ### Added
 
+- Native clients store a client credential per workspace (macOS login
+  Keychain, Windows credential vault) behind Settings → Identity, with a
+  Forget button; `SGIAN_CLIENT_TOKEN` still overrides when set.
 - Trust-surface review before launch (`docs/trust-surface-review-2026-09-19.md`):
   hook and status-line reports need `write` from a credential, revocation
   cuts a live connection at its next request, the legacy `write_to_pane`

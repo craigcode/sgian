@@ -6,8 +6,11 @@ SSH-forwarded socket). Shipped: `ctl identity issue|list|revoke`, `ctl
 whoami`, `client_token` on the hello, scopes `read`/`write`/`admin`, holder
 bound to the credential (`--as` anything else refused; unattributed input
 becomes attributed), `credential` on lease ledger records, a peer-uid check
-on the Unix socket, `identity: open | required`. Not built, by decision: an
-`impersonate` scope. The text below is the proposal as written.
+on the Unix socket, `identity: open | required`; native clients store the
+credential per workspace in the login Keychain / the Windows credential
+vault behind a Settings → Identity field (environment overrides). Not
+built, by decision: an `impersonate` scope. The text below is the proposal
+as written.
 
 ## What is wrong today
 
