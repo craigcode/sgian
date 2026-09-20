@@ -206,6 +206,10 @@ A single binary runs in three modes:
   ssh -N -L /tmp/sgian.sock:$(sgian ctl --json ipc-endpoint | jq -r .endpoint) desk   # on the laptop
   SGIAN_CLIENT_TOKEN=sgc_… sgian ctl whoami
   ```
+
+  The native apps also take a credential in Settings → Identity and keep it
+  per workspace in the login Keychain (macOS) or the credential vault
+  (Windows); the environment variable, when set, overrides the stored one.
 - `ctl project new|list|show|add|rm|delete|ledger|dossier` for projects: a
   named group of panes serving one goal, persisted with the workspace, with an
   attention roll-up (needs input / working / idle / unattended / keyboard

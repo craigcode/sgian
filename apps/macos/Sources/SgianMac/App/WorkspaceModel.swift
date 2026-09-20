@@ -142,7 +142,7 @@ final class WorkspaceModel: ObservableObject {
                 guard currentGeneration == generation else { return }
                 apply(snapshot)
                 status = .connected
-                if DaemonIPCClient.clientTokenFromEnvironment() != nil,
+                if DaemonIPCClient.clientToken(for: nextURL) != nil,
                    let identity = try? await client.request(["command": .string("whoami")], as: JSONValue.self),
                    let credentialHolder = identity["holder"]?.stringValue, !credentialHolder.isEmpty,
                    currentGeneration == generation {
@@ -385,6 +385,25 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func outputWarning(for paneID: String) -> OutputTricks? { outputWarnings[paneID] }
+
+    // MARK: Client credential (docs/design/client-identity.md)
+
+    /// Whether the environment supplies the credential (it then overrides the Keychain).
+    var credentialFromEnvironment: Bool { DaemonIPCClient.clientTokenFromEnvironment() != nil }
+
+    /// Whether a credential is stored in the Keychain for this workspace.
+    var hasStoredCredential: Bool { CredentialStore.load(for: workspaceURL) != nil }
+
+    /// Store (or, with nil, forget) this workspace's credential in the login
+    /// Keychain and reconnect so the daemon binds the connection to it.
+    func setClientCredential(_ token: String?) {
+        guard CredentialStore.save(token, for: workspaceURL) else {
+            errorMessage = "The credential could not be saved to the Keychain."
+            return
+        }
+        holder = WorkspaceModel.defaultHolder()
+        connect(to: workspaceURL)
+    }
 
     func usage(for paneID: String) -> AgentUsage? { agentUsage[paneID] }
 
