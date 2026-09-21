@@ -38,7 +38,7 @@ lease, type.
 
 ```
 ctl identity issue --holder craig@phone --scope read          # prints once
-ctl identity issue --holder kranz --scope write,impersonate   # for Kranz runs
+ctl identity issue --holder kranz:<run-id> --scope write     # what a Kranz run issues itself
 ctl identity list | revoke ID
 ```
 
@@ -48,7 +48,10 @@ scopes, created, last seen, revoked. The hello gains an additive
 
 **Holder is derived, not declared.** With a client token, `holder` on every
 lease and write is the token's holder; `--as` is refused unless the token
-carries `impersonate` (Kranz acting for a run). The workspace token keeps
+carries `impersonate`. Kranz does not use it: each worker run issues itself a
+`write` credential as `kranz:<run-id>` before the session starts and revokes
+it after (Kranz's `docs/sgian-coordination.md`), so the ledger names the run
+and nothing acts for it. The workspace token keeps
 working as the root credential for local `ctl`, with holder `user@host` as
 today, so nothing breaks the day this lands.
 

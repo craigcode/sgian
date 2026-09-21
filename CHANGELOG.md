@@ -7,6 +7,10 @@ follow SemVer once the first public tag exists.
 
 ### Added
 
+- Kranz worker runs identify themselves with their own `kranz:<run-id>`
+  write credential (issued and revoked by Kranz around each session); the
+  identity design note and README no longer describe an `impersonate` grant
+  for Kranz.
 - Review fixes (2026-09-20 full-repo audit, P2/P3): the workspace-key
   collision guard survives a corrupt `workspace.json` via a `workspace.cwd`
   marker; a peer uid that cannot be read is refused on macOS and Linux; a
