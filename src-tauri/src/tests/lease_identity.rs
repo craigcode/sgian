@@ -3564,3 +3564,62 @@ fn serve_answers_invokes_streams_events_and_stays_read_only_by_default() {
     writer.stop();
     daemon.shutdown();
 }
+
+#[test]
+fn review_p2_pure_guards() {
+    // S6: with workspace.json unparseable, the cwd marker still guards.
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(dir.path().join(WORKSPACE_FILE), b"{not json").expect("corrupt file");
+    assert!(
+        check_persisted_cwd(Path::new("/tmp/a"), dir.path()).is_ok(),
+        "no marker: nothing to check"
+    );
+    write_workspace_cwd_marker(dir.path(), Path::new("/tmp/a"));
+    assert!(check_persisted_cwd(Path::new("/tmp/a"), dir.path()).is_ok());
+    let refused = check_persisted_cwd(Path::new("/tmp/b"), dir.path()).expect_err("collision");
+    assert!(refused.contains("collision"), "{refused}");
+
+    // S11: the input queue is capped by bytes, not only entries.
+    let (sender, _receiver) = sync_channel::<Vec<u8>>(PANE_INPUT_QUEUE_LIMIT);
+    let queue = InputQueue {
+        sender,
+        queued_bytes: Arc::new(AtomicUsize::new(0)),
+    };
+    let chunk = "x".repeat(PANE_INPUT_QUEUE_BYTES / 2 + 1);
+    assert!(queue_pane_input(&queue, "p", &chunk).is_ok());
+    let refused = queue_pane_input(&queue, "p", &chunk).expect_err("over the byte cap");
+    assert!(refused.contains("backlogged"), "{refused}");
+    assert!(
+        queue_pane_input(&queue, "p", "small").is_ok(),
+        "small chunks still fit"
+    );
+    assert_eq!(
+        queue.queued_bytes.load(Ordering::SeqCst),
+        chunk.len() + "small".len(),
+        "a refused chunk is not counted"
+    );
+
+    // S8: a reload updates the scrub list of every stored per-pane shell.
+    let mut store = crate::tests::terminal::sh_terminal_store("/tmp");
+    store.pane_shells.insert(
+        "pane-p".to_string(),
+        ShellConfig {
+            shell: "/bin/zsh".to_string(),
+            args: vec!["-l".to_string()],
+            env: HashMap::new(),
+            scrub_env: vec!["OLD".to_string()],
+        },
+    );
+    store.apply_reloaded_config(
+        ShellConfig {
+            shell: "/bin/sh".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            scrub_env: vec!["SECRET".to_string()],
+        },
+        AgentSpawnConfig::default(),
+    );
+    let stored = store.pane_shells.get("pane-p").expect("stored shell");
+    assert_eq!(stored.scrub_env, vec!["SECRET".to_string()]);
+    assert_eq!(stored.shell, "/bin/zsh", "the profile's own shell stays");
+}

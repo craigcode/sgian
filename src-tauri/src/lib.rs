@@ -46,6 +46,10 @@ const LEGACY_APP_SUPPORT_DIR: &str = "Sgian2";
 #[cfg(any(windows, test))]
 const WINDOWS_IPC_NAMESPACE: &str = "sgian2";
 const WORKSPACE_FILE: &str = "workspace.json";
+/// The workspace path on its own, written beside `workspace.json` at daemon
+/// start, so the workspace-key collision guard still has something to check
+/// when `workspace.json` is unparseable (S6 of the 2026-09-20 review).
+const WORKSPACE_CWD_FILE: &str = "workspace.cwd";
 const CONFIG_FILE: &str = "config.json";
 const SCROLLBACK_DIR: &str = "scrollback";
 const RUNTIME_DIR: &str = "runtime";
@@ -1848,7 +1852,7 @@ struct TerminalSession {
     /// try_send here — never a blocking PTY write under the TerminalStore mutex —
     /// so a pane whose foreground process stopped reading stdin (Ctrl-S, stopped
     /// job) can no longer wedge the whole daemon (H2).
-    input: SyncSender<Vec<u8>>,
+    input: InputQueue,
 }
 
 impl Drop for TerminalSession {
@@ -1865,15 +1869,45 @@ impl Drop for TerminalSession {
 /// typing/paste bursts; once a non-draining pane fills it, writes fail fast with
 /// a "backlogged" error instead of blocking a request thread forever.
 const PANE_INPUT_QUEUE_LIMIT: usize = 256;
+/// Bytes queued but not yet written, per pane. 256 entries of up to a frame
+/// each could otherwise pin gigabytes behind a pane that stopped reading
+/// (S11 of the 2026-09-20 review).
+const PANE_INPUT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+
+/// A pane's input queue: the channel into its writer thread plus the bytes
+/// currently queued, so the cap is on memory, not only entry count.
+struct InputQueue {
+    sender: SyncSender<Vec<u8>>,
+    queued_bytes: Arc<AtomicUsize>,
+}
 
 /// Spawn the dedicated writer thread that drains a pane's input queue into its
 /// PTY. The thread exits when the session drops (sender dropped → recv errs) or
 /// when a write fails (PTY gone); after that, queued sends error `Disconnected`.
-fn spawn_input_writer(mut writer: Box<dyn Write + Send>) -> SyncSender<Vec<u8>> {
+fn spawn_input_writer(writer: Box<dyn Write + Send>) -> InputQueue {
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let sender = spawn_input_writer_raw(writer, Some(Arc::clone(&queued_bytes)));
+    InputQueue {
+        sender,
+        queued_bytes,
+    }
+}
+
+/// The writer thread alone. Agent stdin uses this directly: its messages are
+/// bounded per message (`AGENT_MESSAGE_MAX_BYTES`), not per queue.
+pub(crate) fn spawn_input_writer_raw(
+    mut writer: Box<dyn Write + Send>,
+    drained: Option<Arc<AtomicUsize>>,
+) -> SyncSender<Vec<u8>> {
     let (sender, receiver) = sync_channel::<Vec<u8>>(PANE_INPUT_QUEUE_LIMIT);
     thread::spawn(move || {
         while let Ok(chunk) = receiver.recv() {
-            if writer.write_all(&chunk).is_err() || writer.flush().is_err() {
+            let len = chunk.len();
+            let ok = writer.write_all(&chunk).is_ok() && writer.flush().is_ok();
+            if let Some(counter) = &drained {
+                counter.fetch_sub(len, Ordering::SeqCst);
+            }
+            if !ok {
                 break;
             }
         }
@@ -1882,14 +1916,29 @@ fn spawn_input_writer(mut writer: Box<dyn Write + Send>) -> SyncSender<Vec<u8>> 
 }
 
 /// Queue input for a pane's writer thread, failing fast when the pane has
-/// stopped draining (queue full) or its writer thread has exited.
-fn queue_pane_input(input: &SyncSender<Vec<u8>>, pane_id: &str, data: &str) -> Result<(), String> {
-    match input.try_send(data.as_bytes().to_vec()) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(_)) => Err(format!(
+/// stopped draining (queue full by count or by bytes) or its writer thread
+/// has exited.
+fn queue_pane_input(input: &InputQueue, pane_id: &str, data: &str) -> Result<(), String> {
+    let len = data.len();
+    let before = input.queued_bytes.fetch_add(len, Ordering::SeqCst);
+    if before.saturating_add(len) > PANE_INPUT_QUEUE_BYTES {
+        input.queued_bytes.fetch_sub(len, Ordering::SeqCst);
+        return Err(format!(
             "terminal input backlogged (pane is not reading stdin): {pane_id}"
-        )),
-        Err(TrySendError::Disconnected(_)) => Err(format!("terminal session ended: {pane_id}")),
+        ));
+    }
+    match input.sender.try_send(data.as_bytes().to_vec()) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => {
+            input.queued_bytes.fetch_sub(len, Ordering::SeqCst);
+            Err(format!(
+                "terminal input backlogged (pane is not reading stdin): {pane_id}"
+            ))
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            input.queued_bytes.fetch_sub(len, Ordering::SeqCst);
+            Err(format!("terminal session ended: {pane_id}"))
+        }
     }
 }
 
@@ -2163,6 +2212,7 @@ impl DaemonServer {
         let clients = load_clients_file(&clients_path);
 
         let persist_path = data_dir.join(WORKSPACE_FILE);
+        write_workspace_cwd_marker(&data_dir, &cwd);
         let loaded = load_workspace(&persist_path, cwd.display().to_string());
 
         // Defense-in-depth: verify the persisted cwd matches the connecting cwd.
@@ -4541,8 +4591,7 @@ impl DaemonServer {
         // mode): applies to agent sessions spawned after the reload.
         let new_agent_config = new_config.agent_config();
         if let Ok(mut terminals) = self.lock_terminals() {
-            terminals.shell = new_shell;
-            terminals.agent_config = new_agent_config;
+            terminals.apply_reloaded_config(new_shell, new_agent_config);
         }
 
         // Update the config RwLock.
@@ -4600,12 +4649,14 @@ impl DaemonServer {
             .filter(|(pane_id, _)| pane_ids.contains(pane_id))
             .map(|(pane_id, spec)| (pane_id.clone(), spec.clone()))
             .collect();
+        let live_modes = terminals.agent_session_modes();
         drop(terminals);
         // (T1) Agent info rides the bootstrap payload parallel to pane_states.
         snapshot.agent_states = self.router.agent_states();
-        // An agent-kind pane's mode is its configured permission mode, not a
-        // screen: overlay it so every pane carries `unattended` the same way.
-        let permission_mode = self.effective_config().agent_config().permission_mode;
+        // An agent-kind pane's mode is the permission mode its CLI was started
+        // with (the configured one for a pane not running yet), not a screen:
+        // overlay it so every pane carries `unattended` the same way.
+        let configured_mode = self.effective_config().agent_config().permission_mode;
         for pane in &snapshot.panes {
             if pane.kind != PaneKind::Agent {
                 continue;
@@ -4622,8 +4673,12 @@ impl DaemonServer {
                     agent: Some(backend),
                     ..AgentPaneInfo::default()
                 });
-            entry.mode = Some(permission_mode.clone());
+            let permission_mode = live_modes
+                .get(&pane.id)
+                .cloned()
+                .unwrap_or_else(|| configured_mode.clone());
             entry.unattended = is_unattended_mode(Some(&permission_mode));
+            entry.mode = Some(permission_mode);
         }
         // Held keyboard leases ride alongside so a client can render the
         // holder without a second request.

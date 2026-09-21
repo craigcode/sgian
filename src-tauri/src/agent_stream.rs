@@ -416,6 +416,10 @@ impl AgentChildKiller {
 #[cfg(any(unix, windows))]
 pub(crate) struct AgentSession {
     pub(crate) backend: AgentBackendKind,
+    /// The permission mode this CLI was started with. A config reload
+    /// changes future spawns, not this process, and the badge must say what
+    /// is actually running (S9 of the 2026-09-20 review).
+    pub(crate) permission_mode: String,
     pub(crate) input: SyncSender<Vec<u8>>,
     pub(crate) killer: AgentChildKiller,
     pub(crate) shared: Arc<Mutex<AgentShared>>,
@@ -1637,7 +1641,7 @@ impl TerminalStore {
             log: AgentLogWriter::open(&self.agents_dir, pane_id),
             next_seq: agent_log_last_seq(&self.agents_dir, pane_id),
         }));
-        let input = spawn_input_writer(Box::new(stdin));
+        let input = spawn_input_writer_raw(Box::new(stdin), None);
         if let Some(line) = initial_input {
             if let Err(error) = queue_agent_stdin(&input, pane_id, &line) {
                 tracing::warn!(
@@ -1704,12 +1708,21 @@ impl TerminalStore {
             pane_id.to_string(),
             AgentSession {
                 backend,
+                permission_mode: self.agent_config.permission_mode.clone(),
                 input,
                 killer,
                 shared,
                 events,
             },
         );
+    }
+
+    /// The permission mode each live agent session was started with.
+    pub(crate) fn agent_session_modes(&self) -> HashMap<String, String> {
+        self.agent_sessions
+            .iter()
+            .map(|(pane_id, session)| (pane_id.clone(), session.permission_mode.clone()))
+            .collect()
     }
 
     /// (T2) The live session's stdin handle + shared state for request

@@ -7,6 +7,16 @@ follow SemVer once the first public tag exists.
 
 ### Added
 
+- Review fixes (2026-09-20 full-repo audit, P2/P3): the workspace-key
+  collision guard survives a corrupt `workspace.json` via a `workspace.cwd`
+  marker; a peer uid that cannot be read is refused on macOS and Linux; a
+  config reload updates the scrub list profiled panes restart with; an
+  agent pane's badge shows the permission mode its CLI was started with;
+  the web client drops leases, output warnings and usage for panes that
+  vanish on resync and closes the served event stream on stop; the pane
+  input queue is capped at 8 MiB of unwritten bytes; the daemon socket is
+  created under an owner-only umask; `ctl serve` refuses beyond 64 open
+  connections.
 - Review fixes (2026-09-20 full-repo audit, P1): revoking a credential now
   refuses new subscriptions and ends the event streams it opened; agent
   prompts, approvals and interrupts honour the keyboard lease for a

@@ -208,6 +208,19 @@ pub(crate) fn pty_size(cols: u16, rows: u16) -> PtySize {
 }
 
 impl TerminalStore {
+    /// Apply a reloaded config: the default shell and agent spawn config for
+    /// future spawns, and the scrub list for every stored per-pane shell too.
+    /// A profiled pane keeps its own shell/args/env, but the scrub list is
+    /// workspace policy and must follow the reload so a newly added secret
+    /// name applies on that pane's next restart (S8 of the 2026-09-20 review).
+    pub(crate) fn apply_reloaded_config(&mut self, shell: ShellConfig, agent: AgentSpawnConfig) {
+        for stored in self.pane_shells.values_mut() {
+            stored.scrub_env = shell.scrub_env.clone();
+        }
+        self.shell = shell;
+        self.agent_config = agent;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         cwd: PathBuf,

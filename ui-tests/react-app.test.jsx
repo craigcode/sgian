@@ -707,3 +707,16 @@ describe("served page landing", () => {
     expect(controller.state.overviewOpen).toBe(false);
   });
 });
+
+describe("controller lifecycle", () => {
+  it("closes the served bridge on stop", () => {
+    const nativeClose = vi.fn();
+    const controller = createAppController({
+      nativeInvoke: async () => ({}),
+      nativeListen: async () => () => {},
+      nativeClose,
+    });
+    controller.stop();
+    expect(nativeClose).toHaveBeenCalledTimes(1);
+  });
+});
