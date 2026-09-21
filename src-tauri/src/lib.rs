@@ -2113,6 +2113,9 @@ struct DaemonServer {
     /// (M6) Issued client credentials, mirrored to `clients.json`. Leaf lock.
     clients: Mutex<ClientsFile>,
     clients_path: PathBuf,
+    /// Live subscriptions per credential id, so a revocation can end the
+    /// event streams a credential opened, not only its next request. Leaf lock.
+    credential_subscribers: Mutex<HashMap<String, Vec<u64>>>,
     /// The next lease generation (see `HeldLease::generation`); seeded above
     /// every persisted lease so numbers never repeat across restarts.
     next_lease_generation: AtomicU64,
@@ -2352,6 +2355,7 @@ impl DaemonServer {
             agent_usage: Mutex::new(HashMap::new()),
             clients: Mutex::new(clients),
             clients_path,
+            credential_subscribers: Mutex::new(HashMap::new()),
             // Members that no longer exist are dropped on load, like leases.
             projects: Mutex::new(
                 projects
@@ -4711,6 +4715,30 @@ impl DaemonServer {
         self.effective_config().identity_effective()
     }
 
+    /// The gate `Subscribe` passes before it becomes an event stream: the same
+    /// revocation and scope checks as any other request (S1 of the 2026-09-20
+    /// review; `Subscribe` never reaches `handle_as`).
+    fn authorize_subscribe(&self, identity: &ClientIdentity) -> Result<(), String> {
+        if let Some(id) = identity.credential.as_deref() {
+            if !self.credential_is_active(id) {
+                return Err("client credential revoked".to_string());
+            }
+        }
+        if !identity.has(ClientScope::Read) {
+            return Err("read-only credential: 'read' scope required for subscribe".to_string());
+        }
+        Ok(())
+    }
+
+    /// Remember which credential opened a subscription so revocation can end it.
+    fn note_credential_subscription(&self, credential: Option<&str>, sub_id: u64) {
+        if let Some(id) = credential {
+            if let Ok(mut table) = self.credential_subscribers.lock() {
+                table.entry(id.to_string()).or_default().push(sub_id);
+            }
+        }
+    }
+
     fn credential_is_active(&self, id: &str) -> bool {
         self.clients.lock().ok().is_some_and(|clients| {
             clients
@@ -4848,10 +4876,22 @@ impl DaemonServer {
             (record.clone(), clients.clone())
         };
         save_clients_file(&self.clients_path, &snapshot)?;
+        // End the event streams this credential opened; its requests are
+        // refused by `handle_as` from now on.
+        let streams = self
+            .credential_subscribers
+            .lock()
+            .ok()
+            .and_then(|mut table| table.remove(id))
+            .unwrap_or_default();
+        for sub_id in &streams {
+            self.router.remove_subscriber(*sub_id);
+        }
         tracing::info!(
             workspace_key = %self.workspace_key,
             event = "identity_revoked",
             credential = %id,
+            subscriptions_ended = streams.len(),
             "client credential revoked"
         );
         Ok(record.public())
@@ -4896,6 +4936,20 @@ impl DaemonServer {
             ));
         }
         let request = bind_holder(request, identity)?;
+        // Agent control (prompt, approve, interrupt) is a write to the pane
+        // like a keystroke and honours the keyboard lease the same way for a
+        // credentialed connection (S3 of the 2026-09-20 review). The root
+        // token carries no holder on these requests; under `identity: open`
+        // the lease is coordination for it, and under `required` root cannot
+        // write at all.
+        if identity.credential.is_some() {
+            if let DaemonRequest::SendAgentMessage { pane_id, .. }
+            | DaemonRequest::AgentApproval { pane_id, .. }
+            | DaemonRequest::InterruptAgent { pane_id } = &request
+            {
+                self.check_lease_write(pane_id, identity.holder.as_deref(), None)?;
+            }
+        }
         match request {
             DaemonRequest::TakeLease {
                 pane_id,

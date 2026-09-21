@@ -1120,13 +1120,25 @@ pub(crate) fn handle_daemon_client_with_handshake_budget(
 
     if matches!(request, DaemonRequest::Subscribe) {
         // Subscribe converts a v1 connection into a newline-JSON event stream; no
-        // further requests are served on it.
-        begin_subscription(
+        // further requests are served on it. It passes the same revocation and
+        // scope gate as any request first.
+        if let Err(error) = server.authorize_subscribe(&identity) {
+            let response = IpcResponse {
+                ok: false,
+                result: Value::Null,
+                error: Some(error),
+            };
+            let _ = write_json_line(&mut stream, &response);
+            return Ok(());
+        }
+        if let Some(sub_id) = begin_subscription(
             &server,
             stream,
             negotiated_wire_version,
             client_wants_subscribe_ack,
-        );
+        ) {
+            server.note_credential_subscription(identity.credential.as_deref(), sub_id);
+        }
         return Ok(());
     }
 
@@ -1155,12 +1167,13 @@ pub(crate) fn handle_daemon_client_with_handshake_budget(
 /// VAL-CROSS-002). A pane that ends between `add_subscriber` and the snapshot yields
 /// both a broadcast and a catch-up `PaneEnded` — the duplicate is idempotent (the
 /// GUI sets the same ended state again).
+/// Returns the subscriber id, or `None` when the subscriber cap refused it.
 pub(crate) fn begin_subscription(
     server: &Arc<DaemonServer>,
     stream: TransportStream,
     wire_version: u16,
     send_ack: bool,
-) {
+) -> Option<u64> {
     let sub_id = match server.router.add_subscriber(stream, wire_version) {
         Ok(id) => id,
         Err((reason, mut stream)) => {
@@ -1178,7 +1191,7 @@ pub(crate) fn begin_subscription(
             } else {
                 let _ = write_json_line(&mut stream, &response);
             }
-            return;
+            return None;
         }
     };
     // The ack rides the subscriber's own ordered queue as the FIRST payload,
@@ -1202,6 +1215,7 @@ pub(crate) fn begin_subscription(
             }
         }
     }
+    Some(sub_id)
 }
 
 /// (L18) Remaining budget for the v1 hello/auth phase: `total` minus the time
@@ -1355,7 +1369,20 @@ pub(crate) fn serve_framed_connection(
         };
 
         if matches!(request, DaemonRequest::Subscribe) {
-            begin_subscription(&server, stream, wire_version, client_wants_subscribe_ack);
+            if let Err(error) = server.authorize_subscribe(&identity) {
+                let response = IpcResponse {
+                    ok: false,
+                    result: Value::Null,
+                    error: Some(error),
+                };
+                let _ = frame::write(&mut stream, &response);
+                return Ok(());
+            }
+            if let Some(sub_id) =
+                begin_subscription(&server, stream, wire_version, client_wants_subscribe_ack)
+            {
+                server.note_credential_subscription(identity.credential.as_deref(), sub_id);
+            }
             return Ok(());
         }
 

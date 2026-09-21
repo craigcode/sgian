@@ -223,9 +223,12 @@ A single binary runs in three modes:
   back.
 
   ```bash
-  sgian ctl serve                                   # on the desk machine
-  ssh -N -L 8321:127.0.0.1:8321 desk                # on the phone/laptop, then open http://localhost:8321
+  sgian ctl serve                                   # on the desk machine; prints a URL with this run's key
+  ssh -N -L 8321:127.0.0.1:8321 desk                # on the phone/laptop, then open that URL with localhost
   ```
+
+  The key becomes a cookie on first load; without it the page and the API
+  answer 401, so another account on the desk machine cannot use the port.
 - `ctl project new|list|show|add|rm|delete|ledger|dossier` for projects: a
   named group of panes serving one goal, persisted with the workspace, with an
   attention roll-up (needs input / working / idle / unattended / keyboard
