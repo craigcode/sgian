@@ -1973,6 +1973,26 @@ fn closing_a_pane_terminates_its_grandchildren() {
         })
         .expect("ensure terminal");
     let marker = daemon.data_dir.path().join("grandchild.pid");
+    // Wait for the prompt before typing: a write that races the shell's
+    // startup handshake can be partly swallowed under full-suite load, and
+    // then the marker never appears (the same race the run harness closes).
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        let snapshot: Value = client
+            .request(DaemonRequest::Snapshot {
+                pane_id: pane_id.clone(),
+            })
+            .unwrap_or(Value::Null);
+        if snapshot["revision"].as_u64().unwrap_or(0) > 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+    let _ = client.request::<Value>(DaemonRequest::Wait {
+        pane_id: pane_id.clone(),
+        condition: WaitCondition::Idle(120),
+        timeout_ms: Some(5000),
+    });
     // A background job in an interactive shell lands in its own process
     // group, exactly the case a shell-only kill orphans.
     client
@@ -2007,7 +2027,8 @@ fn closing_a_pane_terminates_its_grandchildren() {
         })
         .expect("close");
     let mut gone = false;
-    for _ in 0..200 {
+    // SIGTERM, a grace period, then SIGKILL: allow well past the grace.
+    for _ in 0..400 {
         // SAFETY: existence probe; ESRCH (or a zombie already reaped by
         // init) means the grandchild is gone.
         if unsafe { libc::kill(grandchild as libc::pid_t, 0) } != 0 {

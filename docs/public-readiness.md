@@ -15,6 +15,8 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
 
 - [x] `LICENSE` (MIT), `SECURITY.md` with the security model and private
       reporting, `README.md` leading with the claim and the control plane.
+- [x] External full-repo review (`docs/review-2026-09-20.md`): three P1s and
+      eleven P2/P3s fixed in #53 and #54; accepted risks recorded.
 - [x] Trust-surface review of the credential hello, hook and status-line
       inputs and the dossier (`docs/trust-surface-review-2026-09-19.md`);
       six findings fixed, six risks recorded as accepted with reasons.
