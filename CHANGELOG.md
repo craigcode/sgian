@@ -7,6 +7,10 @@ follow SemVer once the first public tag exists.
 
 ### Added
 
+- Kranz worker runs identify themselves with their own `kranz:<run-id>`
+  write credential (issued and revoked by Kranz around each session); the
+  identity design note and README no longer describe an `impersonate` grant
+  for Kranz.
 - Contributor surface: `CONTRIBUTING.md` (builds per client, the four
   required checks, squash and changelog conventions, where wire-contract
   changes are documented), issue templates that ask for the version, platform

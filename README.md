@@ -277,7 +277,10 @@ A single binary runs in three modes:
   exact output lines.
 - `ctl kranz status|bind|unbind` for panes bound to a Kranz mission: the
   mission's pending questions and grants drive the badge, and a hand-back
-  note is mirrored into the mission inbox with `kranz msg`.
+  note is mirrored into the mission inbox with `kranz msg`. A Kranz worker
+  run issues itself a `write` credential as `kranz:<run-id>` when it starts
+  and revokes it when it ends, so its panes, leases and ledger records name
+  the run rather than the operator.
 - `ctl logs` to tail daemon logs.
 - `ctl status --verbose` for detailed daemon state.
 - `ctl write-config` to persist config changes.
