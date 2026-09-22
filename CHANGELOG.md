@@ -11,6 +11,11 @@ follow SemVer once the first public tag exists.
   write credential (issued and revoked by Kranz around each session); the
   identity design note and README no longer describe an `impersonate` grant
   for Kranz.
+- Contributor surface: `CONTRIBUTING.md` (builds per client, the four
+  required checks, squash and changelog conventions, where wire-contract
+  changes are documented), issue templates that ask for the version, platform
+  and `ctl diagnostic` bundle, a pull-request checklist, and a README that
+  opens with what Sgian is, how to install it and a first five minutes.
 - Review fixes (2026-09-20 full-repo audit, P2/P3): the workspace-key
   collision guard survives a corrupt `workspace.json` via a `workspace.cwd`
   marker; a peer uid that cannot be read is refused on macOS and Linux; a
