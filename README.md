@@ -1,37 +1,65 @@
 # Sgian
 
-Sgian is a keyboard-driven pane manager and terminal multiplexer with native
-macOS and Windows clients, a Tauri Linux client, and a shared Rust daemon.
-The daemon (`--daemon`) and scriptable control CLI (`ctl`) keep sessions
-independent of the desktop client. Closing the GUI leaves your shells running,
-tmux-style.
+Sgian is a terminal multiplexer for supervising coding agents. A Rust daemon
+owns your shells and agent sessions per workspace; the native macOS and Windows
+clients, the Tauri Linux client and a phone-sized served view are thin views
+over it, so closing a window never kills a session. Panes are shells or
+chat-native agent panes (Claude Code, Factory Droid), and a shell running an
+agent TUI is badged by attention state so you can see which agent is waiting
+on you. A scriptable `ctl` command, keyboard leases with a hash-chained ledger
+and per-client credentials make it a place to run several agents at once
+without losing track of who typed what.
 
-Panes come in two kinds: **shell** panes (regular PTY terminals) and **agent**
-panes — chat-native sessions driving headless Claude Code or Factory Droid
-processes with streaming replies, tool-call cards, and in-app permission prompts.
-Agent sessions are daemon-owned too, so they survive the GUI closing and resume
-where they left off. Shell panes running agent TUIs (e.g. the interactive
-`claude` CLI) are auto-detected and badged by attention state
-(working / needs input / idle).
+## Install
 
-Supported native desktop targets are macOS 13+, Windows 10 version 1809+ (ConPTY),
-and Linux distributions compatible with the Ubuntu 22.04/WebKitGTK 4.1 build
-baseline. Every release is gated by native builds on all three platforms.
-
-## Run
+Packaged builds (macOS 13+ DMG, Windows 10 1809+ MSIX, Linux Debian package
+and AppImage) come from the release workflow described under
+[Distribution](#distribution). To build from source you need Node.js 22.12+
+and the Rust toolchain pinned in `rust-toolchain.toml`:
 
 ```bash
 npm ci --ignore-scripts
 npm run dev
 ```
 
-Use Node.js 22.12+ and the Rust toolchain pinned in `rust-toolchain.toml`
-(with rustup ahead of any system Rust installation on PATH).
+## First five minutes
 
+1. Open a workspace. The app asks for a project directory, or set
+   `SGIAN_WORKSPACE=/path/to/project` before launching. One daemon per
+   workspace starts on demand and outlives the window.
+2. Split the view with Ctrl/Cmd+Shift+| (row) or Ctrl/Cmd+Shift+_ (column).
+   Ctrl/Cmd+K opens the command palette; Ctrl/Cmd+Shift+N opens an agent
+   pane in a new split.
+3. Run `claude` in a shell pane. The tab badge follows the agent's state
+   (working, needs input, idle) and flags unattended permission modes.
+4. Script it from another terminal:
+
+   ```bash
+   sgian ctl panes
+   sgian ctl new --agent --name reviewer
+   sgian ctl send reviewer "summarise the failing tests"
+   sgian ctl agent --watch
+   ```
+
+5. Take a pane's keyboard with Ctrl/Cmd+Shift+T before you type into an
+   agent someone else is driving, and hand it back with Ctrl/Cmd+Shift+L.
+   Watch from a phone with `sgian ctl serve` over an SSH tunnel.
+
+Everything below is reference. Contributors should start with
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Run from source
+
+Keep rustup ahead of any system Rust installation on `PATH`.
 The React/Vite frontend lives in `ui/`; the Tauri backend lives in `src-tauri/`.
 Tauri starts Vite automatically in development and builds `dist/` for packaged
 applications. Linux development additionally requires Tauri's
 [documented system dependencies](https://v2.tauri.app/start/prerequisites/#linux).
+
+Supported native desktop targets are macOS 13+, Windows 10 version 1809+
+(ConPTY), and Linux distributions compatible with the Ubuntu 22.04/WebKitGTK
+4.1 build baseline. Every release is gated by native builds on all three
+platforms.
 
 ### Native macOS and Windows clients
 

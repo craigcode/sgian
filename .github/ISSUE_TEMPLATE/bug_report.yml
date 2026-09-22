@@ -1,0 +1,43 @@
+name: Bug report
+description: Something in Sgian misbehaves
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please keep tokens, prompts and private file contents out of this report.
+        Security problems belong in the private channel described in SECURITY.md, not here.
+  - type: input
+    id: version
+    attributes:
+      label: Sgian version
+      description: From the About dialog, or `sgian --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform and client
+      options:
+        - macOS native client
+        - Windows native client
+        - Linux Tauri client
+        - Served view (browser)
+        - ctl only
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostic
+    attributes:
+      label: Diagnostic bundle
+      description: |
+        Run `sgian ctl diagnostic` in the workspace and attach or paste the result.
+        The bundle is redacted (no prompts, tokens or file contents) but please skim it before posting.
+      render: text
