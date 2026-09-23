@@ -210,15 +210,34 @@ Shipped (2026-09-16):
   current holder's session. `docs/design/execution-grants.md` records the
   Kranz-authorizes / Sgian-executes boundary agreed with the Kranz side.
 
+- **Project board in the native clients** (#29). The macOS sidebar groups
+  panes by project with the roll-up in each section header and marks
+  output-guard hits with an eye-slash icon; the Windows sidebar shows one
+  roll-up line per project and names each pane's project and hidden-output
+  count in its subtitle. Both follow `projects_changed` and
+  `output_warning`.
+- **Kranz runs as their own credential holders**
+  ([craigcode/kranz#72](https://github.com/craigcode/kranz/pull/72)). Each
+  worker run issues itself a `write` credential as `kranz:<run-id>` before
+  its session and revokes it after, so panes, leases and ledger records
+  name the run; no `impersonate` scope exists. The exchange was verified
+  against a real daemon (`docs/design/client-identity.md`).
+- **Two pre-launch reviews closed.** The trust-surface review
+  (`docs/trust-surface-review-2026-09-19.md`) and the full-repo review
+  (`docs/review-2026-09-20.md`, fourteen findings) are recorded with the
+  PR that closed each finding.
+
 Open, in order:
 
 - **Execution grants** (`docs/design/execution-grants.md`): the Sgian half
   once `kranz-acp` and Kranz's `TerminalProvider` seam exist.
-- **Output-guard badges and project rendering in the native clients**
-  (the Tauri client has both: `⚠ N` badge, overview grouped by project with
-  the roll-up); stripping for agent panes; per-project shared context notes
-  under git.
-- **M5 SSM / ECS Exec target**.
+- **Output-guard stripping for agent panes**, and per-project shared
+  context notes under git. The badges and project rendering the native
+  clients were missing shipped in #29.
+- **M5 SSM / ECS Exec target**: needs an AWS host to test against.
+- **Hands-on acceptance on a phone**: the served view over `ssh -L` from a
+  real device (the phone-width layout was checked in a desktop browser at
+  375×812 only).
 
 ## 4. Workbench UX
 
