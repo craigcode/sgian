@@ -45,6 +45,9 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
 
 ## Working and stable
 
+- [x] macOS hands-on acceptance of the packaged native app with a real Claude
+      Code session (`docs/acceptance-macos-2026-09-23.md`): passed, with four
+      non-blocking findings and the step list the Windows pass should follow.
 - [ ] **Windows hands-on acceptance** (ENHANCEMENTS §1): Claude Code's
       full-screen TUI in the packaged app through splits and resizes; the
       lease dialog, unattended badge and project views exercised by a person.
