@@ -117,3 +117,27 @@ additive: no wire break, no persisted-format change beyond `clients.json`.
    execution-grants doc already leans this way).
 4. Confirm remote means "SSH-forwarded socket" for M6 and that the phone
    lane waits for a served UI.
+
+## Verified exchange (2026-09-23)
+
+The Kranz side ([craigcode/kranz#72](https://github.com/craigcode/kranz/pull/72))
+and this daemon were each tested against fakes. The exchange below was run
+by hand against a real daemon on a temporary workspace, with the exact argv
+Kranz emits, and every step behaved as this note says it should.
+
+1. `ctl --workspace W --json identity issue --holder kranz:run-e2e --scope write`
+   printed a record with `id`, `holder`, `scopes` and a one-time `token`,
+   which is what Kranz's parser reads.
+2. `whoami` under `SGIAN_CLIENT_TOKEN` answered credential `8de9ac133a94`,
+   holder `kranz:run-e2e`, scopes `write` and `read`, root false.
+3. `lease take` and `send` under the token succeeded; `wait --text` saw the
+   echoed line in the pane. A `send` from the root connection while the
+   lease was held was refused with the holder's name.
+4. The pane ledger's `lease.taken` and `lease.released` records carry
+   `credential: 8de9ac133a94` and `holder: kranz:run-e2e`; the release
+   record counted one write of 23 bytes and one refused write. The chain
+   verified.
+5. `identity revoke 8de9ac133a94` set `revoked_at_ms`; `whoami` under the
+   same token was then refused as "client credential refused", and
+   `identity list` shows the revoked record.
+
