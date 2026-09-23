@@ -5,127 +5,131 @@ follow SemVer once the first public tag exists.
 
 ## Unreleased
 
-### Added
+The first public release. Everything below is new relative to the private
+prototype that preceded it; the version is chosen at release time.
 
-- Kranz worker runs identify themselves with their own `kranz:<run-id>`
-  write credential (issued and revoked by Kranz around each session); the
-  identity design note and README no longer describe an `impersonate` grant
-  for Kranz.
-- Contributor surface: `CONTRIBUTING.md` (builds per client, the four
-  required checks, squash and changelog conventions, where wire-contract
-  changes are documented), issue templates that ask for the version, platform
-  and `ctl diagnostic` bundle, a pull-request checklist, and a README that
-  opens with what Sgian is, how to install it and a first five minutes.
-- Review fixes (2026-09-20 full-repo audit, P2/P3): the workspace-key
-  collision guard survives a corrupt `workspace.json` via a `workspace.cwd`
-  marker; a peer uid that cannot be read is refused on macOS and Linux; a
-  config reload updates the scrub list profiled panes restart with; an
-  agent pane's badge shows the permission mode its CLI was started with;
-  the web client drops leases, output warnings and usage for panes that
-  vanish on resync and closes the served event stream on stop; the pane
-  input queue is capped at 8 MiB of unwritten bytes; the daemon socket is
-  created under an owner-only umask; `ctl serve` refuses beyond 64 open
-  connections.
-- Review fixes (2026-09-20 full-repo audit, P1): revoking a credential now
-  refuses new subscriptions and ends the event streams it opened; agent
-  prompts, approvals and interrupts honour the keyboard lease for a
-  credentialed connection; `ctl serve` requires a per-run session key (URL
-  once, then a cookie) so another local account cannot drive the daemon
-  through the loopback port, and `--allow-write` never allows admin.
-- `ctl serve [--port N] [--allow-write]`: host the web client on loopback
-  for a phone or laptop over an SSH tunnel; read-only by default, acts as
-  the process's credential, embedded assets, loopback-only with a Host
-  check. The web client gains a fetch + SSE bridge for the served page,
-  lands on the session overview, and renders the overview as a stack of
-  cards at phone width.
-- Native clients store a client credential per workspace (macOS login
-  Keychain, Windows credential vault) behind Settings → Identity, with a
-  Forget button; `SGIAN_CLIENT_TOKEN` still overrides when set.
-- Trust-surface review before launch (`docs/trust-surface-review-2026-09-19.md`):
-  hook and status-line reports need `write` from a credential, revocation
-  cuts a live connection at its next request, the legacy `write_to_pane`
-  request is bound to the credential's holder, ledgered hook strings and
-  status-line names are bounded, `ctl hook`/`ctl statusline` cap stdin at
-  1 MiB, and `clients.json` is rewritten at most once a minute.
-- Per-client identity: `ctl identity issue|list|revoke` and `ctl whoami`;
-  credentials carry `read`/`write`/`admin` scopes and fix the holder the
-  daemon attributes input and leases to (`credential` on lease ledger
-  records); `client_token` on the hello lets a second machine connect over
-  an SSH-forwarded socket without the workspace token; `identity: required`
-  makes every write need a credential; connections from another uid are
-  dropped. All three clients read `SGIAN_CLIENT_TOKEN` and show a scope
-  refusal as the read-only notice.
-- `ctl statusline`: the command Claude Code's status line runs. Records
-  the session's model, context fill and rate-limit windows against the pane
-  that owns the calling process and prints your own status line (or a
-  compact default). Shown beside every pane in all three clients (amber
-  past 80%), in `ctl agent`, and as the freshest limit line per project
-  heading. `agent_usage` snapshot map and event.
-- `ctl hook`: the command a Claude Code hook runs. Finds the pane that
+### Clients
+
+- Native macOS (SwiftUI/SwiftTerm) and Windows (WinUI 3) clients beside the
+  Tauri Linux client: split workspaces, settings, platform update
+  integration and a signed release pipeline (#13).
+- A session overview that groups panes by project with an attention roll-up
+  per heading (needs input, working, unattended, keyboard holders, output
+  warnings) in all three clients, following a `projects_changed` event.
+  Output-guard hits show as an amber badge on the pane tab and header; the
+  macOS sidebar marks them with an eye-slash icon.
+- Per-pane usage beside every pane: the agent's model, context fill and
+  rate-limit windows from `ctl statusline`, amber past 80%, with the
+  freshest limit line under each project heading.
+- Keyboard lease UI: a holder badge, a read-only notice when typing is
+  refused, `Ctrl/Cmd+Shift+T` to take a pane and `Ctrl/Cmd+Shift+L` to
+  release it with a note (#15).
+- Client credentials stored per workspace in the macOS login Keychain or
+  the Windows credential vault behind Settings → Identity, with a Forget
+  button; `SGIAN_CLIENT_TOKEN` overrides when set. A scope refusal shows as
+  the read-only notice.
+- `ctl serve [--port N] [--allow-write]`: the web client on a loopback port
+  for a phone or laptop over an SSH tunnel. Read-only by default, acts as
+  the process's credential, never allows admin, embeds its assets, checks
+  the Host header, requires a per-run session key (once in the URL, then a
+  cookie) and refuses beyond 64 open connections. The page lands on the
+  overview and stacks it as cards at phone width.
+
+### Agents
+
+- Official agent signals: `claude agents --json` polled and mapped to panes
+  through the process tree, outranking screen scraping while fresh; a
+  finished session clears the badge (#15).
+- `ctl hook`: the command a Claude Code hook runs. It finds the pane that
   owns the calling process and sets its badge from the hook (Notification →
   needs input, `UserPromptSubmit`/`PreToolUse` → working, `Stop` → idle)
-  with evidence `hook`; Notifications are ledgered as `hook.received` with
-  their message. The README shows the settings snippet.
-- Project board in the native clients: the macOS sidebar groups panes by
-  project with the roll-up in each section header and marks output-guard
-  hits with an eye-slash icon; the Windows sidebar shows one roll-up line
-  per project and names each pane's project and hidden-output count in its
-  subtitle. Both follow `projects_changed` and `output_warning`.
-- Project board in the Tauri client: the session overview groups panes by
-  project with the attention roll-up in each heading (needs input, working,
-  unattended, keyboard holders, output warnings) plus keyboard and output
-  columns, and follows a new `projects_changed` daemon event. Output-guard
-  hits show as an amber `⚠ N` badge on the pane tab and header.
-- `ctl project dossier NAME [--lines N] [--out FILE]`: one JSON document per
-  project (roll-up, each pane's state, full ledger with the chain verified,
-  last N scrollback lines with citable numbers) for a reviewer or a Kranz
-  gate. `pane.ended` ledger records now carry the agent, its attention at
-  exit, mode, unattended flag, keyboard holder and output-guard totals.
-- Keyboard leases: one holder per pane, `lease_policy` open/required, a
-  mandatory hand-back note, per-lease generations that refuse a previous
-  holder's late command as stale, and `ctl lease` / `ctl send --as` (#15, #22).
-- A hash-chained, fsynced per-pane ledger (`ledger/<pane>.jsonl`) recording
-  lease handovers, attention and permission-mode transitions, pane exits,
-  project membership, Kranz mirroring and output-guard hits; `ctl ledger
-  --verify` names the first broken line (#15, #17, #20, #21).
-- Lease UI in all three clients: holder badge, read-only notice when typing
-  is refused, `Ctrl/Cmd+Shift+T` to take and `Ctrl/Cmd+Shift+L` to release
-  (#15).
-- Official agent signals: `claude agents --json` polled and mapped to panes
-  through the process tree, outranking screen scraping while fresh; a finished
-  session clears the badge (#15).
-- Unattended-mode badge: the agent's permission mode read off the screen
+  with evidence `hook`; Notifications are ledgered as `hook.received`. The
+  README carries the settings snippet.
+- `ctl statusline [--exec CMD]`: the command Claude Code's status line runs.
+  It records the session's model, context fill and rate-limit windows
+  against the owning pane, then prints your own status line or a compact
+  default; `agent_usage` snapshot map and event.
+- Unattended-mode badge: the permission mode read off the agent's screen
   (`auto`, `bypass`, `accept-edits`, `plan`) or an agent pane's configured
-  mode, with `unattended` flagged everywhere (#17).
-- Kranz-bound panes: `kranz run` under a pane binds it to its mission;
-  `kranz status --json` drives the badge and released notes are mirrored with
-  `kranz msg`; `ctl kranz bind|unbind|status` (#15).
-- Projects: named pane groups with an attention roll-up and the members'
-  ledgers merged in time order; `ctl project …`, `ctl new --project` (#20).
+  mode, flagged `unattended` in every client, in `ctl agent` and in the
+  ledger (#17).
 - Output guard: per-pane counts of SGR 8 conceal, OSC 52 clipboard writes,
   mismatched OSC 8 hyperlinks, DCS/APC/PM/SOS strings and raw C1 controls,
   ledgered and shown as `HIDDEN-OUTPUT` in `ctl agent` (#21).
+
+### Identity and keyboard leases
+
+- Per-client identity: `ctl identity issue|list|revoke` and `ctl whoami`.
+  Credentials carry `read`/`write`/`admin` scopes and fix the holder the
+  daemon attributes input and leases to; `client_token` on the hello lets
+  a second machine connect over an SSH-forwarded socket without the
+  workspace token; `identity: required` makes every write need a
+  credential; connections from another uid are dropped.
+- Keyboard leases: one holder per pane, `lease_policy` open or required, a
+  mandatory hand-back note, per-lease generations that refuse a previous
+  holder's late command as stale, and `ctl lease` / `ctl send --as`
+  (#15, #22). Agent prompts, approvals and interrupts honour the lease for
+  a credentialed connection.
+- Revoking a credential cuts its live connections at their next request,
+  refuses new subscriptions and ends the event streams it opened.
+- Kranz worker runs identify themselves with their own `kranz:<run-id>`
+  write credential, issued and revoked by Kranz around each session, so a
+  run's panes, leases and ledger records name the run rather than the
+  operator.
+
+### Ledger and projects
+
+- A hash-chained, fsynced per-pane ledger (`ledger/<pane>.jsonl`) recording
+  lease handovers, attention and permission-mode transitions, pane exits
+  with the agent's state at exit, project membership, Kranz mirroring,
+  hook notifications and output-guard hits; `ctl ledger --verify` names
+  the first broken line (#15, #17, #20, #21).
+- Projects: named pane groups with an attention roll-up and the members'
+  ledgers merged in time order; `ctl project …`, `ctl new --project` (#20).
+- `ctl project dossier NAME [--lines N] [--out FILE]`: one JSON document per
+  project (roll-up, each pane's state, the verified ledger, the last N
+  scrollback lines with citable numbers) for a reviewer or a Kranz gate.
+- Kranz-bound panes: `kranz run` under a pane binds it to its mission,
+  `kranz status --json` drives the badge, released notes are mirrored with
+  `kranz msg`; `ctl kranz bind|unbind|status` (#15).
 - `ctl search` and `ctl lines` over a pane's scrollback with control
-  sequences stripped, for citing exact output lines (#19).
-- `ctl agent --watch --json` streaming agent-state, lease and pane-end
+  sequences stripped, for citing exact output lines (#19), and
+  `ctl agent --watch --json` streaming agent-state, lease and pane-end
   transitions (#15).
-- Native macOS (SwiftUI/SwiftTerm) and Windows (WinUI 3) clients, split
-  workspaces, settings, platform update integration and a signed release
-  pipeline (#13).
-- An output-flood regression test with a measured throughput baseline (#18).
 
-### Changed
+### Daemon
 
-- Closing a pane (or daemon exit) terminates the pane's whole process tree,
-  found without forking (libproc on macOS, /proc on Linux) and held in a
-  kill-on-close Job Object on Windows (#15).
+- Closing a pane, or the daemon exiting, terminates the pane's whole
+  process tree, found without forking (libproc on macOS, /proc on Linux)
+  and held in a kill-on-close Job Object on Windows (#15).
 - Pane spawns drop Claude Code's child-session markers inherited from the
-  daemon's environment (#15).
-- IPC line writes are a single syscall; transient `openpty` failures are
-  retried briefly (#15).
+  daemon's environment; a config reload updates the scrub list profiled
+  panes restart with (#15).
+- The workspace-key collision guard survives a corrupt `workspace.json`
+  via a `workspace.cwd` marker; the daemon socket is created under an
+  owner-only umask; the pane input queue is capped at 8 MiB of unwritten
+  bytes; IPC line writes are a single syscall and transient `openpty`
+  failures are retried briefly (#15).
+- An output-flood regression test with a measured throughput baseline (#18).
 
 ### Security
 
 - Trust-boundary hardening across the daemon, native bridges and release
-  automation (#11); vitest 5.0.0 for GHSA-82fw-gwwq-j7x9 and rustls 0.23.45
-  for RUSTSEC-2026-0285 (#15).
+  automation (#11); vitest 5.0.0 for GHSA-82fw-gwwq-j7x9 and rustls
+  0.23.45 for RUSTSEC-2026-0285 (#15).
+- Trust-surface review (`docs/trust-surface-review-2026-09-19.md`): hook
+  and status-line reports need `write` from a credential, the legacy
+  `write_to_pane` request is bound to the credential's holder, ledgered
+  hook strings and status-line names are bounded, `ctl hook` and
+  `ctl statusline` cap stdin at 1 MiB, and `clients.json` is rewritten at
+  most once a minute.
+- Full-repo review (`docs/review-2026-09-20.md`): all fourteen findings
+  closed, including the served view's session key, lease enforcement for
+  credentialed agent control, a peer uid that cannot be read being refused
+  on macOS and Linux, and the web client dropping state for panes that
+  vanish on resync.
+
+### Project
+
+- `CONTRIBUTING.md`, issue and pull-request templates, and a README that
+  opens with what Sgian is, how to install it and a first five minutes.

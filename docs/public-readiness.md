@@ -33,7 +33,12 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
       `src-tauri/tauri.conf.json` by the owner (`npm run release:check`
       verifies they agree). No tag exists yet.
 - [ ] Repository description on GitHub reviewed; the current one predates the
-      lease/ledger work.
+      lease/ledger work. Draft to paste: "Terminal multiplexer for supervising
+      coding agents: a Rust daemon keeps shells and agent sessions alive per
+      workspace, with native macOS and Windows clients, keyboard leases, a
+      hash-chained ledger and a scriptable ctl." Suggested topics:
+      `terminal-multiplexer`, `coding-agents`, `claude-code`, `rust`,
+      `tauri`, `swiftui`, `winui3`, `agent-supervision`.
 - [x] Dependabot pull requests merged or closed so the lockfiles are stable
       for the version pull request (all seven landed 2026-09-16; vite 8 and
       plugin-react 6 went in together because each peers on the other).
