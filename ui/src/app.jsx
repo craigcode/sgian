@@ -121,7 +121,7 @@ function OutputBadge({ warning }) {
   return (
     <span
       className="output-badge"
-      title={`Output hid something: ${outputWarningSummary(warning)}`}
+      title={`Output hid something: ${outputWarningSummary(warning)}${warning.sample ? ` · first seen: ${warning.sample}` : ""}`}
       data-total={warning.total}
     >
       ⚠ {warning.total}

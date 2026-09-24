@@ -233,6 +233,7 @@ fn agent_state_event_emitted_once_per_transition() {
             agent: Some("claude".to_string()),
             attention: Some(AgentAttention::Idle),
             mode: None,
+            unattended: false,
         }
     );
 
@@ -259,6 +260,7 @@ fn agent_state_event_emitted_once_per_transition() {
             agent: Some("claude".to_string()),
             attention: Some(AgentAttention::Working),
             mode: None,
+            unattended: false,
         }
     );
 
@@ -284,6 +286,7 @@ fn agent_state_event_emitted_once_per_transition() {
             agent: None,
             attention: None,
             mode: None,
+            unattended: false,
         }
     );
 
@@ -1043,6 +1046,7 @@ fn agent_event_and_request_wire_shapes() {
         agent: Some("claude".to_string()),
         attention: Some(AgentAttention::NeedsInput),
         mode: None,
+        unattended: false,
     };
     assert_eq!(
         serde_json::to_value(&event).expect("serialize event"),
@@ -1051,6 +1055,7 @@ fn agent_event_and_request_wire_shapes() {
             "pane_id": "pane-1",
             "agent": "claude",
             "attention": "needs_input",
+            "unattended": false,
         })
     );
     let decoded: DaemonEvent = serde_json::from_value(json!({
@@ -1067,6 +1072,7 @@ fn agent_event_and_request_wire_shapes() {
             agent: None,
             attention: None,
             mode: None,
+            unattended: false,
         }
     );
 

@@ -267,6 +267,43 @@ func daemonRoundTrip() async throws {
     #expect(!legacy.isUnattended)
 }
 
+@Test func agentStateEventsDeriveUnattendedWhenTheDaemonOmitsIt() throws {
+    var states: [String: AgentPaneInfo] = [:]
+    let sent = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"agent_state","pane_id":"p1","agent":"claude","attention":"idle","mode":"auto","unattended":true}"#.utf8))
+    #expect(AgentPaneInfo.apply(event: sent, to: &states))
+    #expect(states["p1"]?.isUnattended == true)
+    // An older daemon sends the mode alone; the client must not show a
+    // plain shield for a mode that runs tools without approval.
+    let legacy = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"agent_state","pane_id":"p1","agent":"claude","attention":"working","mode":"auto"}"#.utf8))
+    #expect(AgentPaneInfo.apply(event: legacy, to: &states))
+    #expect(states["p1"]?.attention == .working)
+    #expect(states["p1"]?.isUnattended == true)
+    let plan = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"agent_state","pane_id":"p1","agent":"claude","attention":"idle","mode":"plan"}"#.utf8))
+    #expect(AgentPaneInfo.apply(event: plan, to: &states))
+    #expect(states["p1"]?.isUnattended == false)
+    // An explicit false wins over the derived value.
+    let explicit = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"agent_state","pane_id":"p1","mode":"auto","unattended":false}"#.utf8))
+    #expect(AgentPaneInfo.apply(event: explicit, to: &states))
+    #expect(states["p1"]?.isUnattended == false)
+    let malformed = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"agent_state"}"#.utf8))
+    #expect(AgentPaneInfo.apply(event: malformed, to: &states) == false)
+    #expect(AgentPaneInfo.isUnattendedMode("bypassPermissions"))
+    #expect(AgentPaneInfo.isUnattendedMode("dontAsk"))
+    #expect(!AgentPaneInfo.isUnattendedMode("acceptEdits"))
+    #expect(!AgentPaneInfo.isUnattendedMode(nil))
+}
+
+@Test func startupWorkspaceForgetsAMissingSavedPath() {
+    let existing: Set<String> = ["/w/alive", "/w/older"]
+    let exists: (String) -> Bool = { existing.contains($0) }
+    #expect(WorkspaceModel.startupWorkspacePath(environment: "/w/gone", saved: "/w/alive", recent: [], current: "/", home: "/home", exists: exists) == "/w/gone", "an explicit SGIAN_WORKSPACE is honoured even when missing")
+    #expect(WorkspaceModel.startupWorkspacePath(environment: nil, saved: "/w/alive", recent: ["/w/older"], current: "/x", home: "/home", exists: exists) == "/w/alive")
+    #expect(WorkspaceModel.startupWorkspacePath(environment: nil, saved: "/w/gone", recent: ["/w/gone", "/w/older", "/w/alive"], current: "/x", home: "/home", exists: exists) == "/w/older", "the most recent workspace that still exists")
+    #expect(WorkspaceModel.startupWorkspacePath(environment: nil, saved: "/w/gone", recent: ["/w/gone"], current: "/x", home: "/home", exists: exists) == "/x")
+    #expect(WorkspaceModel.startupWorkspacePath(environment: nil, saved: nil, recent: [], current: "/", home: "/home", exists: exists) == "/home")
+    #expect(WorkspaceModel.startupWorkspacePath(environment: "", saved: nil, recent: [], current: "/x", home: "/home", exists: exists) == "/x", "an empty variable is ignored")
+}
+
 @Test func workspaceSnapshotDecodesProjectsAndOutputWarnings() throws {
     let json = #"{"panes":[],"cwd":"/w","projects":{"feat":{"name":"feat","goal":"ship","panes":["p1","p1","p2"],"created_at_ms":1},"bad":"no"},"output_warnings":{"p1":{"conceal":2,"c1_controls":1},"p2":{}}}"#
     let snapshot = try JSONDecoder().decode(WorkspaceSnapshot.self, from: Data(json.utf8))

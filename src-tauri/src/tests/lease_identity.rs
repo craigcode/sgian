@@ -613,6 +613,7 @@ fn format_watch_event_lines_and_json() {
         agent: Some("claude".to_string()),
         attention: Some(AgentAttention::NeedsInput),
         mode: Some("auto".to_string()),
+        unattended: is_unattended_mode(Some("auto".to_string()).as_deref()),
     };
     assert_eq!(
         format_watch_event(&state, false).as_deref(),
@@ -2903,6 +2904,37 @@ fn output_guard_counts_hiding_tricks_not_redraws() {
         2
     );
     assert_eq!(scan_output_tricks("a\u{85}b\u{9b}c").c1_controls, 2);
+    // Terminal capability traffic is not hidden output: the XTVERSION reply
+    // a terminal sends (and the tty echoes before the app goes raw), the
+    // DECRQSS and XTGETTCAP queries and replies, and the kitty graphics
+    // support query. An image transmission or any other payload still counts.
+    for benign in [
+        "\u{1b}P>|SwiftTerm 1.2.3\u{1b}\\",
+        "\u{1b}P$q q\u{1b}\\",
+        "\u{1b}P1$r0 q\u{1b}\\",
+        "\u{1b}P+q544e\u{1b}\\",
+        "\u{1b}P1+r544e=1\u{1b}\\",
+        "\u{1b}_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\u{1b}\\",
+    ] {
+        assert_eq!(scan_output_tricks(benign).total(), 0, "{benign:?}");
+    }
+    let (tricks, sample) = scan_output_tricks_detailed("\u{1b}_Ga=T,f=100;iVBOR\u{1b}\\");
+    assert_eq!(tricks.string_controls, 1);
+    assert_eq!(sample.as_deref(), Some("APC \"Ga=T,f=100;iVBOR\""));
+    let (tricks, sample) = scan_output_tricks_detailed("\u{1b}Pq payload\u{1b}\\");
+    assert_eq!(tricks.string_controls, 1);
+    assert_eq!(sample.as_deref(), Some("DCS \"q payload\""));
+    let long = format!("\u{1b}P{}\u{1b}\\", "x".repeat(200));
+    let (_, sample) = scan_output_tricks_detailed(&long);
+    let sample = sample.expect("sample");
+    assert!(
+        sample.ends_with('…') && sample.chars().count() < 70,
+        "{sample}"
+    );
+    assert_eq!(
+        scan_output_tricks_detailed("\u{1b}[8mhidden\u{1b}[28m").1,
+        None
+    );
     assert_eq!(
         url_host("https://user@Example.com:8443/path"),
         Some("example.com".to_string())
@@ -2941,6 +2973,11 @@ fn output_guard_accumulates_and_rate_limits_announcements() {
         "a second hit inside the interval is not re-announced"
     );
     assert_eq!(suspicious[0]["payload"]["added"]["conceal"], json!(1));
+    assert_eq!(
+        suspicious[0]["payload"]["sample"],
+        Value::Null,
+        "self-describing hits carry no sample"
+    );
     assert_eq!(router.output_warnings().len(), 1);
     assert_eq!(router.output_tricks("pane-9"), OutputTricks::default());
     router.remove_output_guard("pane-5");
@@ -3643,4 +3680,80 @@ fn review_p2_pure_guards() {
     let stored = store.pane_shells.get("pane-p").expect("stored shell");
     assert_eq!(stored.scrub_env, vec!["SECRET".to_string()]);
     assert_eq!(stored.shell, "/bin/zsh", "the profile's own shell stays");
+}
+
+#[test]
+fn output_guard_announcement_names_the_first_opaque_string() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let router = OutputRouter::new(dir.path().join("scrollback"));
+    let ledger_dir = dir.path().join(LEDGER_DIR);
+    fs::create_dir_all(&ledger_dir).expect("ledger dir");
+    router.set_ledger(Arc::new(Mutex::new(LedgerSink::new(ledger_dir.clone()))));
+    fs::create_dir_all(dir.path().join("scrollback")).expect("scrollback dir");
+    router.ensure_model("pane-7", 80, 24);
+    router.ensure_model("pane-8", 80, 24);
+
+    // What a Claude Code start looks like through SwiftTerm: the query, then
+    // the terminal's reply echoed by the tty. Not a warning.
+    router.emit(
+        "pane-7",
+        "\u{1b}[>0q\u{1b}[?u\u{1b}[c\u{1b}P>|SwiftTerm 1.2.3\u{1b}\\\r\n".to_string(),
+    );
+    assert_eq!(router.output_tricks("pane-7"), OutputTricks::default());
+    assert!(router.output_warnings().is_empty());
+
+    router.emit("pane-8", "\u{1b}_Ga=T,f=100;iVBOR\u{1b}\\".to_string());
+    let records = read_ledger_tail(&ledger_path(&ledger_dir, "pane-8"), 0);
+    let suspicious: Vec<&Value> = records
+        .iter()
+        .filter(|record| record["type"] == json!("output.suspicious"))
+        .collect();
+    assert_eq!(suspicious.len(), 1);
+    assert_eq!(
+        suspicious[0]["payload"]["sample"],
+        json!("APC \"Ga=T,f=100;iVBOR\"")
+    );
+    assert_eq!(
+        suspicious[0]["payload"]["total"]["string_controls"],
+        json!(1)
+    );
+}
+
+#[test]
+fn agent_state_event_carries_unattended_derived_from_mode() {
+    let auto = DaemonEvent::agent_state(
+        "pane-1".to_string(),
+        Some("claude".to_string()),
+        Some(AgentAttention::Idle),
+        Some("auto".to_string()),
+    );
+    let json = serde_json::to_value(&auto).expect("serialize");
+    assert_eq!(json["event"], json!("agent_state"));
+    assert_eq!(json["mode"], json!("auto"));
+    assert_eq!(json["unattended"], json!(true));
+    for mode in ["bypass", "bypassPermissions", "dontAsk"] {
+        let event = DaemonEvent::agent_state("p".to_string(), None, None, Some(mode.to_string()));
+        assert_eq!(
+            serde_json::to_value(&event).unwrap()["unattended"],
+            json!(true)
+        );
+    }
+    let plan = DaemonEvent::agent_state("p".to_string(), None, None, Some("plan".to_string()));
+    assert_eq!(
+        serde_json::to_value(&plan).unwrap()["unattended"],
+        json!(false)
+    );
+    let none = DaemonEvent::agent_state("p".to_string(), None, None, None);
+    let json = serde_json::to_value(&none).expect("serialize");
+    assert_eq!(json["unattended"], json!(false));
+    assert!(json.get("mode").is_none(), "mode stays additive");
+    // An old daemon's event without the field still decodes.
+    let legacy: DaemonEvent = serde_json::from_str(
+        r#"{"event":"agent_state","pane_id":"p","agent":null,"attention":null}"#,
+    )
+    .expect("decode");
+    assert_eq!(
+        legacy,
+        DaemonEvent::agent_state("p".to_string(), None, None, None)
+    );
 }

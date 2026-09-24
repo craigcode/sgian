@@ -744,26 +744,25 @@ pub(crate) fn frontend_event(event: DaemonEvent) -> Option<(&'static str, Value)
             agent,
             attention,
             mode,
-        } => {
-            let unattended = is_unattended_mode(mode.as_deref());
-            (
-                "agent-state",
-                json!({
-                    "pane_id": pane_id,
-                    "agent": agent,
-                    "attention": attention,
-                    "mode": mode,
-                    "unattended": unattended,
-                }),
-            )
-        }
+            unattended,
+        } => (
+            "agent-state",
+            json!({
+                "pane_id": pane_id,
+                "agent": agent,
+                "attention": attention,
+                "mode": mode,
+                "unattended": unattended,
+            }),
+        ),
         DaemonEvent::OutputWarning {
             pane_id,
             added,
             total,
+            sample,
         } => (
             "output-warning",
-            json!({ "pane_id": pane_id, "added": added, "total": total }),
+            json!({ "pane_id": pane_id, "added": added, "total": total, "sample": sample }),
         ),
         DaemonEvent::AgentUsage { pane_id, usage } => {
             ("agent-usage", json!({ "pane_id": pane_id, "usage": usage }))

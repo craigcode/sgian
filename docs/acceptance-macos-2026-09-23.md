@@ -68,6 +68,19 @@ One observation that is not a defect: handing a folder to the app through
 `application(_:open:)` did not select it as the workspace. If that is
 meant to work, it does not; if not, nothing to do.
 
+## Follow-up
+
+All four findings were fixed the same day and re-checked live against the
+rebuilt app: the terminal now appears as an `AXTextArea` labelled by pane
+title with the visible screen as its value; a Claude Code start produces no
+warning because the guard recognises terminal capability traffic (the
+XTVERSION reply SwiftTerm sends, echoed by the tty before the app goes raw,
+was the string it counted); the header reads "auto · unattended" on the
+first live attach because the daemon's `agent_state` event now carries
+`unattended`; and a saved workspace that no longer exists is forgotten at
+launch in favour of the most recent one that does, with a Choose Workspace
+button in the empty state. VoiceOver itself has still not been run.
+
 ## Procedure
 
 The same sequence, for the Windows pass or for repeating this one by hand.
