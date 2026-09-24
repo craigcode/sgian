@@ -81,6 +81,35 @@ first live attach because the daemon's `agent_state` event now carries
 launch in favour of the most recent one that does, with a Choose Workspace
 button in the empty state. VoiceOver itself has still not been run.
 
+## Hook and status-line lanes (2026-09-24)
+
+The first pass drove the badge from screen scraping and the official probe
+only, because this machine's Claude settings carry no `sgian ctl hook` or
+`sgian ctl statusline` entries. A second run layered them in with
+`claude --settings <file>` (the file held the four hook entries and the
+status-line command from the README, with the bundled helper's full path)
+in a daemon pane, and the native client attached afterwards.
+
+- After the prompt was submitted the ledger held `attention.changed` idle →
+  working and working → idle with `evidence: hook`, ahead of the screen
+  classifier.
+- `ctl agent --json` carried `usage` with the model, a 1,000,000-token
+  context window and the session id from the first status-line call, and
+  after the turn 5% context, the five-hour and seven-day windows with their
+  reset times, and the cost. The pane's own status line rendered the
+  compact default ("Fable 5.1 · 5% context · 5h 3% ↻ 2h14m · 7d 21% ↻
+  20h24m") and the client's sidebar row showed the same text.
+- Not exercised: a `Notification` hook (`permission_prompt` needs a mode
+  that asks, `idle_prompt` needs a minute of idleness), so the needs-input
+  badge from a hook and the `hook.received` ledger record still rest on
+  the unit tests.
+
+Two notes for anyone scripting a pass with `ctl send`. A line is submitted
+only when the text contains a newline. Claude Code's input treats a burst
+of text ending in a carriage return as a paste and keeps the newline in the
+box, so send the text and then a separate `send --raw $'\r'`; the shell
+prompt has no such rule.
+
 ## Procedure
 
 The same sequence, for the Windows pass or for repeating this one by hand.
