@@ -318,8 +318,27 @@ pub struct AgentPaneInfo {
     pub unattended: bool,
 }
 
+impl DaemonEvent {
+    /// An `agent_state` event with `unattended` derived from `mode`.
+    pub(crate) fn agent_state(
+        pane_id: String,
+        agent: Option<String>,
+        attention: Option<AgentAttention>,
+        mode: Option<String>,
+    ) -> Self {
+        let unattended = is_unattended_mode(mode.as_deref());
+        DaemonEvent::AgentState {
+            pane_id,
+            agent,
+            attention,
+            mode,
+            unattended,
+        }
+    }
+}
+
 /// Modes in which an agent runs tools without a person approving them.
-fn is_unattended_mode(mode: Option<&str>) -> bool {
+pub(crate) fn is_unattended_mode(mode: Option<&str>) -> bool {
     matches!(
         mode,
         Some("auto") | Some("bypass") | Some("bypassPermissions") | Some("dontAsk")
@@ -1406,6 +1425,10 @@ enum DaemonEvent {
         /// Observed permission mode (see `AgentPaneInfo::mode`); additive.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
+        /// Derived from `mode` (see `is_unattended_mode`) and always sent, so
+        /// a live transition and the bootstrap snapshot agree; additive.
+        #[serde(default)]
+        unattended: bool,
     },
     /// Output-guard hit: `added` since the last announcement, `total` so far
     /// (docs/design/keyboard-lease-and-ledger.md §7). Rate-limited per pane.
@@ -1413,6 +1436,11 @@ enum DaemonEvent {
         pane_id: String,
         added: OutputTricks,
         total: OutputTricks,
+        /// What the pane's first opaque string control looked like (its kind
+        /// and a bounded, escaped prefix of its body), so a badge can say what
+        /// was seen. Absent when every hit was self-describing; additive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sample: Option<String>,
     },
     /// A pane's usage reading changed (see `AgentUsage`). Frequent (every
     /// turn of a session) and not the product: never ledgered.

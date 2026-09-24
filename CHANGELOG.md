@@ -24,6 +24,11 @@ prototype that preceded it; the version is chosen at release time.
 - Keyboard lease UI: a holder badge, a read-only notice when typing is
   refused, `Ctrl/Cmd+Shift+T` to take a pane and `Ctrl/Cmd+Shift+L` to
   release it with a note (#15).
+- macOS: a saved workspace path that no longer exists is forgotten at
+  launch in favour of the most recent one that does, and the empty state
+  offers Choose Workspace instead of a dead spinner; the terminal is a text
+  area to accessibility clients, labelled by pane title, with the visible
+  screen as its value.
 - Client credentials stored per workspace in the macOS login Keychain or
   the Windows credential vault behind Settings → Identity, with a Forget
   button; `SGIAN_CLIENT_TOKEN` overrides when set. A scope refusal shows as
@@ -55,7 +60,16 @@ prototype that preceded it; the version is chosen at release time.
   ledger (#17).
 - Output guard: per-pane counts of SGR 8 conceal, OSC 52 clipboard writes,
   mismatched OSC 8 hyperlinks, DCS/APC/PM/SOS strings and raw C1 controls,
-  ledgered and shown as `HIDDEN-OUTPUT` in `ctl agent` (#21).
+  ledgered and shown as `HIDDEN-OUTPUT` in `ctl agent` (#21). Terminal
+  capability traffic (a terminal's XTVERSION, DECRQSS and XTGETTCAP replies
+  echoed before an application goes raw, the queries themselves, and the
+  kitty graphics support query) is not counted, so an agent's startup no
+  longer trips the badge; the `output.suspicious` record and the
+  `output_warning` event name the first opaque string that did count.
+- `agent_state` events always carry `unattended`, so a live permission-mode
+  transition shows the unattended shield in the native clients without
+  waiting for a reattach; the macOS client also derives it from `mode` for
+  an older daemon.
 
 ### Identity and keyboard leases
 

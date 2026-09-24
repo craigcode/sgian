@@ -153,7 +153,13 @@ private struct EmptyWorkspaceView: View {
                     Button("New Claude Agent") { model.createAgent(backend: .claude) }
                 }
             } else if case .failed = model.status {
-                Button("Reconnect") { model.connect(to: model.workspaceURL) }
+                HStack {
+                    Button("Reconnect") { model.connect(to: model.workspaceURL) }
+                        .buttonStyle(.borderedProminent)
+                    Button("Choose Workspace…") { model.chooseWorkspace() }
+                }
+            } else if model.status == .disconnected {
+                Button("Choose Workspace…") { model.chooseWorkspace() }
                     .buttonStyle(.borderedProminent)
             } else {
                 ProgressView()

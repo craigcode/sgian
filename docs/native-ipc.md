@@ -110,8 +110,10 @@ project above the list and names each pane's project in its subtitle.
 The bootstrap snapshot may carry `output_warnings` (pane_id → per-kind
 counts of output that hides content: `conceal`, `clipboard`,
 `hyperlink_mismatch`, `string_controls`, `c1_controls`), and subscribers may
-receive `output_warning` events with `added` and `total`; both additive, and a
-client should mark such a pane (the Tauri client shows an amber `⚠ N` badge
+receive `output_warning` events with `added` and `total`, plus `sample` (the
+kind and a bounded, escaped prefix of the pane's first opaque DCS/APC/PM/SOS
+string, present only when one was counted) so a badge can say what was
+seen; all additive, and a client should mark such a pane (the Tauri client shows an amber `⚠ N` badge
 beside the agent badge, with the per-kind counts in its title; macOS an
 orange eye-slash icon in the pane row; Windows `⚠ N hidden` in the subtitle).
 
@@ -129,7 +131,10 @@ account).
 `agent_states` entries and `agent_state` events may carry `mode` (the
 agent's observed permission mode) and `unattended` (true when tools run
 without a person approving them); both are additive and clients must mark an
-unattended pane visibly.
+unattended pane visibly. A current daemon always sends `unattended` on the
+event; a client talking to an older daemon should derive it from `mode`
+(`auto`, `bypass`, `bypassPermissions`, `dontAsk`) when the key is absent, so
+a live transition and the bootstrap snapshot agree.
 
 The bootstrap snapshot supplies the pane registry, active pane, scrollback,
 recorded PTY dimensions, runtime state, agent attention, provider/model specs

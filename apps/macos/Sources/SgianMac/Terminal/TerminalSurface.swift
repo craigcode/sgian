@@ -24,14 +24,17 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
     var onTitleChange: ((String) -> Void)?
 
     private var resizeTask: Task<Void, Never>?
+    private var accessibilityTask: Task<Void, Never>?
     private(set) var latestColumns = 80
     private(set) var latestRows = 24
     private var loadedInitialScrollback = false
+    private(set) var title: String
 
     init(id: String, fontSize: CGFloat = 13, columns: Int = 120, rows: Int = 40) {
         let initialColumns = max(2, min(columns, Int(UInt16.max)))
         let initialRows = max(1, min(rows, Int(UInt16.max)))
         self.id = id
+        title = id
         latestColumns = initialColumns
         latestRows = initialRows
         view = TerminalView(
@@ -50,7 +53,38 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
         view.layer?.backgroundColor = view.nativeBackgroundColor.cgColor
         view.caretColor = .systemGreen
         view.changeScrollback(20_000)
+        // SwiftTerm draws the screen itself, so without this the terminal is
+        // an unlabeled scroll bar to VoiceOver. Present it as a text area
+        // whose value is the visible screen; the label follows the pane title.
+        view.setAccessibilityElement(true)
+        view.setAccessibilityRole(.textArea)
         view.setAccessibilityLabel("Terminal \(id)")
+    }
+
+    /// Name the terminal after its pane for accessibility clients.
+    func setTitle(_ title: String) {
+        guard self.title != title else { return }
+        self.title = title
+        view.setAccessibilityLabel("Terminal \(title)")
+    }
+
+    /// The visible screen as text, one line per row, trailing blanks trimmed.
+    static func visibleText(of terminal: Terminal) -> String {
+        (0..<terminal.rows)
+            .compactMap { terminal.getLine(row: $0)?.translateToString(trimRight: true) }
+            .joined(separator: "\n")
+    }
+
+    /// Republish the visible screen as the accessibility value, coalescing
+    /// bursts of output into one update.
+    private func scheduleAccessibilityRefresh() {
+        guard accessibilityTask == nil else { return }
+        accessibilityTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard let self else { return }
+            self.accessibilityTask = nil
+            self.view.setAccessibilityValue(TerminalSurface.visibleText(of: self.view.getTerminal()))
+        }
     }
 
     func feed(_ text: String) {
@@ -105,7 +139,9 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
 
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
     func scrolled(source: TerminalView, position: Double) {}
-    func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
+    func rangeChanged(source: TerminalView, startY: Int, endY: Int) {
+        scheduleAccessibilityRefresh()
+    }
 }
 
 struct TerminalSurfaceView: NSViewRepresentable {

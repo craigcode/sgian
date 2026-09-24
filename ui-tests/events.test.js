@@ -668,6 +668,28 @@ describe("output warnings and projects", () => {
     expect(state.outputWarnings.has("pane-1")).toBe(false);
   });
 
+  it("keeps the daemon's description of the first opaque string with the counts", () => {
+    const state = makeState([{ id: "pane-1" }]);
+    const callbacks = makeCallbacks();
+    handleOutputWarning(
+      state,
+      { pane_id: "pane-1", total: { string_controls: 1 }, sample: 'APC "Ga=T,f=100;iVBOR"' },
+      callbacks,
+    );
+    expect(state.outputWarnings.get("pane-1").sample).toBe('APC "Ga=T,f=100;iVBOR"');
+    expect(callbacks.calls.render).toBe(1);
+    // Later announcements without a sample keep the first description.
+    handleOutputWarning(state, { pane_id: "pane-1", total: { string_controls: 2 } }, callbacks);
+    expect(state.outputWarnings.get("pane-1").total).toBe(2);
+    expect(state.outputWarnings.get("pane-1").sample).toBe('APC "Ga=T,f=100;iVBOR"');
+    // A repeat with the same counts and sample is not a re-render.
+    handleOutputWarning(state, { pane_id: "pane-1", total: { string_controls: 2 } }, callbacks);
+    expect(callbacks.calls.render).toBe(2);
+    // A self-describing hit has no sample and none is invented.
+    handleOutputWarning(state, { pane_id: "pane-1", total: { conceal: 1, string_controls: 2 }, sample: null }, callbacks);
+    expect(state.outputWarnings.get("pane-1").sample).toBe('APC "Ga=T,f=100;iVBOR"');
+  });
+
   it("replaces the project table on projects-changed and skips no-op repeats", () => {
     const state = makeState([{ id: "pane-1" }]);
     const callbacks = makeCallbacks();

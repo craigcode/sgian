@@ -62,11 +62,15 @@ final class WorkspaceModel: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
-        let environmentPath = ProcessInfo.processInfo.environment["SGIAN_WORKSPACE"]
-        let savedPath = defaults.string(forKey: "workspacePath")
-        let current = FileManager.default.currentDirectoryPath
-        let fallback = current == "/" ? FileManager.default.homeDirectoryForCurrentUser.path : current
-        workspaceURL = URL(fileURLWithPath: environmentPath ?? savedPath ?? fallback, isDirectory: true)
+        let path = WorkspaceModel.startupWorkspacePath(
+            environment: ProcessInfo.processInfo.environment["SGIAN_WORKSPACE"],
+            saved: defaults.string(forKey: "workspacePath"),
+            recent: defaults.stringArray(forKey: "recentWorkspaces") ?? [],
+            current: FileManager.default.currentDirectoryPath,
+            home: FileManager.default.homeDirectoryForCurrentUser.path,
+            exists: WorkspaceModel.isDirectory
+        )
+        workspaceURL = URL(fileURLWithPath: path, isDirectory: true)
         let savedFont = defaults.double(forKey: "terminalFontSize")
         terminalFontSize = savedFont == 0 ? 13 : min(30, max(9, savedFont))
     }
@@ -82,6 +86,30 @@ final class WorkspaceModel: ObservableObject {
         panes.first { $0.id == selectedPaneID }
     }
 
+    /// The workspace to open at launch. `SGIAN_WORKSPACE` wins even when the
+    /// directory is missing (an explicit request should fail visibly); the
+    /// saved path is used only while it still exists, then the most recent
+    /// workspace that does, then the current directory (home when launched
+    /// from `/`, as a Finder launch is).
+    nonisolated static func startupWorkspacePath(
+        environment: String?,
+        saved: String?,
+        recent: [String],
+        current: String,
+        home: String,
+        exists: (String) -> Bool
+    ) -> String {
+        if let environment, !environment.isEmpty { return environment }
+        if let saved, exists(saved) { return saved }
+        if let existing = recent.first(where: exists) { return existing }
+        return current == "/" ? home : current
+    }
+
+    nonisolated static func isDirectory(_ path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
+
     func start() {
         guard connectionTask == nil else { return }
         connect(to: workspaceURL)
@@ -89,9 +117,18 @@ final class WorkspaceModel: ObservableObject {
 
     func connect(to url: URL) {
         let nextURL = url.standardizedFileURL.resolvingSymlinksInPath()
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: nextURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            errorMessage = "Workspace does not exist: \(nextURL.path)"
+        guard WorkspaceModel.isDirectory(nextURL.path) else {
+            // Forget a workspace that is gone so the next launch does not
+            // trip over it again, and leave the empty state offering a
+            // picker instead of a spinner.
+            let message = "Workspace does not exist: \(nextURL.path)"
+            errorMessage = message
+            if UserDefaults.standard.string(forKey: "workspacePath") == nextURL.path {
+                UserDefaults.standard.removeObject(forKey: "workspacePath")
+            }
+            recentWorkspaces.removeAll { $0 == nextURL.path || $0 == url.path }
+            UserDefaults.standard.set(recentWorkspaces, forKey: "recentWorkspaces")
+            if connectionTask == nil { status = .failed(message) }
             return
         }
         connectionTask?.cancel()
@@ -513,6 +550,7 @@ final class WorkspaceModel: ObservableObject {
     private func apply(_ snapshot: WorkspaceSnapshot, rebuildTerminals: Bool = false) {
         let oldSelection = selectedPaneID
         panes = snapshot.panes
+        syncTerminalTitles()
         paneStates = snapshot.paneStates
         agentStates = snapshot.agentStates
         leases = snapshot.leases
@@ -580,20 +618,14 @@ final class WorkspaceModel: ObservableObject {
                   let pane = try? JSONDecoder.ipc.decode(Pane.self, from: data)
             else { return }
             upsert(pane)
+            terminals[pane.id]?.setTitle(pane.title)
 
         case "pane_closed":
             guard let paneID = event["pane_id"]?.stringValue else { return }
             remove(paneID)
 
         case "agent_state":
-            guard let paneID = event["pane_id"]?.stringValue else { return }
-            let attention = event["attention"]?.stringValue.flatMap(AgentAttention.init(rawValue:))
-            agentStates[paneID] = AgentPaneInfo(
-                agent: event["agent"]?.stringValue,
-                attention: attention,
-                mode: event["mode"]?.stringValue,
-                unattended: event["unattended"]?.boolValue
-            )
+            AgentPaneInfo.apply(event: .object(event.payload), to: &agentStates)
 
         case "lease_state":
             LeaseInfo.apply(event: .object(event.payload), to: &leases)
@@ -644,6 +676,13 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
+    /// Keep each terminal's accessibility label on its pane's title.
+    private func syncTerminalTitles() {
+        for pane in panes {
+            terminals[pane.id]?.setTitle(pane.title)
+        }
+    }
+
     private func terminal(for paneID: String, size: PaneSize? = nil) -> TerminalSurface {
         if let existing = terminals[paneID] { return existing }
         let surface = TerminalSurface(
@@ -652,6 +691,9 @@ final class WorkspaceModel: ObservableObject {
             columns: size?.cols ?? 120,
             rows: size?.rows ?? 40
         )
+        if let pane = panes.first(where: { $0.id == paneID }) {
+            surface.setTitle(pane.title)
+        }
         let surfaceGeneration = generation
         surface.onInput = { [weak self] data in
             guard let self, self.generation == surfaceGeneration else { return }

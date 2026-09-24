@@ -57,6 +57,32 @@ struct AgentPaneInfo: Codable, Equatable, Sendable {
     }
 
     var isUnattended: Bool { unattended == true }
+
+    /// Modes in which tools run without a person approving them; mirrors the
+    /// daemon's list so a client can derive `unattended` from an older
+    /// daemon's event that lacks the key.
+    static func isUnattendedMode(_ mode: String?) -> Bool {
+        switch mode {
+        case "auto", "bypass", "bypassPermissions", "dontAsk": true
+        default: false
+        }
+    }
+
+    /// Fold one `agent_state` event into the per-pane map: the event replaces
+    /// the entry, and `unattended` is derived from `mode` when the daemon did
+    /// not send it. False when malformed.
+    @discardableResult
+    static func apply(event: JSONValue, to states: inout [String: AgentPaneInfo]) -> Bool {
+        guard let paneID = event["pane_id"]?.stringValue, !paneID.isEmpty else { return false }
+        let mode = event["mode"]?.stringValue
+        states[paneID] = AgentPaneInfo(
+            agent: event["agent"]?.stringValue,
+            attention: event["attention"]?.stringValue.flatMap(AgentAttention.init(rawValue:)),
+            mode: mode,
+            unattended: event["unattended"]?.boolValue ?? isUnattendedMode(mode)
+        )
+        return true
+    }
 }
 
 /// A pane's keyboard lease (docs/design/keyboard-lease-and-ledger.md).

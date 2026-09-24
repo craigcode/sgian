@@ -208,10 +208,70 @@ pub(crate) fn url_host(text: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
-/// Scan one output chunk. Sequences split across chunks are missed, which is
-/// acceptable for a counter meant to raise a flag, not to censor.
+/// Terminal capability traffic that legitimately travels as a DCS or APC
+/// string and must not count as hidden output:
+///
+/// - replies a terminal sends to an application's query, which the tty echoes
+///   into the output stream when they arrive before the application has
+///   switched off echo (Claude Code asks `CSI > 0 q` at startup and SwiftTerm
+///   answers `DCS > | … ST`, so every agent session used to trip the guard);
+/// - the queries themselves, which an application prints to learn what the
+///   terminal supports.
+///
+/// `kind` is the introducer (`P` for DCS, `_` for APC) and `body` the text
+/// between it and the terminator.
+pub(crate) fn is_terminal_capability_traffic(kind: char, body: &str) -> bool {
+    match kind {
+        'P' => {
+            // XTVERSION reply; DECRQSS reply / query; XTGETTCAP reply / query.
+            body.starts_with(">|")
+                || body.starts_with("1$r")
+                || body.starts_with("0$r")
+                || body.starts_with("$q")
+                || body.starts_with("1+r")
+                || body.starts_with("0+r")
+                || body.starts_with("+q")
+        }
+        // Kitty graphics protocol support query (`a=q`), not an image.
+        '_' => body.starts_with('G') && body.split(';').next().is_some_and(|k| k.contains("a=q")),
+        _ => false,
+    }
+}
+
+/// Bound on the sample kept for an opaque string control, in characters.
+const SAMPLE_CHARS: usize = 48;
+
+/// Render an opaque string control as `DCS "…"` with the body escaped and
+/// bounded, so a badge or ledger record can say what was seen without
+/// carrying the payload.
+fn describe_string_control(kind: char, body: &str) -> String {
+    let name = match kind {
+        'P' => "DCS",
+        '_' => "APC",
+        '^' => "PM",
+        _ => "SOS",
+    };
+    let shown: String = body.chars().take(SAMPLE_CHARS).collect();
+    let suffix = if body.chars().count() > SAMPLE_CHARS {
+        "…"
+    } else {
+        ""
+    };
+    format!("{name} {shown:?}{suffix}")
+}
+
+/// [`scan_output_tricks_detailed`] without the sample.
+#[cfg(test)]
 pub(crate) fn scan_output_tricks(text: &str) -> OutputTricks {
+    scan_output_tricks_detailed(text).0
+}
+
+/// Scan one output chunk. Sequences split across chunks are missed, which is
+/// acceptable for a counter meant to raise a flag, not to censor. The second
+/// value describes the first opaque string control counted, if any.
+pub(crate) fn scan_output_tricks_detailed(text: &str) -> (OutputTricks, Option<String>) {
     let mut tricks = OutputTricks::default();
+    let mut sample: Option<String> = None;
     let mut chars = text.chars().peekable();
     // The open OSC 8 target host while inside a hyperlink, and the visible
     // text collected under it.
@@ -285,14 +345,24 @@ pub(crate) fn scan_output_tricks(text: &str) -> OutputTricks {
                         }
                     }
                 }
-                Some('P') | Some('_') | Some('^') | Some('X') => {
-                    tricks.string_controls += 1;
+                Some(kind @ ('P' | '_' | '^' | 'X')) => {
+                    let mut body = String::new();
                     let mut previous_esc = false;
                     for next in chars.by_ref() {
                         if next == '\u{7}' || (previous_esc && next == '\\') {
                             break;
                         }
                         previous_esc = next == '\u{1b}';
+                        if !previous_esc {
+                            body.push(next);
+                        }
+                    }
+                    if is_terminal_capability_traffic(kind, &body) {
+                        continue;
+                    }
+                    tricks.string_controls += 1;
+                    if sample.is_none() {
+                        sample = Some(describe_string_control(kind, &body));
                     }
                 }
                 _ => {}
@@ -305,7 +375,7 @@ pub(crate) fn scan_output_tricks(text: &str) -> OutputTricks {
             }
         }
     }
-    tricks
+    (tricks, sample)
 }
 
 /// Announce at most this often per pane (ledger + event); counts always accumulate.
@@ -316,4 +386,6 @@ pub(crate) struct OutputGuardState {
     pub(crate) total: OutputTricks,
     pub(crate) announced: OutputTricks,
     pub(crate) last_announced: Option<Instant>,
+    /// The first opaque string control seen on this pane, described.
+    pub(crate) sample: Option<String>,
 }

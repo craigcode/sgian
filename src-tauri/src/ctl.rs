@@ -4063,6 +4063,7 @@ pub(crate) fn format_watch_event(event: &DaemonEvent, json_output: bool) -> Opti
             agent,
             attention,
             mode,
+            ..
         } => format!(
             "{pane_id}\tagent_state\t{}\t{}\t{}",
             agent.as_deref().unwrap_or("-"),
@@ -4165,12 +4166,12 @@ pub(crate) fn control_agent_watch(
         {
             continue;
         }
-        let baseline = DaemonEvent::AgentState {
-            pane_id: pane_id.to_string(),
-            agent: entry["agent"].as_str().map(str::to_string),
-            attention: serde_json::from_value(entry["attention"].clone()).ok(),
-            mode: entry["mode"].as_str().map(str::to_string),
-        };
+        let baseline = DaemonEvent::agent_state(
+            pane_id.to_string(),
+            entry["agent"].as_str().map(str::to_string),
+            serde_json::from_value(entry["attention"].clone()).ok(),
+            entry["mode"].as_str().map(str::to_string),
+        );
         if let Some(line) = format_watch_event(&baseline, json_output) {
             writeln!(stdout, "{line}")
                 .map_err(|error| format!("failed to write stdout: {error}"))?;

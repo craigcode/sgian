@@ -283,7 +283,7 @@ impl OutputRouter {
         if !data.bytes().any(|byte| byte == 0x1b || byte >= 0x80) {
             return;
         }
-        let found = scan_output_tricks(data);
+        let (found, sample) = scan_output_tricks_detailed(data);
         if found.total() == 0 {
             return;
         }
@@ -293,6 +293,9 @@ impl OutputRouter {
             };
             let entry = guard.entry(pane_id.to_string()).or_default();
             entry.total.add(&found);
+            if entry.sample.is_none() {
+                entry.sample = sample;
+            }
             let due = entry
                 .last_announced
                 .is_none_or(|at| at.elapsed() >= OUTPUT_WARNING_ANNOUNCE_INTERVAL);
@@ -300,21 +303,22 @@ impl OutputRouter {
                 entry.last_announced = Some(Instant::now());
                 let added = entry.total.minus(&entry.announced);
                 entry.announced = entry.total;
-                Some((added, entry.total))
+                Some((added, entry.total, entry.sample.clone()))
             } else {
                 None
             }
         };
-        if let Some((added, total)) = announce {
+        if let Some((added, total, sample)) = announce {
             self.ledger_note(
                 pane_id,
                 "output.suspicious",
-                json!({ "added": added, "total": total, "evidence": "scan" }),
+                json!({ "added": added, "total": total, "evidence": "scan", "sample": sample }),
             );
             self.broadcast(&DaemonEvent::OutputWarning {
                 pane_id: pane_id.to_string(),
                 added,
                 total,
+                sample,
             });
         }
     }
@@ -365,12 +369,12 @@ impl OutputRouter {
             Some((entry.attention, entry.mode.clone()))
         });
         if let Some((attention, mode)) = changed {
-            self.broadcast(&DaemonEvent::AgentState {
-                pane_id: pane_id.to_string(),
-                agent: Some(agent.to_string()),
+            self.broadcast(&DaemonEvent::agent_state(
+                pane_id.to_string(),
+                Some(agent.to_string()),
                 attention,
                 mode,
-            });
+            ));
         }
     }
 
@@ -811,12 +815,12 @@ impl OutputRouter {
             let attention = entry.attention;
             drop(tracker);
             self.note_mode_change(pane_id, agent.as_deref(), previous_mode, new_mode.clone());
-            self.broadcast(&DaemonEvent::AgentState {
-                pane_id: pane_id.to_string(),
+            self.broadcast(&DaemonEvent::agent_state(
+                pane_id.to_string(),
                 agent,
                 attention,
-                mode: new_mode,
-            });
+                new_mode,
+            ));
             return;
         }
         let new_agent = if entry.manual {
@@ -882,12 +886,12 @@ impl OutputRouter {
                 new_mode.clone(),
             );
         }
-        self.broadcast(&DaemonEvent::AgentState {
-            pane_id: pane_id.to_string(),
-            agent: new_agent,
-            attention: new_attention,
-            mode: new_mode,
-        });
+        self.broadcast(&DaemonEvent::agent_state(
+            pane_id.to_string(),
+            new_agent,
+            new_attention,
+            new_mode,
+        ));
     }
 
     /// A permission-mode change is its own ledger record: "the agent went
@@ -969,12 +973,12 @@ impl OutputRouter {
                 "evidence": evidence,
             }),
         );
-        self.broadcast(&DaemonEvent::AgentState {
-            pane_id: pane_id.to_string(),
-            agent: new_agent,
-            attention: new_attention,
+        self.broadcast(&DaemonEvent::agent_state(
+            pane_id.to_string(),
+            new_agent,
+            new_attention,
             mode,
-        });
+        ));
         newly_official
     }
 
@@ -1011,12 +1015,12 @@ impl OutputRouter {
                 "evidence": "claude-agents: session gone",
             }),
         );
-        self.broadcast(&DaemonEvent::AgentState {
-            pane_id: pane_id.to_string(),
-            agent: None,
-            attention: None,
-            mode: None,
-        });
+        self.broadcast(&DaemonEvent::agent_state(
+            pane_id.to_string(),
+            None,
+            None,
+            None,
+        ));
     }
 
     /// (T1) Set or clear a pane's manual agent mark. `Some(name)` marks the
@@ -1097,12 +1101,12 @@ impl OutputRouter {
                     "evidence": "process ended",
                 }),
             );
-            self.broadcast(&DaemonEvent::AgentState {
-                pane_id: pane_id.to_string(),
-                agent: Some(agent),
-                attention: None,
+            self.broadcast(&DaemonEvent::agent_state(
+                pane_id.to_string(),
+                Some(agent),
+                None,
                 mode,
-            });
+            ));
         }
     }
 

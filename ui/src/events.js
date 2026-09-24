@@ -174,7 +174,12 @@ export function handleOutputWarning(state, payload, callbacks) {
   if (!state.outputWarnings) state.outputWarnings = new Map();
   const next = normalizeOutputWarning(payload.total);
   const existing = state.outputWarnings.get(paneId) ?? null;
-  if (outputWarningEquals(existing, next)) return;
+  // `sample` describes the pane's first opaque string control so the badge
+  // can say what was seen; it rides along with the counts and never changes
+  // once set.
+  const sample = typeof payload.sample === "string" && payload.sample ? payload.sample : existing?.sample;
+  if (next && sample) next.sample = sample;
+  if (outputWarningEquals(existing, next) && existing?.sample === next?.sample) return;
   if (next) state.outputWarnings.set(paneId, next);
   else state.outputWarnings.delete(paneId);
   callbacks.render();
