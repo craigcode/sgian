@@ -25,6 +25,7 @@ function createController({
     installUpdate: vi.fn(),
     takeLease: vi.fn(),
     openReleaseDialog: vi.fn(),
+    toggleScreenReaderMode: vi.fn(),
   };
   if (focusNextAttentionPane) {
     controller.focusNextAttentionPane = vi.fn();
@@ -96,8 +97,20 @@ describe("buildPaletteCommands", () => {
         "focus-attention",
         "lease-take",
         "lease-release",
+        "screen-reader",
       ]),
     );
+  });
+
+  it("offers a screen reader toggle whose label reflects the current preference", () => {
+    const controller = createController();
+    const off = buildPaletteCommands(controller).find((command) => command.id === "screen-reader");
+    expect(off.label).toBe("Turn screen reader support on");
+    off.run();
+    expect(controller.toggleScreenReaderMode).toHaveBeenCalledTimes(1);
+    controller.state.appearance = { screenReader: true };
+    const on = buildPaletteCommands(controller).find((command) => command.id === "screen-reader");
+    expect(on.label).toBe("Turn screen reader support off");
   });
 
   it("omits focus-attention when controller lacks the method", () => {

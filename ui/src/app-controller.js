@@ -137,7 +137,7 @@ function initialState() {
     booted: false,
     ready: "booting",
     bootStatus: "booting",
-    appearance: { fontFamily: null, fontSize: null, theme: null },
+    appearance: { fontFamily: null, fontSize: null, theme: null, screenReader: readScreenReaderPreference() },
     settingsModalOpen: false,
     settingsFocusRestore: null,
     paletteOpen: false,
@@ -168,6 +168,32 @@ function initialState() {
  *   The served page (`sgian ctl serve`) lands on the overview: on a phone the
  *   board is the useful screen and a pane is one tap away.
  */
+const SCREEN_READER_KEY = "sgian.screenReaderMode";
+
+/**
+ * The client's screen-reader preference: xterm's screen-reader mode exposes
+ * each terminal's rows to assistive technology at a cost on heavy output, so
+ * it is off until asked for, and remembered per client rather than per
+ * workspace. Storage may be unavailable (private mode, served view in a
+ * strict browser); then it is simply off for the session.
+ */
+export function readScreenReaderPreference() {
+  try {
+    return globalThis.localStorage?.getItem(SCREEN_READER_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeScreenReaderPreference(enabled) {
+  try {
+    if (enabled) globalThis.localStorage?.setItem(SCREEN_READER_KEY, "1");
+    else globalThis.localStorage?.removeItem(SCREEN_READER_KEY);
+  } catch {
+    // best effort
+  }
+}
+
 export function createAppController({
   nativeInvoke,
   nativeListen,
@@ -463,7 +489,7 @@ export function createAppController({
     try {
       const config = await invokeWithTimeout("get_config");
       if (config) {
-        state.appearance = mergeAppearance(config);
+        state.appearance = { ...mergeAppearance(config), screenReader: state.appearance.screenReader === true };
         terminals.applyAppearance(state.appearance);
         loadProfilesFromConfig(config);
       }
@@ -1224,6 +1250,15 @@ export function createAppController({
     if (target) focusPane(target);
   }
 
+  function toggleScreenReaderMode() {
+    const enabled = state.appearance.screenReader !== true;
+    state.appearance = { ...state.appearance, screenReader: enabled };
+    writeScreenReaderPreference(enabled);
+    terminals.applyAppearance(state.appearance);
+    render();
+    return enabled;
+  }
+
   function toggleZoomActive() {
     if (!state.activePaneId) return;
     toggleZoom(state.zoom, state.activePaneId);
@@ -1445,7 +1480,7 @@ export function createAppController({
 
   function handleConfigChanged(config) {
     if (!config) return;
-    state.appearance = mergeAppearance(config);
+    state.appearance = { ...mergeAppearance(config), screenReader: state.appearance.screenReader === true };
     terminals.applyAppearance(state.appearance);
     loadProfilesFromConfig(config);
     if (state.settingsModalOpen && state.settingsDirty) return;
@@ -1721,6 +1756,7 @@ export function createAppController({
     closeOverview,
     focusNextAttentionPane,
     takeLease,
+    toggleScreenReaderMode,
     releaseLease,
     openReleaseDialog,
     closeLeaseDialog,

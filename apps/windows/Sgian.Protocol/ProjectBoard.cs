@@ -136,7 +136,13 @@ public static class ProjectBoard
         catch (JsonException) { return null; }
         var paneId = idElement.GetString()!;
         if (paneId.Length == 0 || total is null) return null;
-        if (total.Total > 0) warnings[paneId] = total;
+        // The sample describes the first opaque string counted and is sent on
+        // every announcement once set; keep the one already held when a later
+        // payload lacks it.
+        var sample = payload.TryGetProperty("sample", out var sampleElement) && sampleElement.ValueKind == JsonValueKind.String
+            ? sampleElement.GetString()
+            : warnings.TryGetValue(paneId, out var previous) ? previous.Sample : null;
+        if (total.Total > 0) warnings[paneId] = total with { Sample = string.IsNullOrEmpty(sample) ? null : sample };
         else warnings.Remove(paneId);
         return paneId;
     }

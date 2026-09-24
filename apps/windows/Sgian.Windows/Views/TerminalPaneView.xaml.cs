@@ -34,6 +34,7 @@ public sealed partial class TerminalPaneView : UserControl, IDisposable
         string scrollback,
         PaneSize? size,
         double fontSize,
+        bool screenReader,
         Func<string, Task> input,
         Func<ushort, ushort, Task> resize)
     {
@@ -41,6 +42,7 @@ public sealed partial class TerminalPaneView : UserControl, IDisposable
         _input = input;
         _resize = resize;
         Queue(new { type = "font-size", value = fontSize });
+        Queue(new { type = "screen-reader", value = screenReader });
         Reset(scrollback, size);
         App.TraceSmoke($"Initializing WebView2 for {paneId}");
         try
@@ -85,6 +87,17 @@ public sealed partial class TerminalPaneView : UserControl, IDisposable
     public void Write(string data) => Queue(new { type = "output", data });
     public void Reset(string data, PaneSize? size = null) => Queue(new { type = "reset", data, cols = size?.Columns, rows = size?.Rows });
     public void SetFontSize(double value) => Queue(new { type = "font-size", value });
+
+    /// <summary>xterm's screen-reader mode: expose the rows to assistive technology (a per-PC preference; costs on heavy output).</summary>
+    public void SetScreenReaderMode(bool value) => Queue(new { type = "screen-reader", value });
+
+    /// <summary>Name the terminal after its pane for assistive technology, on the host element and inside the page.</summary>
+    public void SetTitle(string title)
+    {
+        var name = $"Terminal {title}";
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(TerminalWebView, name);
+        Queue(new { type = "title", value = name });
+    }
     public void FocusTerminal() => Queue(new { type = "focus" });
     public void Search(string query, bool previous) => Queue(new { type = "search", query, previous });
 

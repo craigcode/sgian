@@ -45,7 +45,11 @@ public sealed partial class MainWindow : Window
             if (args.Reset) view.Reset(args.Data, args.Size); else view.Write(args.Data);
         };
         ViewModel.TerminalSettingsChanged += (_, _) =>
-            _terminals.Values.ToList().ForEach(view => view.SetFontSize(ViewModel.TerminalFontSize));
+            _terminals.Values.ToList().ForEach(view =>
+            {
+                view.SetFontSize(ViewModel.TerminalFontSize);
+                view.SetScreenReaderMode(ViewModel.ScreenReaderMode);
+            });
         ViewModel.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName is nameof(ViewModel.Status) or nameof(ViewModel.ErrorMessage) or
@@ -94,6 +98,7 @@ public sealed partial class MainWindow : Window
         var pane = ViewModel.SelectedPane;
         PaneTitle.Text = pane?.Title ?? "Sgian";
         PaneSubtitle.Text = pane?.Subtitle ?? "Native terminals and coding agents";
+        ToolTipService.SetToolTip(PaneSubtitle, string.IsNullOrEmpty(pane?.OutputWarningSummary) ? null : pane.OutputWarningSummary);
         var projectSummary = ViewModel.ProjectSummary;
         ProjectSummary.Text = projectSummary;
         ProjectSummary.Visibility = projectSummary.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
@@ -243,6 +248,11 @@ public sealed partial class MainWindow : Window
             terminal.Activated += async (_, _) => { if (ViewModel.Generation == generation && ViewModel.SelectedPane != pane) await ViewModel.SelectAsync(pane); };
             _terminals[id] = terminal;
             view = terminal;
+            terminal.SetTitle(pane.Title);
+            pane.PropertyChanged += (_, args) =>
+            {
+                if (args.PropertyName == nameof(pane.Title) && ViewModel.Generation == generation) terminal.SetTitle(pane.Title);
+            };
             _ = InitializeTerminalAsync(terminal, pane, generation);
         }
         Grid.SetRow(view, 1);
@@ -254,7 +264,7 @@ public sealed partial class MainWindow : Window
 
     private async Task InitializeTerminalAsync(TerminalPaneView terminal, PaneViewModel pane, Guid generation)
     {
-        await terminal.InitializeAsync(pane.Id, ViewModel.InitialScrollback(pane.Id), ViewModel.InitialSize(pane.Id), ViewModel.TerminalFontSize,
+        await terminal.InitializeAsync(pane.Id, ViewModel.InitialScrollback(pane.Id), ViewModel.InitialSize(pane.Id), ViewModel.TerminalFontSize, ViewModel.ScreenReaderMode,
             data => generation == ViewModel.Generation ? ViewModel.WriteTerminalAsync(pane.Id, data) : Task.CompletedTask,
             (columns, rows) => generation == ViewModel.Generation ? ViewModel.ResizeTerminalAsync(pane.Id, columns, rows) : Task.CompletedTask);
         if (generation == ViewModel.Generation) await ViewModel.EnsureTerminalAsync(pane.Id);
@@ -377,6 +387,14 @@ public sealed partial class MainWindow : Window
             TextAlignment = TextAlignment.Center,
             HorizontalAlignment = HorizontalAlignment.Center,
         });
+        if (ViewModel.Status != "Connected")
+        {
+            // A missing or unreachable workspace must not leave a dead end:
+            // offer the picker right where the message is.
+            var choose = new Button { Content = "Choose workspace…", HorizontalAlignment = HorizontalAlignment.Center };
+            choose.Click += async (_, _) => await ChooseWorkspaceAsync();
+            panel.Children.Add(choose);
+        }
         return panel;
     }
 
@@ -443,7 +461,9 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async void ChooseWorkspace_Click(object sender, RoutedEventArgs e)
+    private async void ChooseWorkspace_Click(object sender, RoutedEventArgs e) => await ChooseWorkspaceAsync();
+
+    private async Task ChooseWorkspaceAsync()
     {
         var picker = new FolderPicker
         {

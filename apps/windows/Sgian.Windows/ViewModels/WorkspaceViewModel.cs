@@ -51,14 +51,18 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         DaemonClient.ClientTokenLookup ??= CredentialStore.Load;
         var settings = AppSettings.Load();
         RecentWorkspaces = settings.RecentWorkspaces ?? [];
-        var environment = Environment.GetEnvironmentVariable("SGIAN_WORKSPACE");
-        var fallback = Environment.CurrentDirectory == Path.GetPathRoot(Environment.CurrentDirectory)
-            ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
-            : Environment.CurrentDirectory;
-        _workspacePath = environment ?? settings.WorkspacePath ?? fallback;
+        _workspacePath = WorkspaceStartup.Resolve(
+            Environment.GetEnvironmentVariable("SGIAN_WORKSPACE"),
+            settings.WorkspacePath,
+            settings.RecentWorkspaces,
+            Environment.CurrentDirectory,
+            Path.GetPathRoot(Environment.CurrentDirectory),
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            Directory.Exists);
         _terminalFontSize = settings.TerminalFontSize is >= 9 and <= 30
             ? settings.TerminalFontSize
             : 13;
+        _screenReaderMode = settings.ScreenReaderMode;
     }
 
     public ObservableCollection<PaneViewModel> Panes { get; } = [];
@@ -119,6 +123,21 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         private set => Set(ref _workspacePath, value);
     }
 
+    /// <summary>Whether the terminals expose their screen to assistive technology (xterm's screen-reader mode); a per-PC preference.</summary>
+    public bool ScreenReaderMode
+    {
+        get => _screenReaderMode;
+        set
+        {
+            if (Set(ref _screenReaderMode, value))
+            {
+                SaveSettings();
+                TerminalSettingsChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+    }
+    private bool _screenReaderMode;
+
     public double TerminalFontSize
     {
         get => _terminalFontSize;
@@ -155,6 +174,12 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         {
             ErrorMessage = $"Workspace does not exist: {fullPath}";
             Status = "Connection failed";
+            // Forget a workspace that is gone so the next launch does not trip
+            // over it again; the empty state offers the picker.
+            RecentWorkspaces = RecentWorkspaces
+                .Where(path => !string.Equals(path, fullPath, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            SaveSettings(forgetWorkspace: string.Equals(WorkspacePath, fullPath, StringComparison.OrdinalIgnoreCase));
             return;
         }
 
@@ -655,8 +680,12 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                 {
                     statePane.Attention = item.String("attention");
                     statePane.Mode = item.String("mode");
+                    // A current daemon always sends the flag; derive it for an
+                    // older one so a live transition never shows a plain shield
+                    // for a mode that runs tools without approval.
                     statePane.Unattended = item.Payload.TryGetProperty("unattended", out var flag)
-                        && flag.ValueKind == JsonValueKind.True;
+                        ? flag.ValueKind == JsonValueKind.True
+                        : AgentPaneInfo.IsUnattendedMode(statePane.Mode);
                 }
                 break;
             case "projects_changed":
@@ -832,9 +861,9 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         catch (Exception error) { if (generation == _generation) ErrorMessage = error.Message; }
     }
 
-    private void SaveSettings()
+    private void SaveSettings(bool forgetWorkspace = false)
     {
-        try { new AppSettings(WorkspacePath, TerminalFontSize, RecentWorkspaces).Save(); }
+        try { new AppSettings(forgetWorkspace ? null : WorkspacePath, TerminalFontSize, RecentWorkspaces, ScreenReaderMode).Save(); }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         { ErrorMessage = $"Could not save settings: {error.Message}"; }
     }
