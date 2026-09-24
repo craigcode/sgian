@@ -463,7 +463,7 @@ function RenameInput({ pane, controller }) {
   );
 }
 
-function TerminalSurface({ paneId, ended, available, controller }) {
+function TerminalSurface({ paneId, title, ended, available, controller }) {
   const hostRef = useRef(null);
   useLayoutEffect(() => {
     if (!available) return undefined;
@@ -476,6 +476,8 @@ function TerminalSurface({ paneId, ended, available, controller }) {
       ref={hostRef}
       className="terminal terminal-xterm"
       data-pane-id={paneId}
+      role="group"
+      aria-label={`Terminal ${title || paneId}`}
       onPointerDown={() => controller.terminals.focus(paneId)}
     >
       {!available && (
@@ -842,6 +844,7 @@ function Pane({ paneId, state, controller }) {
       ) : (
         <TerminalSurface
           paneId={paneId}
+          title={paneLabel(pane, index)}
           ended={runtime === "ended"}
           available={state.terminalEngineAvailable !== false}
           controller={controller}

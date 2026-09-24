@@ -167,6 +167,9 @@ export function createTerminalController({
       lineHeight: 1,
       macOptionIsMeta: true,
       scrollback: MAX_TERMINAL_ROWS,
+      // Exposes the rows to assistive technology; a per-client preference
+      // because xterm documents a cost on heavy output.
+      screenReaderMode: appearance?.screenReader === true,
       theme: resolveTheme(appearance),
     });
     const FitAddon = globalThis.FitAddon?.FitAddon;
@@ -272,6 +275,9 @@ export function createTerminalController({
 
   function applyAppearance(appearance) {
     liveReapplyAppearance(state.terminalViews.values(), appearance);
+    for (const view of state.terminalViews.values()) {
+      if (view?.terminal?.options) view.terminal.options.screenReaderMode = appearance?.screenReader === true;
+    }
     for (const paneId of state.terminalViews.keys()) scheduleFit(paneId);
   }
 

@@ -139,6 +139,10 @@ describe("React application instances", () => {
     expect(FakeTerminal.instances.filter((terminal) => !terminal.disposed)).toHaveLength(1);
 
     const host = view.container.querySelector('.terminal[data-pane-id="pane-a"]');
+    // The terminal is a named group for assistive technology; xterm's own
+    // rows are exposed only when the screen reader preference is on.
+    expect(host.getAttribute("role")).toBe("group");
+    expect(host.getAttribute("aria-label")).toMatch(/^Terminal /);
     controller.notify();
     expect(view.container.querySelector('.terminal[data-pane-id="pane-a"]')).toBe(host);
     expect(FakeTerminal.instances).toHaveLength(2);

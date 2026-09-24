@@ -627,6 +627,22 @@ describe("agent permission mode", () => {
     ).toBe(true);
   });
 
+  it("derives unattended from the mode when an older daemon omits the flag", () => {
+    const state = makeState([{ id: "pane-1" }]);
+    const callbacks = makeCallbacks();
+    handleAgentState(state, { pane_id: "pane-1", agent: "claude", attention: "idle", mode: "auto" }, callbacks);
+    expect(state.agentStates.get("pane-1").unattended).toBe(true);
+    handleAgentState(state, { pane_id: "pane-1", agent: "claude", attention: "idle", mode: "plan" }, callbacks);
+    expect(state.agentStates.get("pane-1").unattended).toBeUndefined();
+    // An explicit false from the daemon wins over the derived value.
+    handleAgentState(
+      state,
+      { pane_id: "pane-1", agent: "claude", attention: "idle", mode: "auto", unattended: false },
+      callbacks,
+    );
+    expect(state.agentStates.get("pane-1").unattended).toBeUndefined();
+  });
+
   it("a mode-only agent-state event re-renders", () => {
     const state = makeState([{ id: "pane-1" }]);
     const callbacks = makeCallbacks();

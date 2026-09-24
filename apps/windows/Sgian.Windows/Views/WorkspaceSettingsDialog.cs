@@ -22,6 +22,10 @@ internal static class WorkspaceSettingsDialog
         var font = new Slider { Header = "Terminal font size", Minimum = 9, Maximum = 30, StepFrequency = 1, Value = model.TerminalFontSize };
         font.ValueChanged += (_, args) => model.TerminalFontSize = args.NewValue;
         panel.Children.Add(font);
+        var screenReader = new ToggleSwitch { Header = "Screen reader support", IsOn = model.ScreenReaderMode, OnContent = "On", OffContent = "Off" };
+        screenReader.Toggled += (_, _) => model.ScreenReaderMode = screenReader.IsOn;
+        panel.Children.Add(screenReader);
+        panel.Children.Add(new TextBlock { Text = "Exposes each terminal's rows to Narrator and other assistive technology. Costs some performance on heavy output. A per-PC setting.", TextWrapping = TextWrapping.Wrap });
         TextBox Field(string title, string key, bool multiline = false)
         {
             var box = new TextBox { Header = title, Text = config[key]?.GetValue<string>() ?? "", AcceptsReturn = multiline };

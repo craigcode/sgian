@@ -49,6 +49,12 @@
         } finally { restoring = false; postSize(); }
       }
       if (message.type === 'font-size') { terminal.options.fontSize = message.value; postSize(); }
+      if (message.type === 'screen-reader') terminal.options.screenReaderMode = message.value === true;
+      if (message.type === 'title') {
+        const name = typeof message.value === 'string' && message.value ? message.value : 'Terminal';
+        document.getElementById('terminal').setAttribute('aria-label', name);
+        document.title = name;
+      }
       if (message.type === 'focus') {
         hostFocus = true;
         try { terminal.focus(); } finally { hostFocus = false; }

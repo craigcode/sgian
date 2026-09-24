@@ -31,6 +31,8 @@ var tests = new (string Name, Action Body)[]
     ("Agent permission mode", AgentPermissionMode),
     ("Project board model", ProjectBoardModel),
     ("Agent usage from the status line", AgentUsageModel),
+    ("Workspace startup resolution", WorkspaceStartupResolution),
+    ("Output warning sample", OutputWarningSample),
 };
 
 var failures = new List<string>();
@@ -171,6 +173,37 @@ static void AgentPermissionMode()
     var legacy = JsonSerializer.Deserialize<AgentPaneInfo>("""{"agent":"claude","attention":"working"}""")!;
     Equal(null, legacy.Mode);
     Equal(false, legacy.Unattended);
+    Equal(true, AgentPaneInfo.IsUnattendedMode("auto"));
+    Equal(true, AgentPaneInfo.IsUnattendedMode("bypassPermissions"));
+    Equal(true, AgentPaneInfo.IsUnattendedMode("dontAsk"));
+    Equal(false, AgentPaneInfo.IsUnattendedMode("plan"));
+    Equal(false, AgentPaneInfo.IsUnattendedMode(null));
+}
+
+static void WorkspaceStartupResolution()
+{
+    var alive = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { @"C:\w\alive", @"C:\w\older" };
+    Func<string, bool> exists = alive.Contains;
+    Equal(@"C:\w\gone", WorkspaceStartup.Resolve(@"C:\w\gone", @"C:\w\alive", null, @"C:\x", @"C:\", @"C:\Users\me", exists));
+    Equal(@"C:\w\alive", WorkspaceStartup.Resolve(null, @"C:\w\alive", new[] { @"C:\w\older" }, @"C:\x", @"C:\", @"C:\Users\me", exists));
+    Equal(@"C:\w\older", WorkspaceStartup.Resolve(null, @"C:\w\gone", new[] { @"C:\w\gone", @"C:\w\older", @"C:\w\alive" }, @"C:\x", @"C:\", @"C:\Users\me", exists));
+    Equal(@"C:\x", WorkspaceStartup.Resolve(null, @"C:\w\gone", new[] { @"C:\w\gone" }, @"C:\x", @"C:\", @"C:\Users\me", exists));
+    Equal(@"C:\Users\me", WorkspaceStartup.Resolve(null, null, null, @"C:\", @"C:\", @"C:\Users\me", exists));
+    Equal(@"C:\x", WorkspaceStartup.Resolve("", null, null, @"C:\x", @"C:\", @"C:\Users\me", exists));
+}
+
+static void OutputWarningSample()
+{
+    var warnings = new Dictionary<string, OutputTricks>();
+    Equal("p1", ProjectBoard.ApplyWarning(Json("""{"pane_id":"p1","added":{"string_controls":1},"total":{"string_controls":1},"sample":"APC \"Ga=T,f=100;iVBOR\""}"""), warnings));
+    Equal("APC \"Ga=T,f=100;iVBOR\"", warnings["p1"].Sample);
+    Equal("p1", ProjectBoard.ApplyWarning(Json("""{"pane_id":"p1","total":{"string_controls":2}}"""), warnings));
+    Equal(2, warnings["p1"].Total);
+    Equal("APC \"Ga=T,f=100;iVBOR\"", warnings["p1"].Sample);
+    Equal("p1", ProjectBoard.ApplyWarning(Json("""{"pane_id":"p1","total":{"conceal":1},"sample":null}"""), warnings));
+    Equal("APC \"Ga=T,f=100;iVBOR\"", warnings["p1"].Sample);
+    Equal("p2", ProjectBoard.ApplyWarning(Json("""{"pane_id":"p2","total":{"conceal":1}}"""), warnings));
+    Equal(null, warnings["p2"].Sample);
 }
 
 static void KeyboardLease()

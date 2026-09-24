@@ -112,6 +112,12 @@ export function buildPaletteCommands(controller) {
       keywords: ["lease", "keyboard", "release", "note", "hand back"],
       run: () => controller.openReleaseDialog(state.activePaneId),
     },
+    {
+      id: "screen-reader",
+      label: state.appearance?.screenReader ? "Turn screen reader support off" : "Turn screen reader support on",
+      keywords: ["screen reader", "accessibility", "voiceover", "narrator", "a11y"],
+      run: () => controller.toggleScreenReaderMode(),
+    },
   ];
 
   if (typeof controller.focusNextAttentionPane === "function") {

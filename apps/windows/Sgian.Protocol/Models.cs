@@ -64,6 +64,9 @@ public sealed record AgentPaneInfo
     public string? Mode { get; init; }
 
     /// <summary>True when tools run without a person approving them (auto / bypass).</summary>
+    /// <summary>Modes in which tools run without a person approving them; mirrors the daemon's list so a client can derive the flag from an older daemon's event.</summary>
+    public static bool IsUnattendedMode(string? mode) => mode is "auto" or "bypass" or "bypassPermissions" or "dontAsk";
+
     [JsonPropertyName("unattended")]
     public bool Unattended { get; init; }
 }
@@ -114,6 +117,10 @@ public sealed record OutputTricks
 
     [JsonPropertyName("c1_controls")]
     public int C1Controls { get; init; }
+
+    /// <summary>What the pane's first opaque string control looked like, from the <c>output_warning</c> event; not part of the counts object.</summary>
+    [JsonIgnore]
+    public string? Sample { get; init; }
 
     [JsonIgnore]
     public int Total =>

@@ -179,7 +179,9 @@ public sealed class PaneViewModel : ObservableObject
         OutputWarning is null ? "" : $"\u26A0 {OutputWarning.Total} hidden";
 
     public string OutputWarningSummary =>
-        OutputWarning is null ? "" : $"Output hid something: {OutputWarning.Summary}";
+        OutputWarning is null
+            ? ""
+            : $"Output hid something: {OutputWarning.Summary}" + (OutputWarning.Sample is null ? "" : $" · first seen: {OutputWarning.Sample}");
 
     public string Subtitle
     {

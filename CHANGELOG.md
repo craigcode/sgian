@@ -24,6 +24,14 @@ prototype that preceded it; the version is chosen at release time.
 - Keyboard lease UI: a holder badge, a read-only notice when typing is
   refused, `Ctrl/Cmd+Shift+T` to take a pane and `Ctrl/Cmd+Shift+L` to
   release it with a note (#15).
+- Windows and the web client: a saved workspace that no longer exists is
+  forgotten at launch in favour of the most recent one that does and the
+  empty state offers a Choose workspace button (Windows); every terminal is
+  a named group for assistive technology labelled by pane title, with
+  xterm's screen-reader mode as a per-client preference (Settings on
+  Windows, the command palette in the web client) because it costs on heavy
+  output; the output badge names the first opaque string seen; and both
+  derive the unattended flag from the mode for an older daemon.
 - macOS: a saved workspace path that no longer exists is forgotten at
   launch in favour of the most recent one that does, and the empty state
   offers Choose Workspace instead of a dead spinner; the terminal is a text

@@ -433,6 +433,14 @@ describe("main.js boot against the stubbed native bridge", () => {
     }
   });
 
+  it("leaves xterm's screen reader mode off until the client preference turns it on", () => {
+    // xterm documents a cost on heavy output, so the mode is a per-client
+    // preference rather than a default; the palette toggles it live.
+    for (const term of FakeTerminal.instances) {
+      expect(term.options.screenReaderMode).toBe(false);
+    }
+  });
+
   it("exposes a pencil rename button in every pane header (toolbar rename removed)", () => {
     // The toolbar's old "A" button is gone; rename lives in the pane header.
     expect(document.querySelector("#rename-pane")).toBeNull();

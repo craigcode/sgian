@@ -88,8 +88,18 @@ export function normalizeAgentState(entry) {
   // send them, so older payloads normalize exactly as before.
   const normalized = { agent: entry.agent, attention };
   if (typeof entry.mode === "string" && entry.mode) normalized.mode = entry.mode;
-  if (entry.unattended === true) normalized.unattended = true;
+  // A current daemon always sends the flag; derive it for an older one so a
+  // live transition never shows a plain badge for a mode that runs tools
+  // without approval.
+  if (entry.unattended === true || (entry.unattended === undefined && isUnattendedMode(normalized.mode))) {
+    normalized.unattended = true;
+  }
   return normalized;
+}
+
+/** Modes in which tools run without a person approving them (the daemon's list). */
+export function isUnattendedMode(mode) {
+  return mode === "auto" || mode === "bypass" || mode === "bypassPermissions" || mode === "dontAsk";
 }
 
 /**
