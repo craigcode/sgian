@@ -77,6 +77,15 @@ If you only have one platform, run the first check and let CI run the rest.
 - **No secrets in fixtures.** The secret scan runs on every push and fails
   the build; keep tokens and prompts out of tests and docs.
 
+## Public documentation
+
+Issues, roadmap entries, review notes and design documents in this repository
+are public source artifacts. Keep implementation requirements, acceptance
+criteria and necessary technical attribution self-contained here. Keep
+competitive strategy, market comparisons and private business analysis in an
+access-controlled notes store outside the checkout. Removing text in a later
+commit does not remove it from existing history or release tags.
+
 ## Design notes
 
 The design notes under `docs/design/` record the decisions behind the
