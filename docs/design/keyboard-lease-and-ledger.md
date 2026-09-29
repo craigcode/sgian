@@ -6,12 +6,9 @@
 
 ## 1. What the v0.1 draft got right, and what it got wrong
 
-The draft's claim stands: no surveyed tool puts human/agent keyboard ownership
-*in the pane* with a durable record of every handover. A fresh scan on
-2026-09-13 (Warp/Oz, Conductor, Claude Squad, CAO, AgentsRoom, Zellij 0.45,
-tmux 3.8 RC, iTerm2 3.7, Cursor CLI, Codex app-server, OpenCode, Devin)
-confirms it: "takeover" everywhere means attach-to-tmux or push-to-cloud.
-Nobody has a per-pane write lease or a mandatory hand-back note.
+The required interaction is explicit human/agent keyboard ownership in each
+pane, with a durable record of every handover and a mandatory hand-back note.
+Implement that interaction through the existing daemon and control API.
 
 The draft's premise about this repository is wrong. It assumes a greenfield
 four-crate attach client and says the existing code may be replaced. What
@@ -296,30 +293,29 @@ Ranked by leverage against effort. None are committed beyond M1.
    `output_warning`, and shown by `ctl agent`. Stripping (rather than
    flagging) and client badges are still open.
 4. **Unattended-mode badge.** Any pane running under `auto`, `dontAsk`, or
-   `bypassPermissions` must be visibly marked. Warp shipped auto-approve
-   that bypassed its own denylist; the Claude Code deny-rule skip after 50
-   subcommands (CVE-2026-40068 era) shows why visibility matters.
+   `bypassPermissions` must be visibly marked. Approval mode and deny-rule
+   enforcement are separate controls; the UI must identify the effective
+   mode rather than implying that an unattended session has human approval.
 5. **Codex app-server and ACP backends.** Codex exposes JSON-RPC over stdio
    with approvals and interrupt; ACP wraps Claude, Codex, and others with the
-   same shape. One adapter behind the existing normalized event stream makes
-   the vendor-neutral claim real.
+   same shape. Qualify adapters behind the existing normalized event stream
+   using explicit permission and lifecycle evidence.
 6. **Ledger export in the agent-audit-trail draft vocabulary**, optionally
-   Ed25519-signed with a per-workspace key. EU AI Act Article 12 logging is
-   in force since 2026-08-02; a portable, verifiable record is a selling
-   point for the WorkSpaces audience.
+   Ed25519-signed with a per-workspace key. Define the export's event
+   coverage, provenance and verification limits before making an audit or
+   compliance claim.
 7. **`vt100` replacement.** The crate is stale (2025-07) and a third-party
    fuzz run reported panics. `alacritty_terminal` 0.26 (2026-04) is
    maintained and exposes grid, scrollback, and regex search. Not urgent
    while vt100 only drives classification and snapshots, but it should be
    on the list before it drives a renderer.
-8. **Projects (shipped 2026-09-16).** The grouping above panes that
-   Cursor's Projects (2026-09-10) put behind a cloud coordinator: a named
-   group with a goal, member panes, an attention roll-up, and the members'
-   ledgers merged in time order, persisted with the workspace and driven
-   through `ctl project` so any orchestrator or script can be the
-   coordinator. Cursor documents no per-project "who did what"; the merged
-   ledger is that record. Still open: rendering in the clients and a
-   per-project directory of shared context notes kept under git.
+8. **Projects (shipped 2026-09-16).** A named group with a goal, member
+   panes, an attention roll-up and the members' ledgers merged in time order,
+   persisted with the workspace and driven through `ctl project`. The
+   historical design reference was Cursor's Projects (2026-09-10). The
+   merged ledger records project-level actions and attribution. Still open
+   at this design checkpoint: client rendering and a per-project directory
+   of shared context notes kept under git.
 9. **Split `lib.rs`.** Everything lives in one flat module. The lease and
    ledger code lands as its own banner section with pure functions so it can
    be the first thing moved into a module when the split happens.

@@ -155,13 +155,13 @@ Shipped (2026-09-15):
 
 Shipped (2026-09-16):
 
-- **Projects.** A named group of panes serving one goal (borrowed from the
-  shape of Cursor's Projects, 2026-09-10, minus the cloud coordinator):
+- **Projects.** A named group of panes serving one goal (the historical
+  design reference was Cursor's Projects, 2026-09-10):
   persisted with the workspace, a pane in at most one, `project.assigned` /
   `project.unassigned` on the pane's ledger, an attention roll-up (panes,
   live, needs input, working, idle, unattended, keyboard holders), a
-  per-pane detail view, and the members' ledgers merged in time order —
-  the project-level "who did what" Cursor does not record. Daemon requests
+  per-pane detail view, and the members' ledgers merged in time order to
+  record project-level actions and attribution. Daemon requests
   plus `ctl project …` and `ctl new --project`; a `projects_changed` event
   carries the whole table after any change, and the Tauri session overview
   is the board: one group per project with the roll-up in its heading,
@@ -286,41 +286,29 @@ Shipped:
   cleanly; updater check classification skips network/signature errors without
   panicking.
 
-## 6. Competitive positioning — Warp scan candidates (2026-08-04)
+## 6. Control-plane and permission follow-ups (2026-08-04)
 
-Source: [REVIEW-2026-08-04-warp.md](REVIEW-2026-08-04-warp.md) — Warp's
-standalone Agent CLI launched 2026-08-04, planting a funded incumbent
-directly in sgian's lane (persistent sessions + supervised agents).
-Sgian's defensible ground: local-first (no account, no cloud, MIT) and a
-scriptable control plane the Warp CLI lacks entirely (no headless mode, no
-JSON, no hooks at launch). Candidates, cheapest first — none committed:
+Source: the historical [Warp CLI engineering notes](REVIEW-2026-08-04-warp.md).
+These candidates record implementation scope; later shipped-status entries
+above and the current acceptance work determine what remains to build.
 
-- **Lead with the control plane.** README/positioning currently leads with
-  panes; `ctl --json` + exact exit codes + bounded runs is the
-  differentiator no competitor shipped. A short "drive sgian from scripts"
-  doc section (or demo) makes it legible.
-- **Local-first positioning statement.** One paragraph: no account, no
-  cloud, transcripts never leave the machine. The OpenWarp fork's traction
-  (209 HN points for "Warp without the cloud") is the demand evidence.
-- **Permission-visibility pass.** Warp shipped auto-approve bypassing its
-  denylist by default and replace-not-extend denylists. Sgian's defaults
-  are safer, but: badge any pane running under `auto` / `dontAsk` /
-  `bypassPermissions` so unattended modes are always visible, and audit
-  config surfaces for replace-vs-extend semantics (`scrub_env` vs `env`
-  precedence is documented; make the audit deliberate, not assumed).
-- **Machine-readable agent-state stream.** The daemon already broadcasts
-  working / needs-input / idle transitions; expose them to scripts
-  (`ctl agent --watch --json` or an equivalent subscription) so external
-  tooling — CI, notification glue, or a mission orchestrator like kranz —
-  can react to needs-input without polling.
-- **Additional agent backends.** Codex / Gemini CLI panes behind the same
-  normalized event stream would strengthen the vendor-neutral claim that
-  Warp's own-agent-first launch makes newly legible. Medium effort; only
-  worth it once §1 clears.
+- **Document scripting.** Show `ctl --json`, exact exit codes and bounded
+  runs in a short, reproducible scripting example.
+- **Document local operation.** Explain daemon persistence, local storage,
+  provider connections and optional remote access separately. Do not imply
+  that an agent CLI's provider traffic stays local.
+- **Permission visibility.** Badge every pane running under `auto`,
+  `dontAsk` or `bypassPermissions`. Audit configuration composition and
+  `scrub_env`/`env` precedence against the documented behavior.
+- **Machine-readable agent-state stream.** Expose working, needs-input and
+  idle transitions through the existing event subscription so scripts and
+  mission coordinators can react without polling.
+- **Additional agent backends.** Qualify Codex and Gemini CLI adapters behind
+  the normalized event stream, with explicit permission and lifecycle proof.
+  Sequence this behind the platform acceptance work in §1.
 
 ## Prioritization note
 
-Windows acceptance (§1) remains the release blocker for a public ship —
-and gains urgency from the Warp scan: Warp's CLI ships Windows day one.
-The Warp client's now-open ConPTY handling is a directly relevant
-reference for §1 (study only — AGPL; sgian is MIT).
+Use §1 and the current release checklist for platform acceptance status.
+Windows ConPTY, attach/detach and packaged-client behavior need their own
+execution receipts before a platform release is considered qualified.
