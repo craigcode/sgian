@@ -13,6 +13,7 @@ API: the wire contract is the JSON in `docs/native-ipc.md`.
 | `windows_transport.rs` | 1,071 | The named-pipe implementation (`cfg(windows)`). |
 | `frame.rs` | 118 | The v2 length-prefixed frame codec. |
 | `identity.rs` | 252 | Per-client credentials (M6): scopes, policy, records, `ClientIdentity`, request scoping, holder binding. |
+| `windows_job.rs` | — | Windows job ownership, suspended agent launch and process-tree regression tests. |
 | `process_tree.rs` | 157 | Fork-free parent snapshots (libproc / procfs), descendant walks, tree termination. |
 | `router.rs` | 1,421 | Agent screen classification, `AgentTracker`, `OutputRouter`: scrollback append, output-guard hook, attention and usage state, subscriber fan-out. |
 | `terminals.rs` | 700 | `TerminalStore`: PTY spawn, liveness, input queues, kill. |

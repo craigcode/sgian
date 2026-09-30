@@ -290,6 +290,9 @@ jobs:
       - name: Windows transport unit tests
         working-directory: src-tauri
         run: cargo test --locked --lib windows_pipe_tests
+      - name: Windows agent process-tree tests
+        working-directory: src-tauri
+        run: cargo test --locked --lib windows_job_tests
       - name: Build NSIS installer (validation)
         shell: bash
         run: npm run tauri build -- --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked

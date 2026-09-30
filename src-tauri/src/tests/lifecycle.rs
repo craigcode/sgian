@@ -2465,16 +2465,15 @@ fn check_persisted_cwd_accepts_equivalent_spellings() {
     );
 }
 
-/// check_persisted_cwd passes for a corrupt workspace.json (unparseable).
+/// check_persisted_cwd refuses a corrupt workspace.json with no cwd marker.
 #[test]
-fn check_persisted_cwd_corrupt_file_ok() {
+fn check_persisted_cwd_corrupt_file_without_marker_refused() {
     let dir = tempfile::tempdir().expect("temp dir");
     fs::write(dir.path().join(WORKSPACE_FILE), "not valid json").expect("write corrupt file");
 
-    assert!(
-        check_persisted_cwd(&PathBuf::from("/tmp/any-cwd"), dir.path()).is_ok(),
-        "corrupt workspace.json should pass cwd check (handled elsewhere)"
-    );
+    let refused = check_persisted_cwd(&PathBuf::from("/tmp/any-cwd"), dir.path())
+        .expect_err("corrupt persist without a marker");
+    assert!(refused.contains("unparseable"), "{refused}");
 }
 
 // ─── VAL-XPLAT-001 / VAL-CROSS-017: data-dir abstraction via dirs crate ───
@@ -2544,5 +2543,45 @@ fn private_mode_creates_owner_only_file() {
     #[cfg(not(unix))]
     {
         let _ = path;
+    }
+}
+
+#[test]
+fn corrupt_workspace_refusal_preserves_the_original_marker_and_state() {
+    for corrupt in [b"{not json".as_slice(), b"\xff\xfe".as_slice()] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let owner = dir.path().join("owner");
+        let other = dir.path().join("other");
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).expect("data dir");
+        fs::write(data.join(WORKSPACE_FILE), corrupt).expect("corrupt workspace");
+        assert!(
+            check_persisted_cwd(&other, &data).is_err(),
+            "missing marker must refuse"
+        );
+        assert!(DaemonServer::with_config(other.clone(), data.clone(), Config::default()).is_err());
+        assert!(
+            !data.join(WORKSPACE_CWD_FILE).exists(),
+            "refusal must not write a marker"
+        );
+        write_workspace_cwd_marker(&data, &owner);
+        let marker = fs::read(data.join(WORKSPACE_CWD_FILE)).expect("original marker");
+        assert!(
+            check_persisted_cwd(&owner, &data).is_ok(),
+            "matching marker can recover"
+        );
+        assert!(
+            check_persisted_cwd(&other, &data).is_err(),
+            "foreign marker must refuse"
+        );
+        assert!(DaemonServer::with_config(other.clone(), data.clone(), Config::default()).is_err());
+        assert_eq!(
+            fs::read(data.join(WORKSPACE_CWD_FILE)).expect("marker"),
+            marker
+        );
+        assert_eq!(
+            fs::read(data.join(WORKSPACE_FILE)).expect("workspace"),
+            corrupt
+        );
     }
 }

@@ -214,40 +214,84 @@ pub(crate) fn no_daemon_error(cwd: &Path) -> String {
 /// connecting `cwd`. A mismatch indicates either a workspace_key hash collision
 /// (two different cwds hashing to the same key) or data-dir tampering — in either
 /// case the client must refuse rather than silently serve another workspace's
-/// panes, scrollback, and token. A fresh workspace (no workspace.json) or a
-/// corrupt one (unparseable) passes this check; those conditions are handled
-/// elsewhere (fresh → seeded, corrupt → logged + reseeded).
+/// panes, scrollback, and token. A fresh workspace (no workspace.json) passes.
+/// An unparseable file without a `workspace.cwd` marker is a refusal: the
+/// previous fail-open let a colliding cwd inherit the other workspace's
+/// token and scrollback (S6 follow-up).
 pub(crate) fn check_persisted_cwd(cwd: &Path, data_dir: &Path) -> Result<(), String> {
     let persist_path = data_dir.join(WORKSPACE_FILE);
-    let data = match fs::read_to_string(&persist_path) {
+    let data = match fs::read(&persist_path) {
         Ok(data) => data,
         Err(_) => return Ok(()), // no persisted file — fresh workspace
     };
-    let persisted_cwd = match serde_json::from_str::<PersistedWorkspace>(&data) {
+    let persisted_cwd = match serde_json::from_slice::<PersistedWorkspace>(&data) {
         Ok(p) => p.cwd,
-        // Corrupt: load_workspace starts fresh, but the guard must not go
-        // with it. The cwd marker written at daemon start still says whose
-        // data dir this is.
-        Err(_) => match fs::read_to_string(data_dir.join(WORKSPACE_CWD_FILE)) {
-            Ok(marker) => marker.trim().to_string(),
-            Err(_) => return Ok(()),
+        Err(_) => match read_workspace_cwd_marker(data_dir) {
+            Some(marker) => marker,
+            None => {
+                return Err(
+                    "workspace.json is unparseable and there is no workspace.cwd marker; \
+                     refusing to serve this data dir. \
+                     If this is intentional, remove the workspace data for this key."
+                        .to_string(),
+                );
+            }
         },
     };
+    refuse_if_cwd_mismatch(&persisted_cwd, cwd)
+}
+
+/// Daemon-side twin of `check_persisted_cwd`. Uses the parsed persist file
+/// when it is valid, otherwise the on-disk marker. Must run *before* the
+/// marker is rewritten for the connecting cwd, or a corrupt file plus a
+/// colliding start would stamp the new cwd and skip the guard.
+pub(crate) fn refuse_workspace_cwd_mismatch(
+    cwd: &Path,
+    data_dir: &Path,
+    loaded: &LoadedWorkspace,
+) -> Result<(), String> {
+    let persisted = loaded
+        .persisted_cwd
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| read_workspace_cwd_marker(data_dir));
+    if let Some(persisted_cwd) = persisted {
+        return refuse_if_cwd_mismatch(&persisted_cwd, cwd);
+    }
+    if loaded.was_corrupt {
+        return Err(
+            "workspace.json is unparseable and there is no workspace.cwd marker; \
+             refusing to serve this data dir. \
+             If this is intentional, remove the workspace data for this key."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn refuse_if_cwd_mismatch(persisted_cwd: &str, cwd: &Path) -> Result<(), String> {
     let connecting = canonical_workspace_path(cwd);
-    if !persisted_cwd.is_empty() && !workspace_cwds_match(Path::new(&persisted_cwd), cwd) {
+    if !persisted_cwd.is_empty() && !workspace_cwds_match(Path::new(persisted_cwd), cwd) {
         return Err(format!(
-            "workspace_key collision detected: the persisted workspace cwd '{}' does not match \
+            "workspace_key collision detected: the persisted workspace cwd '{persisted_cwd}' does not match \
              the connecting cwd '{}'; refusing to serve mismatched workspace data. \
              If this is intentional, remove the workspace data for this key.",
-            persisted_cwd,
             connecting.display()
         ));
     }
     Ok(())
 }
 
+pub(crate) fn read_workspace_cwd_marker(data_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(data_dir.join(WORKSPACE_CWD_FILE)).ok()?;
+    let trimmed = text.trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 /// Best-effort: the marker is a hint for `check_persisted_cwd`, never the
-/// source of truth while `workspace.json` parses.
+/// source of truth while `workspace.json` parses. Write it only after the
+/// collision guard has accepted this cwd.
 pub(crate) fn write_workspace_cwd_marker(data_dir: &Path, cwd: &Path) {
     let path = data_dir.join(WORKSPACE_CWD_FILE);
     if let Ok(mut file) = OpenOptions::new()
@@ -838,7 +882,7 @@ pub(crate) struct LoadedWorkspace {
 }
 
 pub(crate) fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspace {
-    let data = match fs::read_to_string(persist_path) {
+    let data = match fs::read(persist_path) {
         Ok(data) => data,
         Err(_) => {
             // No persisted file — fresh workspace.
@@ -860,7 +904,7 @@ pub(crate) fn load_workspace(persist_path: &Path, cwd: String) -> LoadedWorkspac
         }
     };
 
-    match serde_json::from_str::<PersistedWorkspace>(&data) {
+    match serde_json::from_slice::<PersistedWorkspace>(&data) {
         Ok(persisted) => {
             let layout = persisted.layout.clone();
             let sizes = persisted

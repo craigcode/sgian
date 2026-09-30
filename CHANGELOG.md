@@ -8,6 +8,16 @@ follow SemVer once the first public tag exists.
 The first public release. Everything below is new relative to the private
 prototype that preceded it; the version is chosen at release time.
 
+### Fixes
+
+- Windows agent panes join a kill-on-close job before their code runs; closing,
+  restarting or discarding a pending pane terminates its child process tree.
+  A failed job assignment refuses the launch.
+- Workspace startup checks the previous cwd marker before replacing it and
+  refuses corrupt workspace state with no usable marker.
+- Revoking a client credential also closes subscriptions still being registered;
+  regression checks require connection closure rather than accepting a timeout.
+
 ### Clients
 
 - Native macOS (SwiftUI/SwiftTerm) and Windows (WinUI 3) clients beside the
