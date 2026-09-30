@@ -4736,30 +4736,33 @@ impl DaemonServer {
         Ok(())
     }
 
-    /// Remember which credential opened a subscription so revocation can end it.
-    fn note_credential_subscription(&self, credential: Option<&str>, sub_id: u64) {
-        let Some(id) = credential else { return };
-        // Hold clients through registration: revoke either sees this subscriber
-        // in its table, or has already marked the credential inactive. This also
-        // covers revocation between authorize_subscribe and the subscribe ack.
-        let registered = self.clients.lock().ok().is_some_and(|clients| {
-            let active = clients
-                .clients
-                .iter()
-                .any(|record| record.id == id && record.revoked_at_ms.is_none());
-            active
-                && self
-                    .credential_subscribers
-                    .lock()
-                    .ok()
-                    .is_some_and(|mut table| {
-                        table.entry(id.to_string()).or_default().push(sub_id);
-                        true
-                    })
-        });
-        if !registered {
-            self.router.remove_subscriber(sub_id);
+    /// Recheck revocation and register atomically, before the router can deliver
+    /// any output. Revoke takes clients before removing registered subscribers.
+    fn register_subscription(
+        &self,
+        stream: TransportStream,
+        wire_version: u16,
+        credential: Option<&str>,
+    ) -> Result<u64, (String, TransportStream)> {
+        let Some(id) = credential else {
+            return self.router.add_subscriber(stream, wire_version);
+        };
+        let Ok(clients) = self.clients.lock() else {
+            return Err(("client table lock poisoned".into(), stream));
+        };
+        if !clients
+            .clients
+            .iter()
+            .any(|record| record.id == id && record.revoked_at_ms.is_none())
+        {
+            return Err(("client credential revoked".into(), stream));
         }
+        let Ok(mut table) = self.credential_subscribers.lock() else {
+            return Err(("credential subscriber table lock poisoned".into(), stream));
+        };
+        let sub_id = self.router.add_subscriber(stream, wire_version)?;
+        table.entry(id.to_string()).or_default().push(sub_id);
+        Ok(sub_id)
     }
 
     fn credential_is_active(&self, id: &str) -> bool {

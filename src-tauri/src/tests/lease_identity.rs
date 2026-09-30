@@ -1310,15 +1310,15 @@ fn revoked_credential_cannot_register_a_subscription_after_authorization() {
         .handle_identity_revoke(id)
         .expect("revoke in registration window");
     let (mut client, stream) = test_transport_pair().expect("pair");
-    let sub_id = server
-        .router
-        .add_subscriber(stream, frame::WIRE_VERSION)
-        .map_err(|(error, _)| error)
-        .expect("subscriber");
-    server.note_credential_subscription(Some(id), sub_id);
     client
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("timeout");
+    let (error, stream) = server
+        .register_subscription(stream, frame::WIRE_VERSION, Some(id))
+        .expect_err("revoked credential must not become a router subscriber");
+    assert_eq!(error, "client credential revoked");
+    assert_eq!(server.router.subscriber_count(), 0);
+    drop(stream);
     let mut byte = [0];
     assert_eq!(client.read(&mut byte).expect("EOF, not timeout"), 0);
     assert_eq!(server.router.subscriber_count(), 0);
