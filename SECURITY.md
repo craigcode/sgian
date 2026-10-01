@@ -55,7 +55,7 @@ Use GitHub's **Security → Report a vulnerability** on
 when private vulnerability reporting is enabled. If that option is unavailable,
 open a minimal issue asking the maintainer for a private reporting channel;
 keep exploit details, tokens, prompts, and private files out of the issue.
-The maintainer must enable private vulnerability reporting before public launch.
+Private vulnerability reporting is enabled.
 
 Only the latest released version is intended to receive security fixes. No
 response-time guarantee is currently offered.
