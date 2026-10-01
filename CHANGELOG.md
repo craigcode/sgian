@@ -124,11 +124,15 @@ prototype that preceded it; the version is chosen at release time.
 - Closing a pane, or the daemon exiting, terminates the pane's whole
   process tree, found without forking (libproc on macOS, /proc on Linux)
   and held in a kill-on-close Job Object on Windows (#15).
+  Windows agent panes hold the same Job Object, so the `node` process
+  behind npm's `claude.cmd` shim ends with the session.
 - Pane spawns drop Claude Code's child-session markers inherited from the
   daemon's environment; a config reload updates the scrub list profiled
   panes restart with (#15).
 - The workspace-key collision guard survives a corrupt `workspace.json`
-  via a `workspace.cwd` marker; the daemon socket is created under an
+  via a `workspace.cwd` marker, checked before the marker is rewritten so a
+  colliding start cannot stamp its own path, and a corrupt file with no
+  marker is refused rather than served; the daemon socket is created under an
   owner-only umask; the pane input queue is capped at 8 MiB of unwritten
   bytes; IPC line writes are a single syscall and transient `openpty`
   failures are retried briefly (#15).

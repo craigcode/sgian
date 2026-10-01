@@ -52,13 +52,12 @@ use super::*;
 // state, PaneEnded, and close/restart races behave identically. Process
 // management is per-platform: unix sends SIGTERM with a SIGKILL escalation
 // after a grace period (via libc); Windows has no signals, so kills are a
-// direct `Child::kill()` (TerminateProcess — immediate, no grace). Remaining
-// Windows deltas: TerminateProcess kills only the DIRECT child (claude is a
-// node app; Job-Object tree-kill is out of scope, so grandchildren may
-// outlive the session), and npm's `claude.cmd` shim must be spawned via
-// `cmd.exe /c` (CreateProcess cannot run batch scripts — see
-// resolve_agent_bin). On platforms that are neither unix nor Windows,
-// CreateAgentPane fails with a clean error.
+// direct `Child::kill()` (TerminateProcess — immediate, no grace) plus a
+// kill-on-close Job Object so `cmd.exe` shim grandchildren die with the
+// session. npm's `claude.cmd` shim must be spawned via `cmd.exe /c`
+// (CreateProcess cannot run batch scripts — see resolve_agent_bin).
+// On platforms that are neither unix nor Windows, CreateAgentPane
+// fails with a clean error.
 // ---------------------------------------------------------------------------
 
 /// Permission modes accepted by `claude --permission-mode` (2.1.201). Only
@@ -390,13 +389,12 @@ impl AgentChildKiller {
 /// so the kill is a direct `Child::kill()` (TerminateProcess — immediate).
 /// Going through the shared `Child` handle keeps kills handle-based: no
 /// pid-reuse hazard, so no `reaped`-style guard is needed (double-kills are
-/// harmless no-ops on an exited process). (T2) KNOWN DELTA: TerminateProcess
-/// kills only the DIRECT child — claude is a node app, and via the .cmd shim
-/// the direct child is cmd.exe, so grandchildren (node) may outlive the
-/// session and hold its pipes open. Job-Object tree-kill is out of scope.
+/// harmless no-ops on an exited process). The Job Object kills the tree
+/// when this session drops, including `cmd.exe` shim grandchildren.
 #[cfg(windows)]
 pub(crate) struct AgentChildKiller {
     pub(crate) child: Arc<Mutex<std::process::Child>>,
+    pub(crate) _job: Option<KillOnCloseJob>,
 }
 
 #[cfg(windows)]
@@ -412,7 +410,7 @@ impl AgentChildKiller {
 /// pattern as PTY input — no blocking pipe write under the store lock), the
 /// child killer, and the shared state. Dropping it (close/restart/shutdown)
 /// denies pending approvals and kills the CLI (SIGTERM→SIGKILL on unix,
-/// TerminateProcess on Windows).
+/// TerminateProcess plus Job Object on Windows).
 #[cfg(any(unix, windows))]
 pub(crate) struct AgentSession {
     pub(crate) backend: AgentBackendKind,
@@ -1629,9 +1627,10 @@ impl TerminalStore {
             );
         }
 
-        #[cfg(unix)]
         let pid = child.id();
         let reaped = Arc::new(AtomicBool::new(false));
+        #[cfg(windows)]
+        let job = KillOnCloseJob::attach(pid);
         // The child is shared between the reader (which reaps it) and — on
         // Windows — the killer (TerminateProcess needs the process handle;
         // the unix killer signals by pid and never touches this mutex).
@@ -1703,7 +1702,7 @@ impl TerminalStore {
         #[cfg(unix)]
         let killer = AgentChildKiller { pid, reaped };
         #[cfg(windows)]
-        let killer = AgentChildKiller { child };
+        let killer = AgentChildKiller { child, _job: job };
         self.agent_sessions.insert(
             pane_id.to_string(),
             AgentSession {

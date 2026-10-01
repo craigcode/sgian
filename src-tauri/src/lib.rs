@@ -1794,14 +1794,15 @@ impl PaneRegistry {
 
 mod process_tree;
 use process_tree::*;
-/// A kill-on-close Job Object holding the pane's child so closing the pane
-/// (or the daemon exiting) terminates the whole tree, ConPTY included.
+/// A kill-on-close Job Object holding a child tree so closing the pane
+/// (or the daemon exiting) terminates grandchildren too — ConPTY shells and
+/// agent CLIs launched through `cmd.exe` shims.
 #[cfg(windows)]
-struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
 impl KillOnCloseJob {
-    fn attach(pid: u32) -> Option<Self> {
+    pub(crate) fn attach(pid: u32) -> Option<Self> {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -2240,24 +2241,12 @@ impl DaemonServer {
         let clients = load_clients_file(&clients_path);
 
         let persist_path = data_dir.join(WORKSPACE_FILE);
-        write_workspace_cwd_marker(&data_dir, &cwd);
         let loaded = load_workspace(&persist_path, cwd.display().to_string());
-
-        // Defense-in-depth: verify the persisted cwd matches the connecting cwd.
-        // The client (DaemonClient) also checks before connecting, but a daemon
-        // spawned directly (e.g. via --daemon args) must still refuse a mismatched
-        // workspace rather than silently serving another workspace's data.
-        if let Some(ref persisted_cwd) = loaded.persisted_cwd {
-            let connecting = cwd.display().to_string();
-            if !persisted_cwd.is_empty() && !workspace_cwds_match(Path::new(persisted_cwd), &cwd) {
-                return Err(format!(
-                    "workspace_key collision detected: the persisted workspace cwd '{}' does not \
-                     match the connecting cwd '{}'; refusing to serve mismatched workspace data. \
-                     If this is intentional, remove the workspace data for this key.",
-                    persisted_cwd, connecting
-                ));
-            }
-        }
+        // Collision check uses the existing marker / persist file. Writing the
+        // marker first would stamp a colliding cwd onto a corrupt data dir and
+        // skip the guard (S6 follow-up).
+        refuse_workspace_cwd_mismatch(&cwd, &data_dir, &loaded)?;
+        write_workspace_cwd_marker(&data_dir, &cwd);
 
         let (
             registry,

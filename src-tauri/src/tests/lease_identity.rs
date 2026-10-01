@@ -1243,6 +1243,121 @@ fn client_credentials_gate_writes_and_attribute_leases_over_ipc() {
 
 #[cfg(unix)]
 #[test]
+fn revoked_credential_cannot_subscribe_and_live_stream_ends() {
+    let daemon = TestDaemon::spawn(Config::default());
+    let client = daemon.client();
+    let viewer: Value = client
+        .request(DaemonRequest::IdentityIssue {
+            holder: "phone".into(),
+            scopes: vec!["read".into()],
+        })
+        .expect("issue");
+    let token = viewer["token"].as_str().expect("token").to_string();
+    let id = viewer["id"].as_str().expect("id").to_string();
+
+    let mut live = connect_with_client_token(&daemon, &token).expect("hello");
+    live.write_request(&DaemonRequest::Subscribe)
+        .expect("subscribe");
+    live.await_subscribe_ack().expect("ack");
+
+    let mut pending = connect_with_client_token(&daemon, &token).expect("hello 2");
+    client
+        .request::<Value>(DaemonRequest::IdentityRevoke { id })
+        .expect("revoke");
+
+    let refused = pending
+        .request(&DaemonRequest::Subscribe)
+        .expect("refusal is a response");
+    assert_eq!(
+        refused.error.as_deref(),
+        Some("client credential revoked"),
+        "{refused:?}"
+    );
+
+    live.set_read_timeout(Some(Duration::from_secs(2)));
+    let ended = live.read_event();
+    assert!(
+        matches!(ended, Ok(None) | Err(_)),
+        "live subscribe must end after revoke, got {ended:?}"
+    );
+    daemon.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_control_honours_the_keyboard_lease_for_credentials() {
+    let daemon = TestDaemon::spawn(Config::default());
+    let client = daemon.client();
+    let snap: WorkspaceSnapshot = client
+        .request(DaemonRequest::BootstrapWorkspace)
+        .expect("bootstrap");
+    let pane_id = snap.panes[0].id.clone();
+    let alice: Value = client
+        .request(DaemonRequest::IdentityIssue {
+            holder: "alice".into(),
+            scopes: vec!["write".into()],
+        })
+        .expect("alice");
+    let bob: Value = client
+        .request(DaemonRequest::IdentityIssue {
+            holder: "bob".into(),
+            scopes: vec!["write".into()],
+        })
+        .expect("bob");
+    let mut alice_conn =
+        connect_with_client_token(&daemon, alice["token"].as_str().unwrap()).expect("alice hello");
+    let mut bob_conn =
+        connect_with_client_token(&daemon, bob["token"].as_str().unwrap()).expect("bob hello");
+    let taken = alice_conn
+        .request(&DaemonRequest::TakeLease {
+            pane_id: pane_id.clone(),
+            holder: "alice".into(),
+            force: false,
+            why: None,
+        })
+        .expect("take");
+    assert!(taken.ok, "{taken:?}");
+
+    for (name, request) in [
+        (
+            "send_agent_message",
+            DaemonRequest::SendAgentMessage {
+                pane_id: pane_id.clone(),
+                text: "hi".into(),
+                message_id: None,
+            },
+        ),
+        (
+            "agent_approval",
+            DaemonRequest::AgentApproval {
+                pane_id: pane_id.clone(),
+                request_id: "r1".into(),
+                allow: false,
+                message: None,
+            },
+        ),
+        (
+            "interrupt_agent",
+            DaemonRequest::InterruptAgent {
+                pane_id: pane_id.clone(),
+            },
+        ),
+    ] {
+        let refused = bob_conn.request(&request).expect("response");
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("held by alice"),
+            "{name} => {refused:?}"
+        );
+    }
+    daemon.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
 fn identity_required_makes_the_root_token_read_and_admin_only() {
     let daemon = TestDaemon::spawn(Config {
         identity: Some("required".into()),
@@ -3625,17 +3740,33 @@ fn serve_answers_invokes_streams_events_and_stays_read_only_by_default() {
 
 #[test]
 fn review_p2_pure_guards() {
-    // S6: with workspace.json unparseable, the cwd marker still guards.
+    // S6: unparseable workspace.json without a marker is a refusal.
     let dir = tempfile::tempdir().expect("tempdir");
     fs::write(dir.path().join(WORKSPACE_FILE), b"{not json").expect("corrupt file");
-    assert!(
-        check_persisted_cwd(Path::new("/tmp/a"), dir.path()).is_ok(),
-        "no marker: nothing to check"
-    );
+    let refused = check_persisted_cwd(Path::new("/tmp/a"), dir.path()).expect_err("no marker");
+    assert!(refused.contains("unparseable"), "{refused}");
     write_workspace_cwd_marker(dir.path(), Path::new("/tmp/a"));
     assert!(check_persisted_cwd(Path::new("/tmp/a"), dir.path()).is_ok());
     let refused = check_persisted_cwd(Path::new("/tmp/b"), dir.path()).expect_err("collision");
     assert!(refused.contains("collision"), "{refused}");
+    let loaded = LoadedWorkspace {
+        registry: PaneRegistry::new("/tmp/b".into()),
+        sizes: HashMap::new(),
+        layout: None,
+        restored_from_disk: false,
+        pane_states: HashMap::new(),
+        agents: HashMap::new(),
+        agents_v2: HashMap::new(),
+        agent_specs: HashMap::new(),
+        pane_shells: HashMap::new(),
+        leases: HashMap::new(),
+        projects: HashMap::new(),
+        was_corrupt: true,
+        persisted_cwd: None,
+    };
+    let daemon_refused = refuse_workspace_cwd_mismatch(Path::new("/tmp/b"), dir.path(), &loaded)
+        .expect_err("daemon guard uses the existing marker");
+    assert!(daemon_refused.contains("collision"), "{daemon_refused}");
 
     // S11: the input queue is capped by bytes, not only entries.
     let (sender, _receiver) = sync_channel::<Vec<u8>>(PANE_INPUT_QUEUE_LIMIT);

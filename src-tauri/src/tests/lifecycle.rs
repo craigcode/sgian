@@ -2465,16 +2465,15 @@ fn check_persisted_cwd_accepts_equivalent_spellings() {
     );
 }
 
-/// check_persisted_cwd passes for a corrupt workspace.json (unparseable).
+/// check_persisted_cwd refuses a corrupt workspace.json with no cwd marker.
 #[test]
-fn check_persisted_cwd_corrupt_file_ok() {
+fn check_persisted_cwd_corrupt_file_without_marker_refused() {
     let dir = tempfile::tempdir().expect("temp dir");
     fs::write(dir.path().join(WORKSPACE_FILE), "not valid json").expect("write corrupt file");
 
-    assert!(
-        check_persisted_cwd(&PathBuf::from("/tmp/any-cwd"), dir.path()).is_ok(),
-        "corrupt workspace.json should pass cwd check (handled elsewhere)"
-    );
+    let refused = check_persisted_cwd(&PathBuf::from("/tmp/any-cwd"), dir.path())
+        .expect_err("corrupt persist without a marker");
+    assert!(refused.contains("unparseable"), "{refused}");
 }
 
 // ─── VAL-XPLAT-001 / VAL-CROSS-017: data-dir abstraction via dirs crate ───
