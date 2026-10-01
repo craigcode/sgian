@@ -1,0 +1,459 @@
+name: CI
+
+# Supply-chain note: all first- and third-party actions are pinned to full
+# commit SHAs (release tag noted in a trailing comment) so a moved or
+# compromised tag cannot inject code into CI — this matters most for the
+# signing jobs and the final publication job.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_call:
+
+# Serialize repeated runs of a ref; never cancel in-progress signing.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: fmt + clippy + test + vitest
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Scan Git history for secrets
+        run: |
+          brew install gitleaks
+          scripts/audit-public-history.sh
+      # dtolnay/rust-toolchain publishes only moving refs (stable/beta/nightly),
+      # so the `stable` branch head is pinned by commit SHA like every other
+      # action. Verify against: git ls-remote https://github.com/dtolnay/rust-toolchain refs/heads/stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.94.0
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Format
+        working-directory: src-tauri
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        working-directory: src-tauri
+        run: cargo test --locked
+      - name: Frontend tests (vitest)
+        run: |
+          npm ci --ignore-scripts
+          npm audit --audit-level=moderate
+          npm test
+          npm run release:check
+          python3 scripts/test-native-release.py
+          node --test scripts/test-native-terminal.mjs
+      - name: Rust dependency audit
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --file src-tauri/Cargo.lock
+      - name: Native macOS client (SwiftUI + daemon IPC)
+        env:
+          SGIAN_NATIVE_INTEGRATION: "1"
+          SGIAN_BACKEND_BINARY: ${{ github.workspace }}/src-tauri/target/debug/sgian
+        run: |
+          cargo build --locked --manifest-path src-tauri/Cargo.toml
+          swift test --package-path apps/macos
+      # Cross-compilation supplements the native Windows runtime job. The ring
+      # crate's build script needs the mingw-w64 cross C toolchain, which the
+      # runner image doesn't ship.
+      - name: Windows cross-compile check
+        working-directory: src-tauri
+        run: |
+          brew install mingw-w64
+          rustup target add x86_64-pc-windows-gnu
+          cargo check --locked --target x86_64-pc-windows-gnu
+
+  build:
+    name: build app bundle
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.94.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts
+      # Validation builds never receive signing secrets or produce trusted updates.
+      - name: Build .app (validation)
+        run: npm run tauri build -- --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
+      - name: Packaged UI smoke
+        env:
+          SGIAN_UI_SMOKE_TIMEOUT_SECS: "120"
+        run: |
+          set -euo pipefail
+          apps=(src-tauri/target/release/bundle/macos/*.app)
+          app="${apps[0]}"
+          ws="$RUNNER_TEMP/sgian-macos-ui-smoke"
+          marker="$RUNNER_TEMP/sgian-macos-ui-smoke-ok"
+          bash scripts/ui-smoke.sh "$app" "$ws" "$marker"
+      - name: Build and verify native macOS app
+        run: scripts/build-macos-native.sh
+      - name: Packaged native macOS UI smoke
+        env:
+          SGIAN_UI_SMOKE_TIMEOUT_SECS: "120"
+        run: |
+          set -euo pipefail
+          app="$GITHUB_WORKSPACE/apps/macos/build/Sgian.app"
+          ws="$RUNNER_TEMP/sgian-native-macos-ui-smoke"
+          marker="$RUNNER_TEMP/sgian-native-macos-ui-smoke-ok"
+          trap '"$app/Contents/Helpers/sgian" ctl --workspace "$ws" shutdown || true' EXIT
+          bash scripts/ui-smoke.sh "$app" "$ws" "$marker"
+      - name: Archive native macOS app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            apps/macos/build/Sgian.app \
+            apps/macos/build/Sgian-native-macos.zip
+      - name: Upload native macOS artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sgian-macos-native-${{ runner.arch }}
+          path: apps/macos/build/Sgian-native-macos.zip
+          if-no-files-found: error
+
+  # Linux tier-1 validation. Use Ubuntu 22.04 deliberately: it is the oldest
+  # Ubuntu baseline with Tauri 2's WebKitGTK 4.1 packages, so the generated
+  # AppImage does not accidentally acquire a newer glibc floor. In addition to
+  # compiling the GUI, run the Unix transport and agent process end-to-end.
+  build-linux:
+    name: build linux bundles + smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.94.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libayatana-appindicator3-dev \
+            libfuse2 \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            xvfb
+      - run: npm ci --ignore-scripts
+      - name: Linux Rust tests
+        working-directory: src-tauri
+        run: cargo test --locked
+      - name: Optimized GLib security regression
+        working-directory: src-tauri
+        run: cargo test --locked --release --test glib_variant_iter
+      - name: Build Debian and AppImage bundles
+        run: npm run tauri build -- --bundles deb,appimage --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
+      - name: Smoke test daemon + ctl + agent
+        env:
+          XDG_DATA_HOME: ${{ runner.temp }}/sgian-data
+        run: |
+          set -euo pipefail
+          exe="$GITHUB_WORKSPACE/src-tauri/target/release/sgian"
+          ws="$RUNNER_TEMP/sgian-linux-smoke"
+          driver="$RUNNER_TEMP/fake-claude"
+          mkdir -p "$ws" "$XDG_DATA_HOME"
+          cat > "$driver" <<'SH'
+          #!/bin/sh
+          IFS= read -r message || true
+          printf '%s\n' '{"type":"system","subtype":"init","session_id":"fake-session-1","model":"fake","cwd":"/tmp","tools":[]}'
+          printf '%s\n' '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}}}'
+          printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"smoke-ok"}}}'
+          printf '%s\n' '{"type":"stream_event","event":{"type":"message_stop"}}'
+          printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"smoke-ok"}]}}'
+          printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"smoke-ok","duration_ms":1,"num_turns":1,"total_cost_usd":0.0,"usage":{}}'
+          SH
+          chmod 700 "$driver"
+          export SGIAN_CLAUDE_BIN="$driver"
+
+          dump_diagnostics() {
+            echo "=== Linux smoke diagnostics ==="
+            find "$XDG_DATA_HOME/Sgian" -maxdepth 6 -type f -print 2>/dev/null || true
+            find "$XDG_DATA_HOME/Sgian" -name daemon.log -type f -exec tail -n 80 {} \; 2>/dev/null || true
+            pgrep -af sgian || true
+          }
+          trap dump_diagnostics ERR
+
+          "$exe" ctl --workspace "$ws" new --name smoke
+          pids=()
+          for _ in $(seq 1 32); do
+            "$exe" ctl --workspace "$ws" panes --json >/dev/null &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do
+            wait "$pid"
+          done
+          echo "UNIX SOCKET CONCURRENCY SMOKE OK"
+          "$exe" ctl --workspace "$ws" send smoke 'echo sgian-linux-smoke-ok\n'
+          "$exe" ctl --workspace "$ws" new --agent smokebot
+          "$exe" ctl --workspace "$ws" send smokebot hi
+
+          log=''
+          for _ in $(seq 1 20); do
+            log="$(find "$XDG_DATA_HOME/Sgian/workspaces" -path '*/agents/*.jsonl' -type f -print -quit 2>/dev/null || true)"
+            if [ -n "$log" ] && grep -q '"turn_complete"' "$log"; then
+              break
+            fi
+            sleep 1
+          done
+          test -n "$log"
+          grep -q '"text_delta"' "$log"
+          grep -q '"turn_complete"' "$log"
+          echo "AGENT SMOKE OK ($log)"
+          soak_ws="$RUNNER_TEMP/sgian-linux-soak"
+          mkdir -p "$soak_ws"
+          bash "$GITHUB_WORKSPACE/scripts/transport-soak.sh" "$exe" "$soak_ws"
+          "$exe" ctl --workspace "$soak_ws" shutdown || true
+          "$exe" ctl --workspace "$ws" shutdown
+          trap - ERR
+          echo "LINUX SMOKE OK"
+      - name: Packaged UI smoke
+        env:
+          XDG_DATA_HOME: ${{ runner.temp }}/sgian-data
+          SGIAN_UI_SMOKE_TIMEOUT_SECS: "120"
+        run: |
+          set -euo pipefail
+          exe="$GITHUB_WORKSPACE/src-tauri/target/release/sgian"
+          ws="$RUNNER_TEMP/sgian-linux-ui-smoke"
+          marker="$RUNNER_TEMP/sgian-linux-ui-smoke-ok"
+          xvfb-run -a bash scripts/ui-smoke.sh "$exe" "$ws" "$marker"
+      - name: Upload Linux artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sgian-linux
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: warn
+
+  # Windows tier-1 validation: build a real NSIS installer on a Windows runner
+  # and run a headless daemon/ctl smoke test against it — the named-pipe
+  # transport's first runtime exercise (the macOS job only cross-compiles).
+  # Unsigned for now (no Authenticode cert); SmartScreen will warn. The
+  # installer is uploaded as a workflow artifact for manual testing.
+  build-windows:
+    name: build windows installer + smoke
+    runs-on: windows-latest
+    # Bounded: a hung smoke must fail fast (with diagnostics), never the 6h
+    # default job timeout. 30m covers cold-cache release builds (a full run is
+    # ~15m warm); hung processes still die here with the daemon-log dump.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.94.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts
+      - name: Windows transport unit tests
+        working-directory: src-tauri
+        run: cargo test --locked --lib windows_pipe_tests
+      - name: Windows agent process-tree tests
+        working-directory: src-tauri
+        run: cargo test --locked --lib windows_job_tests
+      - name: Build NSIS installer (validation)
+        shell: bash
+        run: npm run tauri build -- --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
+      - name: Build native WinUI client + unsigned MSIX
+        shell: pwsh
+        run: scripts/build-windows-native.ps1 -Configuration Release -RuntimeIdentifier win-x64 -SkipRust
+      # Headless runtime smoke FROM THE INSTALLED NSIS PAYLOAD: silently install
+      # into an isolated runner directory, then use that executable to spawn the
+      # daemon (via its own current_exe), create/list/send, and shut down. Using
+      # target/release directly missed installed-path/packaging regressions.
+      # Exercises installer layout, self-spawn, named-pipe transport, token auth,
+      # and daemon lifecycle for real.
+      # On any failure, dump the daemon log + data dir + leftover processes —
+      # the smoke is also the Windows transport's diagnostic harness.
+      # NOTE: release builds are GUI-subsystem (windows_subsystem = "windows"),
+      # which pwsh does NOT wait for and never sets $LASTEXITCODE for — invoke
+      # via Start-Process -Wait -PassThru to get real exit codes. Console
+      # output still attaches to this console and lands in the log.
+      - name: Smoke test daemon + ctl
+        shell: pwsh
+        run: |
+          $installer = (Resolve-Path "src-tauri/target/release/bundle/nsis/*-setup.exe").Path
+          $installDir = Join-Path $env:RUNNER_TEMP "sgian-installed"
+          $install = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS silent install failed with exit $($install.ExitCode)" }
+          $installedExe = Get-ChildItem $installDir -Recurse -Filter sgian.exe -File | Select-Object -First 1
+          if (-not $installedExe) {
+            Get-ChildItem $installDir -Recurse -Force | Select-Object FullName, Length | Format-Table -AutoSize | Out-String | Write-Host
+            throw "installed NSIS payload contains no sgian.exe under $installDir"
+          }
+          $exe = $installedExe.FullName
+          Write-Host "SMOKE INSTALLED EXE: $exe"
+          $ws = Join-Path $env:RUNNER_TEMP "sgian-smoke"
+          New-Item -ItemType Directory -Force $ws | Out-Null
+          # Fake Claude driver (minimal probe-verified stream-json protocol):
+          # read one user line, emit init + streamed text + result, exit.
+          # Exercises the Windows agent-pane port end-to-end (.cmd via cmd /c).
+          $driver = Join-Path $env:RUNNER_TEMP "fake-claude.cmd"
+          # (Array-of-strings, not a here-string: pwsh requires the closing
+          # delimiter at column 0, which YAML block scalars forbid.)
+          $driverLines = @(
+            '@echo off',
+            'set /p msg=',
+            'echo {"type":"system","subtype":"init","session_id":"fake-session-1","model":"fake","cwd":"C:\\fake","tools":[]}',
+            'echo {"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}}}',
+            'echo {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"smoke-ok"}}}',
+            'echo {"type":"stream_event","event":{"type":"message_stop"}}',
+            'echo {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"smoke-ok"}]}}',
+            'echo {"type":"result","subtype":"success","is_error":false,"result":"smoke-ok","duration_ms":1,"num_turns":1,"total_cost_usd":0.0,"usage":{}}'
+          )
+          $driverLines | Set-Content -Path $driver -Encoding ascii
+          # The daemon is spawned by the first ctl command and inherits this env.
+          $env:SGIAN_CLAUDE_BIN = $driver
+          function Invoke-Sgian([string[]]$cmdArgs, [int]$timeoutMs = 60000) {
+            # Bounded wait: on timeout, kill the client and throw so the catch
+            # block dumps the daemon log at the exact hang point.
+            $p = Start-Process -FilePath $exe -ArgumentList $cmdArgs -PassThru -NoNewWindow
+            if (-not $p.WaitForExit($timeoutMs)) {
+              try { $p.Kill() } catch {}
+              throw "timed out after $($timeoutMs/1000)s: sgian $($cmdArgs -join ' ')"
+            }
+            return $p.ExitCode
+          }
+          try {
+            if ((Invoke-Sgian @('ctl','--workspace',$ws,'new','--name','smoke')) -ne 0) { throw "ctl new failed" }
+            # Concurrent clients used to lose the listener hand-off race with
+            # ERROR_PIPE_BUSY (231), after which ensure_daemon mislabeled the
+            # healthy daemon as wedged. Exercise a burst large enough to make
+            # that race deterministic on the Windows runner.
+            $burst = foreach ($i in 1..32) {
+              Start-Process -FilePath $exe -ArgumentList @('ctl','--workspace',$ws,'panes','--json') -PassThru -NoNewWindow
+            }
+            foreach ($p in $burst) {
+              if (-not $p.WaitForExit(60000)) {
+                try { $p.Kill() } catch {}
+                throw "concurrent named-pipe client timed out (pid $($p.Id))"
+              }
+              if ($p.ExitCode -ne 0) {
+                throw "concurrent named-pipe client failed with exit $($p.ExitCode) (pid $($p.Id))"
+              }
+            }
+            Write-Host "PIPE CONCURRENCY SMOKE OK"
+            if ((Invoke-Sgian @('ctl','--workspace',$ws,'panes','--json')) -ne 0) { throw "ctl panes failed" }
+            if ((Invoke-Sgian @('ctl','--workspace',$ws,'send','smoke','echo sgian-smoke-ok\n')) -ne 0) { throw "ctl send failed" }
+            if ((Invoke-Sgian @('ctl','--workspace',$ws,'new','--agent','smokebot')) -ne 0) { throw "ctl new --agent failed" }
+            if ((Invoke-Sgian @('ctl','--workspace',$ws,'send','smokebot','hi')) -ne 0) { throw "ctl send-to-agent failed" }
+            $soakWs = Join-Path $env:RUNNER_TEMP "sgian-windows-soak"
+            New-Item -ItemType Directory -Force $soakWs | Out-Null
+            & "$env:GITHUB_WORKSPACE/scripts/transport-soak.ps1" -Exe $exe -Workspace $soakWs -Rounds 3 -Burst 32
+            if ((Invoke-Sgian @('ctl','--workspace',$soakWs,'shutdown')) -ne 0) {
+              Write-Host "soak shutdown returned non-zero (continuing)"
+            }
+            # Wait for the fake driver's turn to land in the conversation log.
+            $log = $null
+            foreach ($i in 1..10) {
+              $log = Get-ChildItem (Join-Path $env:APPDATA 'Sgian\workspaces\*\agents\*.jsonl') -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($log -and (Select-String -Path $log.FullName -Pattern '"turn_complete"' -Quiet)) { break }
+              Start-Sleep -Seconds 3
+            }
+            if (-not $log) { throw "no agent conversation log found" }
+            if (-not (Select-String -Path $log.FullName -Pattern '"text_delta"' -Quiet)) { throw "agent log missing streamed text_delta" }
+            if (-not (Select-String -Path $log.FullName -Pattern '"turn_complete"' -Quiet)) { throw "agent log missing turn_complete" }
+            Write-Host "AGENT SMOKE OK ($($log.FullName))"
+            if ((Invoke-Sgian @('ctl','--workspace',$ws,'shutdown')) -ne 0) { throw "ctl shutdown failed" }
+            Write-Host "SMOKE OK"
+          } catch {
+            Write-Host "=== SMOKE FAILURE: $_ ==="
+            $root = Join-Path $env:APPDATA "Sgian"
+            if (Test-Path $root) {
+              Write-Host "=== data dir tree ($root) ==="
+              Get-ChildItem -Recurse -Force $root | Select-Object FullName, Length | Format-Table -AutoSize | Out-String | Write-Host
+              Get-ChildItem -Recurse -Force -Filter daemon*.log $root | ForEach-Object {
+                Write-Host "=== $($_.FullName) (tail) ==="
+                Get-Content $_.FullName -Tail 60 | Write-Host
+              }
+            } else {
+              Write-Host "=== no data dir at $root ==="
+            }
+            Write-Host "=== sgian processes ==="
+            Get-Process sgian -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime | Format-Table -AutoSize | Out-String | Write-Host
+            throw
+          }
+      - name: Packaged UI smoke
+        shell: pwsh
+        run: |
+          $installer = (Resolve-Path "src-tauri/target/release/bundle/nsis/*-setup.exe").Path
+          $installDir = Join-Path $env:RUNNER_TEMP "sgian-ui-smoke-installed"
+          $install = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS silent install failed with exit $($install.ExitCode)" }
+          $installedExe = Get-ChildItem $installDir -Recurse -Filter sgian.exe -File | Select-Object -First 1
+          if (-not $installedExe) { throw "installed NSIS payload contains no sgian.exe" }
+          $ws = Join-Path $env:RUNNER_TEMP "sgian-windows-ui-smoke"
+          $marker = Join-Path $env:RUNNER_TEMP "sgian-windows-ui-smoke-ok"
+          & "$env:GITHUB_WORKSPACE/scripts/ui-smoke.ps1" -Exe $installedExe.FullName -Workspace $ws -Marker $marker -TimeoutSecs 120
+      - name: Native WinUI UI smoke
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "apps/windows/build/win-x64/Sgian.Windows.exe").Path
+          $backend = Join-Path (Split-Path $exe -Parent) "Helpers/sgian.exe"
+          $ipcWs = Join-Path $env:RUNNER_TEMP "sgian-native-windows-ipc-smoke"
+          dotnet run --project apps/windows/Sgian.Protocol.Tests/Sgian.Protocol.Tests.csproj -c Release -- --integration $backend $ipcWs
+          if ($LASTEXITCODE -ne 0) { throw "Native Windows live IPC smoke failed" }
+          & $backend ctl --workspace $ipcWs shutdown
+          $ws = Join-Path $env:RUNNER_TEMP "sgian-native-windows-ui-smoke"
+          $marker = Join-Path $env:RUNNER_TEMP "sgian-native-windows-ui-smoke-ok"
+          & "$env:GITHUB_WORKSPACE/scripts/smoke-windows-native.ps1" -Exe $exe -Workspace $ws -Marker $marker -TimeoutSecs 120
+      # Upload even when the smoke test fails: the installer is still useful
+      # for manual debugging on real hardware.
+      - name: Upload installer artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sgian-windows-nsis
+          path: src-tauri/target/release/bundle/nsis/*.exe
+      - name: Upload native Windows artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sgian-windows-native-${{ runner.arch }}
+          path: |
+            apps/windows/build/Sgian-native-windows-win-x64.zip
+            apps/windows/build/msix/**/*.msix
+            apps/windows/build/msix/**/*.msixupload
+          if-no-files-found: error

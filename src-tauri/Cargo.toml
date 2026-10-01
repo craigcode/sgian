@@ -1,0 +1,64 @@
+[package]
+name = "sgian"
+version = "0.1.0"
+description = "A fast native pane manager for agentic terminals"
+license = "MIT"
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "sgian_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Local 0.8.1 fork: its Windows CreatePseudoConsole flags are aligned with
+# node-pty/VS Code (0) to avoid portable-pty's undocumented 0x2|0x4 modes.
+# Keep the fork narrow; see vendor/portable-pty/SGIAN-PATCH.md.
+portable-pty = { path = "vendor/portable-pty" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Ledger chain hashes (docs/design/keyboard-lease-and-ledger.md). Already a
+# transitive dependency of tauri, so this adds no new crate to the lockfile.
+sha2 = "0.10"
+tauri = { version = "2", features = [] }
+libc = "0.2"
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"
+fs4 = { version = "1.1.0", features = ["sync"] }
+dirs = "7"
+notify = "8"
+regex = "1"
+vt100 = "0.16.2"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2.3.1"
+# The built web client embedded for `sgian serve` (docs/design/served-view.md);
+# build.rs makes sure the directory exists so a daemon-only build without a
+# frontend still compiles. The HTTP loop itself is std-only (serve_http.rs).
+include_dir = "0.7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+glib = "=0.18.5"
+
+[patch.crates-io]
+# GTK3 requires the 0.18 API. Backport upstream's VariantStrIter UB fix.
+# See vendor/glib/SGIAN-PATCH.md for provenance and the removal condition.
+glib = { path = "vendor/glib" }

@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>Sgian.Windows</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64;ARM64</Platforms>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <UseWinUI>true</UseWinUI>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <WindowsPackageType Condition="'$(WindowsPackageType)' == ''">MSIX</WindowsPackageType>
+    <WindowsAppSDKSelfContained Condition="'$(WindowsPackageType)' == 'None'">true</WindowsAppSDKSelfContained>
+    <SelfContained Condition="'$(WindowsPackageType)' == 'None'">true</SelfContained>
+    <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
+    <GenerateAppxPackageOnBuild>false</GenerateAppxPackageOnBuild>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <ApplicationIcon>..\..\..\src-tauri\icons\icon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.4.0" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2526" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Sgian.Protocol\Sgian.Protocol.csproj" />
+    <Manifest Include="$(ApplicationManifest)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\..\src-tauri\icons\Square150x150Logo.png" Link="Assets\Square150x150Logo.png" />
+    <Content Include="..\..\..\src-tauri\icons\Square44x44Logo.png" Link="Assets\Square44x44Logo.png" />
+    <Content Include="..\..\..\src-tauri\icons\StoreLogo.png" Link="Assets\StoreLogo.png" />
+    <Content Include="..\..\..\src-tauri\icons\icon.ico" Link="Assets\icon.ico" />
+    <Content Include="..\..\..\ui\vendor\xterm\xterm.js" Link="Terminal\vendor\xterm.js" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\ui\vendor\xterm\xterm.css" Link="Terminal\vendor\xterm.css" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\ui\vendor\xterm\LICENSE" Link="Terminal\vendor\LICENSE" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\ui\vendor\xterm\addon-fit.js" Link="Terminal\vendor\addon-fit.js" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\ui\vendor\xterm\addon-search.js" Link="Terminal\vendor\addon-search.js" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\..\LICENSE" Link="Sgian-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Terminal\index.html" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Terminal\terminal.js" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(SgianBackendPath)" Condition="Exists('$(SgianBackendPath)')" Link="Helpers\sgian.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

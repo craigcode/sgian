@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-complete-ui-smoke"
+description = "Enables the complete_ui_smoke command without any pre-configured scope."
+commands.allow = ["complete_ui_smoke"]
+
+[[permission]]
+identifier = "deny-complete-ui-smoke"
+description = "Denies the complete_ui_smoke command without any pre-configured scope."
+commands.deny = ["complete_ui_smoke"]

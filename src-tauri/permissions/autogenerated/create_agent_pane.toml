@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-create-agent-pane"
+description = "Enables the create_agent_pane command without any pre-configured scope."
+commands.allow = ["create_agent_pane"]
+
+[[permission]]
+identifier = "deny-create-agent-pane"
+description = "Denies the create_agent_pane command without any pre-configured scope."
+commands.deny = ["create_agent_pane"]

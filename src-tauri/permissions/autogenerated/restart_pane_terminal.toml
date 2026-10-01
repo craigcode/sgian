@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-restart-pane-terminal"
+description = "Enables the restart_pane_terminal command without any pre-configured scope."
+commands.allow = ["restart_pane_terminal"]
+
+[[permission]]
+identifier = "deny-restart-pane-terminal"
+description = "Denies the restart_pane_terminal command without any pre-configured scope."
+commands.deny = ["restart_pane_terminal"]

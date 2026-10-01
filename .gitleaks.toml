@@ -1,0 +1,19 @@
+# Sgian's gitleaks configuration: the default rules, plus one narrow waiver.
+#
+# The vendored xterm UMD bundles are unchanged upstream files whose minified
+# FourKeyMap / SequencerByKey exports trip `generic-api-key` on line 1.
+# `scripts/verify-vendored-xterm.mjs` independently checks the complete bundle
+# bytes, so the waiver names only that rule on only those files. It is a
+# path-and-rule allowlist rather than commit fingerprints because the history
+# begins at the 0.1.0 release commit, and a fingerprint cannot name the commit
+# that contains it.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Minified exports in the unchanged upstream xterm bundles"
+targetRules = ["generic-api-key"]
+paths = [
+  '''^ui/vendor/xterm/xterm\.js$''',
+  '''^ui/vendor/xterm/addon-search\.js$''',
+]

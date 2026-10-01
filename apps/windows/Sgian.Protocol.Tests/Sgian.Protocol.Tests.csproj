@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Sgian.Protocol\Sgian.Protocol.csproj" />
+    <Compile Include="..\Sgian.Windows\Terminal\TerminalBridgePolicy.cs" Link="TerminalBridgePolicy.cs" />
+  </ItemGroup>
+</Project>

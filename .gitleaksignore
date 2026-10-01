@@ -1,0 +1,2 @@
+# No fingerprint waivers. The reviewed false positives in the vendored xterm
+# bundles are covered by the rule-and-path allowlist in `.gitleaks.toml`.

@@ -1,0 +1,251 @@
+name: Native release candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-release-candidate
+  cancel-in-progress: false
+
+jobs:
+  source:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require the protected main branch
+        env:
+          SOURCE_REF: ${{ github.ref }}
+        run: test "$SOURCE_REF" = refs/heads/main
+
+  validation:
+    needs: source
+    uses: ./.github/workflows/ci.yml
+
+  macos:
+    needs: validation
+    runs-on: macos-latest
+    environment: native-release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.94.0
+      - run: node scripts/verify-release-config.mjs
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Capture the current default keychain and search list BEFORE
+          # mutating them so the teardown step can restore them (matters on
+          # shared/self-hosted runners).
+          security default-keychain -d user > "$RUNNER_TEMP/default-keychain.txt" 2>/dev/null || true
+          security list-keychains -d user > "$RUNNER_TEMP/keychain-search-list.txt" 2>/dev/null || true
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -t 3600 -u "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          # Authorize codesign to use the imported private key without an
+          # interactive authorization prompt (which would hang on a headless
+          # runner).  The partition list grants apple-tool:, apple:, and
+          # codesign: access to the key.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          # Preserve the existing login and system keychains in the search
+          # list while adding the temporary build keychain, then set the build
+          # keychain as the default so codesign resolves the imported identity.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db /Library/Keychains/System.keychain
+          security default-keychain -s "$KEYCHAIN_PATH"
+
+      - name: Prepare signing files
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          umask 077
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle.key"
+      - name: Build universal native app and signed updater feed
+        env:
+          SGIAN_RELEASE: "1"
+          SGIAN_MAC_ARCH: universal
+          SGIAN_CODESIGN_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          SGIAN_SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
+          SGIAN_SPARKLE_PRIVATE_KEY_FILE: ${{ runner.temp }}/sparkle.key
+          SGIAN_NOTARY_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          bash scripts/build-macos-native.sh
+          bash scripts/package-macos-native.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-macos-release
+          path: apps/macos/build/release/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Clean up keychain and signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/build.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/sparkle.key"
+          # xargs strips the quoting that `security` prints around each path.
+          if [ -s "$RUNNER_TEMP/keychain-search-list.txt" ]; then
+            xargs security list-keychains -d user -s < "$RUNNER_TEMP/keychain-search-list.txt" || true
+          fi
+          if [ -s "$RUNNER_TEMP/default-keychain.txt" ]; then
+            xargs security default-keychain -d user -s < "$RUNNER_TEMP/default-keychain.txt" || true
+          fi
+          rm -f "$RUNNER_TEMP/keychain-search-list.txt" "$RUNNER_TEMP/default-keychain.txt"
+
+  windows:
+    needs: validation
+    runs-on: windows-latest
+    environment: native-release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.94.0
+      - run: node scripts/verify-release-config.mjs
+      - name: Prepare Windows certificate
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP/native-signing.pfx", [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+      - name: Build and verify signed native Windows package
+        shell: pwsh
+        env:
+          SGIAN_WINDOWS_CERTIFICATE_PATH: ${{ runner.temp }}/native-signing.pfx
+          SGIAN_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: ./scripts/build-windows-native.ps1 -ReleaseSigning
+      - name: Remove certificate file
+        if: always()
+        shell: pwsh
+        run: Remove-Item "$env:RUNNER_TEMP/native-signing.pfx" -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-windows-release
+          path: apps/windows/build/release/*
+          if-no-files-found: error
+          retention-days: 7
+  linux:
+    name: linux release artifacts
+    needs: validation
+    environment: native-release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.94.0
+      # Deliberately no rust-cache in release jobs: updater-signed artifacts
+      # must be compiled from clean sources rather than restored object files.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libayatana-appindicator3-dev \
+            libfuse2 \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev
+      - name: Verify release configuration
+        run: node scripts/verify-release-config.mjs
+      - run: npm ci --ignore-scripts
+      - name: Build Debian package, AppImage, and updater signature
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --bundles deb,appimage -- --locked
+      - name: Generate SHA-256 checksums
+        run: |
+          set -euo pipefail
+          BUNDLE=src-tauri/target/release/bundle
+          OUT="$BUNDLE/SHA256SUMS-linux.txt"
+          : > "$OUT"
+          for file in "$BUNDLE"/deb/*.deb \
+                      "$BUNDLE"/appimage/*.AppImage \
+                      "$BUNDLE"/appimage/*.AppImage.sig; do
+            (cd "$(dirname "$file")" && sha256sum "$(basename "$file")") >> "$OUT"
+          done
+          cat "$OUT"
+      - name: Stage signed linux artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-linux
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.sig
+            src-tauri/target/release/bundle/SHA256SUMS-linux.txt
+
+  draft:
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-22.04
+    environment: native-release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22
+      - run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Download artifacts from this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_RUN: ${{ github.run_id }}
+        run: gh run download "$RELEASE_RUN" --name native-macos-release --name native-windows-release --name signed-linux --dir release-input
+      - name: Verify complete release and generate update descriptors
+        env:
+          SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
+        run: python3 scripts/prepare-native-release.py release-input release-assets --sparkle-key "$SPARKLE_PUBLIC_KEY"
+      - name: Create a reviewable draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./package.json").version')"
+          tag="v$version"
+          if gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha > existing-tag.txt 2>/dev/null; then
+            test "$(cat existing-tag.txt)" = "$SOURCE_SHA"
+          fi
+          if gh release view "$tag" --json isDraft,targetCommitish > release-state.json 2>/dev/null; then
+            node -e 'if (!JSON.parse(require("fs").readFileSync("release-state.json")).isDraft) throw Error("Refusing to replace a published release")'
+            target="$(node -p 'JSON.parse(require("fs").readFileSync("release-state.json")).targetCommitish')"
+            test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$target" --jq .sha)" = "$SOURCE_SHA"
+          else
+            gh release create "$tag" --target "$SOURCE_SHA" --draft --title "Sgian $version" --generate-notes
+          fi
+          gh release upload "$tag" release-assets/* --clobber
+          echo "Draft created. Install and update acceptance is required before manual publication." >> "$GITHUB_STEP_SUMMARY"

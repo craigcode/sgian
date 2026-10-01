@@ -1,0 +1,35 @@
+{
+  "name": "sgian",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "frontend:dev": "vite",
+    "frontend:build": "node scripts/verify-vendored-xterm.mjs && vite build && node scripts/verify-frontend-bundle.mjs",
+    "tauri": "tauri",
+    "test": "vitest run",
+    "release:check": "node scripts/verify-release-config.mjs"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.5",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "happy-dom": "^20.14.5",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-search": "0.16.0",
+    "@xterm/xterm": "6.0.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  }
+}

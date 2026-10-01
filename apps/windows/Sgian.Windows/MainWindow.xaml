@@ -1,0 +1,153 @@
+<Window
+    x:Class="Sgian.Windows.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Sgian">
+    <Grid x:Name="Root" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="260" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <Border Background="{ThemeResource LayerFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,0,1,0">
+            <Grid RowSpacing="8" Padding="12,12,10,10">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <Grid ColumnSpacing="10">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <Border Width="32" Height="32" CornerRadius="8"
+                            Background="{ThemeResource AccentFillColorDefaultBrush}">
+                        <TextBlock Text="†" FontSize="24" FontWeight="SemiBold"
+                                   Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                        <TextBlock Text="Sgian" FontWeight="SemiBold" FontSize="16" />
+                        <TextBlock x:Name="ConnectionStatus" Text="Connecting"
+                                   FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                    <Button Grid.Column="2" x:Name="SettingsButton" Click="Settings_Click"
+                            ToolTipService.ToolTip="Settings">
+                        <FontIcon Glyph="&#xE713;" FontSize="15" />
+                    </Button>
+                </Grid>
+
+                <Grid Grid.Row="1" ColumnSpacing="6">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Button Content="New terminal" HorizontalAlignment="Stretch" Click="NewTerminal_Click">
+                        <Button.KeyboardAccelerators>
+                            <KeyboardAccelerator Key="T" Modifiers="Control" />
+                        </Button.KeyboardAccelerators>
+                    </Button>
+                    <Button Grid.Column="1" Content="New agent" HorizontalAlignment="Stretch">
+                        <Button.Flyout>
+                            <MenuFlyout>
+                                <MenuFlyoutItem Text="Claude" Tag="claude" Click="NewAgent_Click" />
+                                <MenuFlyoutItem Text="Factory Droid" Tag="droid" Click="NewAgent_Click" />
+                            </MenuFlyout>
+                        </Button.Flyout>
+                    </Button>
+                </Grid>
+
+                <!-- Project board (ENHANCEMENTS "projects"): one line per project with its
+                     attention roll-up; each pane's subtitle names its project. -->
+                <TextBlock x:Name="ProjectSummary" Grid.Row="2" FontSize="11" TextWrapping="Wrap"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" Visibility="Collapsed" />
+
+                <ListView x:Name="PaneList" Grid.Row="3" SelectionMode="Single"
+                          IsItemClickEnabled="True" SelectionChanged="PaneList_SelectionChanged">
+                    <ListView.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Padding="4,6" ColumnSpacing="10">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="28" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <FontIcon Glyph="{Binding Glyph}" FontSize="15" VerticalAlignment="Center" />
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock Text="{Binding Title, Mode=OneWay}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Text="{Binding Subtitle, Mode=OneWay}" FontSize="11"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                               TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                            </Grid>
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
+
+                <Button Grid.Row="4" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                        Click="ChooseWorkspace_Click" ToolTipService.ToolTip="Choose workspace">
+                    <Grid ColumnSpacing="9">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <FontIcon Glyph="&#xE8B7;" FontSize="14" />
+                        <StackPanel Grid.Column="1">
+                            <TextBlock Text="Workspace" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <TextBlock x:Name="WorkspaceLabel" TextTrimming="CharacterEllipsis" />
+                        </StackPanel>
+                    </Grid>
+                </Button>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Column="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <StackPanel Grid.Row="0">
+                <InfoBar x:Name="ErrorBar" Severity="Error" IsClosable="True"
+                         IsOpen="False" Title="Sgian couldn’t complete that action" />
+                <InfoBar x:Name="LeaseBar" Severity="Informational" IsClosable="False"
+                         IsOpen="False" Title="Keyboard lease" />
+            </StackPanel>
+
+            <Grid Grid.Row="1" Height="50" Padding="14,0" Background="{ThemeResource LayerFillColorDefaultBrush}"
+                  BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="0,0,0,1">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel VerticalAlignment="Center">
+                    <TextBlock x:Name="PaneTitle" FontWeight="SemiBold" FontSize="15" />
+                    <TextBlock x:Name="PaneSubtitle" FontSize="11"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <Button Content="Split right" Click="SplitRight_Click" ToolTipService.ToolTip="Split right (Ctrl+Shift+D)" />
+                    <Button Content="Split down" Click="SplitDown_Click" ToolTipService.ToolTip="Split down (Ctrl+Shift+E)" />
+                    <Button Content="Zoom" Click="Zoom_Click" ToolTipService.ToolTip="Zoom pane (Ctrl+Shift+Z)" />
+                    <Button Content="Find" Click="Search_Click" ToolTipService.ToolTip="Find in terminal (Ctrl+Shift+F)" />
+                    <Button Content="Commands" Click="Commands_Click" ToolTipService.ToolTip="Commands (Ctrl+Shift+P)" />
+                    <Button x:Name="LeaseButton" Content="Take keyboard" Click="Lease_Click"
+                            ToolTipService.ToolTip="Take or release the pane's keyboard (Ctrl+Shift+T / Ctrl+Shift+L)" />
+                    <Button x:Name="RestartButton" Content="Restart" Visibility="Collapsed" Click="Restart_Click" />
+                    <Button x:Name="RenameButton" Content="Rename" Visibility="Collapsed" Click="Rename_Click" />
+                    <Button x:Name="CloseButton" Visibility="Collapsed" Click="Close_Click"
+                            ToolTipService.ToolTip="Close pane">
+                        <FontIcon Glyph="&#xE711;" FontSize="12" />
+                    </Button>
+                </StackPanel>
+            </Grid>
+
+            <ContentControl x:Name="PaneContent" Grid.Row="2" />
+        </Grid>
+    </Grid>
+</Window>
