@@ -1794,75 +1794,10 @@ impl PaneRegistry {
 
 mod process_tree;
 use process_tree::*;
-/// A kill-on-close Job Object holding the pane's child so closing the pane
-/// (or the daemon exiting) terminates the whole tree, ConPTY included.
 #[cfg(windows)]
-struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
-
+mod windows_job;
 #[cfg(windows)]
-impl KillOnCloseJob {
-    fn attach(pid: u32) -> Option<Self> {
-        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        };
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
-        };
-        // SAFETY: plain Win32 calls with valid arguments; every handle we
-        // open is closed on every path below.
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null() || job == INVALID_HANDLE_VALUE {
-                return None;
-            }
-            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let set = SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
-            if set == 0 {
-                CloseHandle(job);
-                return None;
-            }
-            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
-            if process.is_null() {
-                CloseHandle(job);
-                return None;
-            }
-            let assigned = AssignProcessToJobObject(job, process);
-            CloseHandle(process);
-            if assigned == 0 {
-                CloseHandle(job);
-                return None;
-            }
-            Some(Self(job))
-        }
-    }
-}
-
-// SAFETY: a job object handle is a kernel object reference with no thread
-// affinity; it is only ever used to close the job, from whichever thread
-// drops the owning session.
-#[cfg(windows)]
-unsafe impl Send for KillOnCloseJob {}
-#[cfg(windows)]
-unsafe impl Sync for KillOnCloseJob {}
-
-#[cfg(windows)]
-impl Drop for KillOnCloseJob {
-    fn drop(&mut self) {
-        // SAFETY: the handle was created by CreateJobObjectW and is closed once.
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
-        }
-    }
-}
+use windows_job::*;
 
 struct TerminalSession {
     _master: Box<dyn MasterPty + Send>,
@@ -2240,24 +2175,12 @@ impl DaemonServer {
         let clients = load_clients_file(&clients_path);
 
         let persist_path = data_dir.join(WORKSPACE_FILE);
-        write_workspace_cwd_marker(&data_dir, &cwd);
         let loaded = load_workspace(&persist_path, cwd.display().to_string());
-
-        // Defense-in-depth: verify the persisted cwd matches the connecting cwd.
-        // The client (DaemonClient) also checks before connecting, but a daemon
-        // spawned directly (e.g. via --daemon args) must still refuse a mismatched
-        // workspace rather than silently serving another workspace's data.
-        if let Some(ref persisted_cwd) = loaded.persisted_cwd {
-            let connecting = cwd.display().to_string();
-            if !persisted_cwd.is_empty() && !workspace_cwds_match(Path::new(persisted_cwd), &cwd) {
-                return Err(format!(
-                    "workspace_key collision detected: the persisted workspace cwd '{}' does not \
-                     match the connecting cwd '{}'; refusing to serve mismatched workspace data. \
-                     If this is intentional, remove the workspace data for this key.",
-                    persisted_cwd, connecting
-                ));
-            }
-        }
+        // Collision check uses the existing marker / persist file. Writing the
+        // marker first would stamp a colliding cwd onto a corrupt data dir and
+        // skip the guard (S6 follow-up).
+        refuse_workspace_cwd_mismatch(&cwd, &data_dir, &loaded)?;
+        write_workspace_cwd_marker(&data_dir, &cwd);
 
         let (
             registry,
@@ -4813,13 +4736,33 @@ impl DaemonServer {
         Ok(())
     }
 
-    /// Remember which credential opened a subscription so revocation can end it.
-    fn note_credential_subscription(&self, credential: Option<&str>, sub_id: u64) {
-        if let Some(id) = credential {
-            if let Ok(mut table) = self.credential_subscribers.lock() {
-                table.entry(id.to_string()).or_default().push(sub_id);
-            }
+    /// Recheck revocation and register atomically, before the router can deliver
+    /// any output. Revoke takes clients before removing registered subscribers.
+    fn register_subscription(
+        &self,
+        stream: TransportStream,
+        wire_version: u16,
+        credential: Option<&str>,
+    ) -> Result<u64, (String, TransportStream)> {
+        let Some(id) = credential else {
+            return self.router.add_subscriber(stream, wire_version);
+        };
+        let Ok(clients) = self.clients.lock() else {
+            return Err(("client table lock poisoned".into(), stream));
+        };
+        if !clients
+            .clients
+            .iter()
+            .any(|record| record.id == id && record.revoked_at_ms.is_none())
+        {
+            return Err(("client credential revoked".into(), stream));
         }
+        let Ok(mut table) = self.credential_subscribers.lock() else {
+            return Err(("credential subscriber table lock poisoned".into(), stream));
+        };
+        let sub_id = self.router.add_subscriber(stream, wire_version)?;
+        table.entry(id.to_string()).or_default().push(sub_id);
+        Ok(sub_id)
     }
 
     fn credential_is_active(&self, id: &str) -> bool {

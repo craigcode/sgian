@@ -52,13 +52,12 @@ use super::*;
 // state, PaneEnded, and close/restart races behave identically. Process
 // management is per-platform: unix sends SIGTERM with a SIGKILL escalation
 // after a grace period (via libc); Windows has no signals, so kills are a
-// direct `Child::kill()` (TerminateProcess — immediate, no grace). Remaining
-// Windows deltas: TerminateProcess kills only the DIRECT child (claude is a
-// node app; Job-Object tree-kill is out of scope, so grandchildren may
-// outlive the session), and npm's `claude.cmd` shim must be spawned via
-// `cmd.exe /c` (CreateProcess cannot run batch scripts — see
-// resolve_agent_bin). On platforms that are neither unix nor Windows,
-// CreateAgentPane fails with a clean error.
+// direct `Child::kill()` (TerminateProcess — immediate, no grace) plus a
+// kill-on-close Job Object so `cmd.exe` shim grandchildren die with the
+// session. npm's `claude.cmd` shim must be spawned via `cmd.exe /c`
+// (CreateProcess cannot run batch scripts — see resolve_agent_bin).
+// On platforms that are neither unix nor Windows, CreateAgentPane
+// fails with a clean error.
 // ---------------------------------------------------------------------------
 
 /// Permission modes accepted by `claude --permission-mode` (2.1.201). Only
@@ -386,22 +385,19 @@ impl AgentChildKiller {
     }
 }
 
-/// (T2) Windows: no POSIX signals exist to mirror the unix grace escalation,
-/// so the kill is a direct `Child::kill()` (TerminateProcess — immediate).
-/// Going through the shared `Child` handle keeps kills handle-based: no
-/// pid-reuse hazard, so no `reaped`-style guard is needed (double-kills are
-/// harmless no-ops on an exited process). (T2) KNOWN DELTA: TerminateProcess
-/// kills only the DIRECT child — claude is a node app, and via the .cmd shim
-/// the direct child is cmd.exe, so grandchildren (node) may outlive the
-/// session and hold its pipes open. Job-Object tree-kill is out of scope.
+/// Windows kills the entire job immediately, then reaps through the shared
+/// child handle. Killing the job first releases a reader blocked in wait().
+/// The job also kills the tree if the session or daemon drops unexpectedly.
 #[cfg(windows)]
 pub(crate) struct AgentChildKiller {
     pub(crate) child: Arc<Mutex<std::process::Child>>,
+    pub(crate) job: KillOnCloseJob,
 }
 
 #[cfg(windows)]
 impl AgentChildKiller {
     pub(crate) fn kill(&self) {
+        self.job.terminate();
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
         }
@@ -412,7 +408,7 @@ impl AgentChildKiller {
 /// pattern as PTY input — no blocking pipe write under the store lock), the
 /// child killer, and the shared state. Dropping it (close/restart/shutdown)
 /// denies pending approvals and kills the CLI (SIGTERM→SIGKILL on unix,
-/// TerminateProcess on Windows).
+/// TerminateProcess plus Job Object on Windows).
 #[cfg(any(unix, windows))]
 pub(crate) struct AgentSession {
     pub(crate) backend: AgentBackendKind,
@@ -486,6 +482,8 @@ pub(crate) struct AgentSpawnPlan {
 pub(crate) struct PreparedAgentSpawn {
     pub(crate) backend: AgentBackendKind,
     pub(crate) child: std::process::Child,
+    #[cfg(windows)]
+    pub(crate) job: KillOnCloseJob,
     pub(crate) stdin: std::process::ChildStdin,
     pub(crate) stdout: std::process::ChildStdout,
     pub(crate) stderr: std::process::ChildStderr,
@@ -516,15 +514,6 @@ pub(crate) fn execute_agent_spawn(plan: &AgentSpawnPlan) -> Result<PreparedAgent
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // (T2) Windows: the daemon (GUI subsystem) has no console, so a
-    // console-subsystem child (cmd.exe / node) would otherwise pop a visible
-    // console window per agent pane. Piped stdio is unaffected by the flag.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
     for key in INHERITED_SESSION_MARKERS {
         command.env_remove(key);
     }
@@ -534,7 +523,11 @@ pub(crate) fn execute_agent_spawn(plan: &AgentSpawnPlan) -> Result<PreparedAgent
     for (key, value) in &plan.env {
         command.env(key, value);
     }
-    let mut child = command.spawn().map_err(|error| {
+    #[cfg(windows)]
+    let spawned = KillOnCloseJob::spawn(&mut command);
+    #[cfg(unix)]
+    let spawned = command.spawn();
+    let spawned = spawned.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!(
                 "{provider} CLI not found: '{}' is not executable or not on PATH",
@@ -544,6 +537,10 @@ pub(crate) fn execute_agent_spawn(plan: &AgentSpawnPlan) -> Result<PreparedAgent
             format!("failed to spawn agent CLI '{}': {error}", program)
         }
     })?;
+    #[cfg(windows)]
+    let (mut child, job) = spawned;
+    #[cfg(unix)]
+    let mut child = spawned;
     // Partial-failure cleanup mirrors execute_spawn: a child whose pipes
     // could not be taken is killed + reaped, never abandoned.
     let (stdin, stdout, stderr) =
@@ -558,6 +555,8 @@ pub(crate) fn execute_agent_spawn(plan: &AgentSpawnPlan) -> Result<PreparedAgent
     Ok(PreparedAgentSpawn {
         backend: plan.backend,
         child,
+        #[cfg(windows)]
+        job,
         stdin,
         stdout,
         stderr,
@@ -1603,6 +1602,8 @@ impl TerminalStore {
         let PreparedAgentSpawn {
             backend,
             child,
+            #[cfg(windows)]
+            job,
             stdin,
             stdout,
             stderr,
@@ -1703,7 +1704,7 @@ impl TerminalStore {
         #[cfg(unix)]
         let killer = AgentChildKiller { pid, reaped };
         #[cfg(windows)]
-        let killer = AgentChildKiller { child };
+        let killer = AgentChildKiller { child, job };
         self.agent_sessions.insert(
             pane_id.to_string(),
             AgentSession {

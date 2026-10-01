@@ -1145,14 +1145,13 @@ pub(crate) fn handle_daemon_client_with_handshake_budget(
             let _ = write_json_line(&mut stream, &response);
             return Ok(());
         }
-        if let Some(sub_id) = begin_subscription(
+        begin_subscription(
             &server,
             stream,
             negotiated_wire_version,
             client_wants_subscribe_ack,
-        ) {
-            server.note_credential_subscription(identity.credential.as_deref(), sub_id);
-        }
+            identity.credential.as_deref(),
+        );
         return Ok(());
     }
 
@@ -1181,17 +1180,19 @@ pub(crate) fn handle_daemon_client_with_handshake_budget(
 /// VAL-CROSS-002). A pane that ends between `add_subscriber` and the snapshot yields
 /// both a broadcast and a catch-up `PaneEnded` — the duplicate is idempotent (the
 /// GUI sets the same ended state again).
-/// Returns the subscriber id, or `None` when the subscriber cap refused it.
+/// Returns the subscriber id, or `None` if the credential was revoked or the
+/// subscriber cap refused it. Credential registration precedes output and ack.
 pub(crate) fn begin_subscription(
     server: &Arc<DaemonServer>,
     stream: TransportStream,
     wire_version: u16,
     send_ack: bool,
+    credential: Option<&str>,
 ) -> Option<u64> {
-    let sub_id = match server.router.add_subscriber(stream, wire_version) {
+    let sub_id = match server.register_subscription(stream, wire_version, credential) {
         Ok(id) => id,
         Err((reason, mut stream)) => {
-            // (M5) Over the subscriber cap: report a clean error on the
+            // Revoked credential or subscriber cap: report a clean error on the
             // connection's own wire protocol, then let the stream drop (close)
             // — no subscriber entry, channel, or threads were created, so the
             // connection is not leaked.
@@ -1392,11 +1393,13 @@ pub(crate) fn serve_framed_connection(
                 let _ = frame::write(&mut stream, &response);
                 return Ok(());
             }
-            if let Some(sub_id) =
-                begin_subscription(&server, stream, wire_version, client_wants_subscribe_ack)
-            {
-                server.note_credential_subscription(identity.credential.as_deref(), sub_id);
-            }
+            begin_subscription(
+                &server,
+                stream,
+                wire_version,
+                client_wants_subscribe_ack,
+                identity.credential.as_deref(),
+            );
             return Ok(());
         }
 
