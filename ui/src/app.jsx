@@ -1508,7 +1508,7 @@ function SettingsDialog({ state, controller }) {
           </div>
           <footer className="modal-footer">
             <button id="settings-cancel" className="modal-button" type="button" onClick={controller.closeSettingsModal}>Cancel</button>
-            <button id="settings-save" className="modal-button primary" type="submit" disabled={state.settingsLoadFailed}>Save</button>
+            <button id="settings-save" className="modal-button primary" type="submit" disabled={state.settingsLoadFailed || !state.settingsLoaded}>Save</button>
           </footer>
         </form>
       </div>

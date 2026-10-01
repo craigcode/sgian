@@ -16,6 +16,17 @@ preceded it.
 
 ### Fixes
 
+- Saving Settings no longer resets `lease_policy`, `identity`, the agent
+  probe interval or the Kranz binary path: `get_config` returns them and
+  `write_config` keeps any key the payload omits, replacing only what it
+  carries (#32).
+- Agent profiles added from the macOS and Windows Settings now save; both
+  forms wrote `backend` and `model` where the daemon expects
+  `agent_backend` and `agent_model` (#31).
+- The web client's Settings form cannot be saved before the configuration
+  has loaded, and an edit made while it loads no longer leaves the other
+  fields empty (#33).
+
 - Windows agent panes join a kill-on-close job before their code runs; closing,
   restarting or discarding a pending pane terminates its child process tree.
   A failed job assignment refuses the launch.

@@ -337,6 +337,35 @@ impl DaemonEvent {
     }
 }
 
+/// Copy into `incoming` every key of the workspace config file at
+/// `config_path` that `incoming` does not mention and that holds something
+/// (not null, not an empty list or map). See the `WriteConfig` handler.
+fn preserve_omitted_config_keys(incoming: &mut Value, config_path: &Path) {
+    let Some(object) = incoming.as_object_mut() else {
+        return;
+    };
+    let Some(existing) = read_config_file(config_path).ok().flatten() else {
+        return;
+    };
+    let Ok(Value::Object(current)) = serde_json::to_value(&existing) else {
+        return;
+    };
+    for (key, value) in current {
+        if object.contains_key(&key) {
+            continue;
+        }
+        let empty = match &value {
+            Value::Null => true,
+            Value::Array(items) => items.is_empty(),
+            Value::Object(entries) => entries.is_empty(),
+            _ => false,
+        };
+        if !empty {
+            object.insert(key, value);
+        }
+    }
+}
+
 /// Modes in which an agent runs tools without a person approving them.
 pub(crate) fn is_unattended_mode(mode: Option<&str>) -> bool {
     matches!(
@@ -880,6 +909,13 @@ impl Config {
             "theme": self.theme,
             "idle_shutdown_secs": self.idle_shutdown_secs_effective(),
             "restore_policy": self.restore_policy_effective(),
+            // The coordination and identity settings ride along as stored
+            // (null when unset) so a get → edit → write round-trip from a
+            // settings form cannot drop them (issue #32).
+            "lease_policy": self.lease_policy,
+            "agent_probe_interval_ms": self.agent_probe_interval_ms,
+            "kranz_bin": self.kranz_bin,
+            "identity": self.identity,
             "agent_permission_mode": self.agent_permission_mode_effective(),
             "agent_claude_bin": self.agent_claude_bin,
             "agent_droid_bin": self.agent_droid_bin,
@@ -3496,27 +3532,16 @@ impl DaemonServer {
                     .unwrap_or_else(|| Path::new("."))
                     .join(CONFIG_FILE);
 
-                // M1: a payload that OMITS scrub_env must not erase the workspace
-                // file's current scrub list (serde would default the missing field
-                // to [] and the atomic write below would persist that). An absent
-                // key preserves the existing list; an explicit value — including
-                // [] — replaces it. full_config() now carries scrub_env, so honest
-                // get→edit→write round-trips are covered either way; this guards
-                // clients that build partial payloads (e.g. a settings form
-                // without a scrub_env field).
+                // A key the payload OMITS keeps the workspace file's current
+                // value; a key it carries, including an explicit null, [] or
+                // {}, replaces it. Serde would otherwise default every missing
+                // field and the atomic write below would persist that, so a
+                // settings form that knows nothing of `lease_policy`,
+                // `identity`, `scrub_env` or a field added later would reset
+                // it on an unrelated save (M1, issue #32), and a save sent
+                // before the form had loaded would wipe the file (issue #33).
                 let mut config = config;
-                if config.get("scrub_env").is_none() {
-                    if let Some(object) = config.as_object_mut() {
-                        let current_scrub = read_config_file(&config_path)
-                            .ok()
-                            .flatten()
-                            .map(|existing| existing.scrub_env)
-                            .unwrap_or_default();
-                        if !current_scrub.is_empty() {
-                            object.insert("scrub_env".to_string(), json!(current_scrub));
-                        }
-                    }
-                }
+                preserve_omitted_config_keys(&mut config, &config_path);
 
                 // Deserialize the JSON value into a Config (validates types).
                 let new_config: Config = serde_json::from_value(config)

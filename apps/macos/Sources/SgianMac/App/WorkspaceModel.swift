@@ -370,10 +370,22 @@ final class WorkspaceModel: ObservableObject {
 
     func requestClose(_ pane: Pane? = nil) { panePendingClose = pane ?? selectedPane }
 
+    /// The agent a profile describes, or nil for a shell profile. Reads the
+    /// daemon's field names (`agent_backend`, `agent_model`); `kind` may be
+    /// omitted, in which case an agent field makes it an agent profile, as
+    /// the daemon infers. The pre-fix spellings are read too so a profile a
+    /// hand-edited file still carries is not silently turned into a shell.
+    nonisolated static func agentSpec(forProfile profile: JSONValue) -> (backend: AgentBackend, model: String?)? {
+        let backend = profile["agent_backend"]?.stringValue ?? profile["backend"]?.stringValue
+        let model = profile["agent_model"]?.stringValue ?? profile["model"]?.stringValue
+        let kind = profile["kind"]?.stringValue
+        guard kind == "agent" || (kind == nil && (backend != nil || model != nil)) else { return nil }
+        return (AgentBackend(rawValue: backend ?? "claude") ?? .claude, model)
+    }
+
     func createProfile(_ profile: JSONValue) {
-        if profile["kind"]?.stringValue == "agent" {
-            createAgent(backend: AgentBackend(rawValue: profile["backend"]?.stringValue ?? "claude") ?? .claude,
-                        model: profile["model"]?.stringValue)
+        if let spec = WorkspaceModel.agentSpec(forProfile: profile) {
+            createAgent(backend: spec.backend, model: spec.model)
         } else { createShell(profile: profile["name"]?.stringValue) }
     }
 

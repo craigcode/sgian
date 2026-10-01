@@ -164,8 +164,10 @@ struct SettingsView: View {
         guard !profiles.contains(where: { $0["name"]?.stringValue == name }) else { message = "A profile with that name already exists."; return }
         var profile: [String: JSONValue] = ["name": .string(name), "kind": .string(profileKind)]
         if profileKind == "agent" {
-            profile["backend"] = .string(profileBackend)
-            if !profileModel.isEmpty { profile["model"] = .string(profileModel) }
+            // The daemon's profile schema names these `agent_backend` and
+            // `agent_model` and rejects unknown fields (issue #31).
+            profile["agent_backend"] = .string(profileBackend)
+            if !profileModel.isEmpty { profile["agent_model"] = .string(profileModel) }
         }
         profiles.append(.object(profile)); profileName = ""; message = "Save to apply the new profile."
     }

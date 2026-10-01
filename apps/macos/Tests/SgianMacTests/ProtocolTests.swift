@@ -293,6 +293,21 @@ func daemonRoundTrip() async throws {
     #expect(!AgentPaneInfo.isUnattendedMode(nil))
 }
 
+@Test func agentProfilesUseTheDaemonFieldNames() throws {
+    func profile(_ json: String) throws -> JSONValue { try JSONDecoder().decode(JSONValue.self, from: Data(json.utf8)) }
+    let droid = WorkspaceModel.agentSpec(forProfile: try profile(#"{"name":"reviewer","kind":"agent","agent_backend":"droid","agent_model":"m1"}"#))
+    #expect(droid?.backend == .droid)
+    #expect(droid?.model == "m1")
+    // `kind` may be omitted; an agent field makes it an agent profile.
+    let inferred = WorkspaceModel.agentSpec(forProfile: try profile(#"{"name":"a","agent_model":"m2"}"#))
+    #expect(inferred?.backend == .claude)
+    #expect(inferred?.model == "m2")
+    #expect(WorkspaceModel.agentSpec(forProfile: try profile(#"{"name":"sh","kind":"shell","shell":"/bin/zsh"}"#)) == nil)
+    #expect(WorkspaceModel.agentSpec(forProfile: try profile(#"{"name":"sh"}"#)) == nil)
+    // A shell profile is not turned into an agent by a stray field.
+    #expect(WorkspaceModel.agentSpec(forProfile: try profile(#"{"name":"sh","kind":"shell","agent_model":"m"}"#)) == nil)
+}
+
 @Test func startupWorkspaceForgetsAMissingSavedPath() {
     let existing: Set<String> = ["/w/alive", "/w/older"]
     let exists: (String) -> Bool = { existing.contains($0) }
