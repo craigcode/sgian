@@ -28,10 +28,11 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
       `.gitleaksignore` (commit, file, rule, line); never by path or rule.
 - [x] crates.io names held by the owner: `sgian` 0.0.1, `sgian-pty` 0.0.1,
       `sgian-protocol` 0.0.1 (placeholders whose READMEs state the intent).
-- [ ] `CHANGELOG.md` finalised for the chosen version (draft exists).
-- [ ] Version chosen and set in `src-tauri/Cargo.toml`, `package.json` and
-      `src-tauri/tauri.conf.json` by the owner (`npm run release:check`
-      verifies they agree). No tag exists yet.
+- [x] `CHANGELOG.md` finalised for the chosen version: `0.1.0 - 2026-09-30`.
+- [x] Version chosen by the owner: `0.1.0`, already set in
+      `src-tauri/Cargo.toml`, `package.json` and `src-tauri/tauri.conf.json`
+      (`npm run release:check` verifies they agree). The owner creates the
+      `v0.1.0` tag after the visibility change.
 - [ ] Repository description on GitHub reviewed; the current one predates the
       lease/ledger work. Draft to paste: "Terminal multiplexer for supervising
       coding agents: a Rust daemon keeps shells and agent sessions alive per
@@ -61,6 +62,9 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
       coverage in the suite.
 
 ## Signing and updates
+
+0.1.0 ships as source, so nothing in this section gates it. Every item here
+gates the first release that carries installers.
 
 - [ ] The 11 repository secrets and the `SPARKLE_PUBLIC_KEY` variable named
       in `native-release.md` are provisioned. As of 2026-09-16 the

@@ -12,10 +12,12 @@ without losing track of who typed what.
 
 ## Install
 
-Packaged builds (macOS 13+ DMG, Windows 10 1809+ MSIX, Linux Debian package
-and AppImage) come from the release workflow described under
-[Distribution](#distribution). To build from source you need Node.js 22.12+
-and the Rust toolchain pinned in `rust-toolchain.toml`:
+0.1.0 is a source release: build it yourself, on macOS 13+, Windows 10
+1809+ or a Linux distribution on the Ubuntu 22.04/WebKitGTK 4.1 baseline.
+Signed installers (DMG, MSIX, Debian package and AppImage) with automatic
+updates come in a later release from the workflow described under
+[Distribution](#distribution). You need Node.js 22.12+ and the Rust
+toolchain pinned in `rust-toolchain.toml`:
 
 ```bash
 npm ci --ignore-scripts
