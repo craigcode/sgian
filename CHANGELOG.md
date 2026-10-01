@@ -5,8 +5,14 @@ follow SemVer once the first public tag exists.
 
 ## Unreleased
 
-The first public release. Everything below is new relative to the private
-prototype that preceded it; the version is chosen at release time.
+## 0.1.0 - 2026-09-30
+
+The first public release, published as source: build it from the `v0.1.0`
+tag with the three commands in the README. Signed and notarized installers
+with automatic updates follow in a later release, once the signing
+credentials exist and an installed update has been exercised on each
+platform. Everything below is new relative to the private prototype that
+preceded it.
 
 ### Fixes
 
