@@ -564,3 +564,91 @@ fn write_config_live_reloads_restore_policy() {
 
     daemon.shutdown();
 }
+
+/// Issue #32: a settings round-trip (get → edit one field → write) and a
+/// partial payload must both leave the coordination and identity keys
+/// alone, and an explicit null must still clear one.
+#[test]
+fn write_config_keeps_keys_the_payload_omits_and_get_config_returns_them() {
+    let daemon = TestDaemon::spawn(Config::default());
+    let client = daemon.client();
+    let config_path = daemon.data_dir.path().join(CONFIG_FILE);
+    let read = || -> Config {
+        serde_json::from_str(&fs::read_to_string(&config_path).expect("config should exist"))
+            .expect("config should parse")
+    };
+
+    client
+        .request::<CommandOk>(DaemonRequest::WriteConfig {
+            config: json!({
+                "lease_policy": "required",
+                "identity": "required",
+                "agent_probe_interval_ms": 0,
+                "kranz_bin": "/tmp/custom-kranz",
+                "font_size": 13,
+                "env": { "A": "1" },
+            }),
+        })
+        .expect("seed write should succeed");
+
+    // What a settings form receives now carries the four keys.
+    let mut served: Value = client
+        .request(DaemonRequest::GetConfig)
+        .expect("get_config should succeed");
+    for _ in 0..40 {
+        if served["lease_policy"] == json!("required") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        served = client
+            .request(DaemonRequest::GetConfig)
+            .expect("get_config should succeed");
+    }
+    assert_eq!(served["lease_policy"], json!("required"));
+    assert_eq!(served["identity"], json!("required"));
+    assert_eq!(served["agent_probe_interval_ms"], json!(0));
+    assert_eq!(served["kranz_bin"], json!("/tmp/custom-kranz"));
+
+    // The form's round-trip: change one field of what it was served.
+    served["font_size"] = json!(15);
+    client
+        .request::<CommandOk>(DaemonRequest::WriteConfig { config: served })
+        .expect("round-trip write should succeed");
+    let parsed = read();
+    assert_eq!(parsed.font_size, Some(15));
+    assert_eq!(parsed.lease_policy.as_deref(), Some("required"));
+    assert_eq!(parsed.identity.as_deref(), Some("required"));
+    assert_eq!(parsed.agent_probe_interval_ms, Some(0));
+    assert_eq!(parsed.kranz_bin.as_deref(), Some("/tmp/custom-kranz"));
+
+    // A client that knows none of these keys, and even an empty payload
+    // (a save sent before the form loaded, issue #33), keeps them.
+    client
+        .request::<CommandOk>(DaemonRequest::WriteConfig {
+            config: json!({ "font_size": 16 }),
+        })
+        .expect("partial write should succeed");
+    client
+        .request::<CommandOk>(DaemonRequest::WriteConfig { config: json!({}) })
+        .expect("empty write should succeed");
+    let parsed = read();
+    assert_eq!(parsed.font_size, Some(16));
+    assert_eq!(parsed.lease_policy.as_deref(), Some("required"));
+    assert_eq!(parsed.identity.as_deref(), Some("required"));
+    assert_eq!(parsed.kranz_bin.as_deref(), Some("/tmp/custom-kranz"));
+    assert_eq!(parsed.env.get("A").map(String::as_str), Some("1"));
+
+    // Carrying a key replaces it: null clears, a new value wins.
+    client
+        .request::<CommandOk>(DaemonRequest::WriteConfig {
+            config: json!({ "kranz_bin": null, "lease_policy": "open", "env": {} }),
+        })
+        .expect("explicit write should succeed");
+    let parsed = read();
+    assert_eq!(parsed.kranz_bin, None);
+    assert_eq!(parsed.lease_policy.as_deref(), Some("open"));
+    assert!(parsed.env.is_empty(), "an explicit {{}} clears the map");
+    assert_eq!(parsed.identity.as_deref(), Some("required"));
+
+    daemon.shutdown();
+}

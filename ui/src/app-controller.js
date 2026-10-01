@@ -147,6 +147,13 @@ function initialState() {
     lastActivityMs: new Map(),
     settingsDirty: false,
     settingsLoadFailed: false,
+    // True once get_config has answered for the open dialog. Save stays off
+    // until then: a submit before the load would write a near-empty config
+    // over the workspace's settings (issue #33).
+    settingsLoaded: false,
+    // Fields the person edited since the dialog opened; a load that lands
+    // late fills every other field instead of being discarded.
+    settingsTouched: new Set(),
     settingsPassthroughConfig: {},
     settingsValues: populateFormFromConfig(null),
     settingsErrors: {},
@@ -1349,6 +1356,8 @@ export function createAppController({
     state.settingsModalOpen = true;
     state.settingsDirty = false;
     state.settingsLoadFailed = false;
+    state.settingsLoaded = false;
+    state.settingsTouched = new Set();
     state.settingsErrors = {};
     state.settingsError = "";
     // Do not expose values from the previous open while the fresh full config
@@ -1375,17 +1384,29 @@ export function createAppController({
   async function loadSettingsConfig() {
     if (!bridgeInvoke) {
       state.settingsValues = populateFormFromConfig(null);
+      state.settingsLoaded = true;
       notify();
       return;
     }
     try {
       const config = await invokeWithTimeout("get_config");
-      if (state.settingsModalOpen && !state.settingsDirty) {
+      if (state.settingsModalOpen) {
+        // Keep what the person typed while the request was in flight and
+        // fill everything else from the daemon, so an early edit cannot
+        // leave the untouched fields (or the passthrough keys) empty.
+        const loaded = populateFormFromConfig(config);
+        const kept = {};
+        for (const key of state.settingsTouched) {
+          if (key in state.settingsValues) kept[key] = state.settingsValues[key];
+        }
         state.settingsLoadFailed = false;
+        state.settingsLoaded = true;
         state.settingsPassthroughConfig = settingsPassthroughConfig(config);
-        state.settingsValues = populateFormFromConfig(config);
-        state.settingsErrors = {};
-        state.settingsError = "";
+        state.settingsValues = { ...loaded, ...kept };
+        if (!state.settingsDirty) {
+          state.settingsErrors = {};
+          state.settingsError = "";
+        }
         notify();
       }
     } catch (error) {
@@ -1401,6 +1422,7 @@ export function createAppController({
 
   function updateSetting(key, value) {
     state.settingsDirty = true;
+    state.settingsTouched.add(key);
     state.settingsValues = { ...state.settingsValues, [key]: value };
     if (state.settingsErrors[key]) {
       state.settingsErrors = { ...state.settingsErrors };
@@ -1410,7 +1432,7 @@ export function createAppController({
   }
 
   async function saveSettings(values = state.settingsValues) {
-    if (state.settingsLoadFailed) return false;
+    if (state.settingsLoadFailed || !state.settingsLoaded) return false;
     const { valid, errors } = validateSettingsForm(values);
     if (!valid) {
       state.settingsErrors = errors;

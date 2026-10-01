@@ -78,6 +78,16 @@ whose sequence is not newer than the last applied sequence.
 
 ## Native client requests
 
+`get_config` returns the effective configuration a settings form edits,
+including the coordination keys a form may not show (`lease_policy`,
+`agent_probe_interval_ms`, `kranz_bin`, `identity`, `scrub_env`).
+`write_config` replaces the workspace file with the payload, with one rule a
+client can rely on: a key the payload omits keeps its current value, and a
+key it carries, including an explicit `null`, `[]` or `{}`, replaces it. A
+form should still load before it lets anyone save. Agent profiles name their
+fields `agent_backend` and `agent_model`; unknown profile fields are
+rejected.
+
 The native clients currently use:
 
 - `ping`, `bootstrap_workspace`, `subscribe`

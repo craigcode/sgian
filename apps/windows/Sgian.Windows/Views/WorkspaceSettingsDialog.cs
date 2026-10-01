@@ -72,7 +72,8 @@ internal static class WorkspaceSettingsDialog
             if (title.Length == 0 || profiles.Any(item => item?["name"]?.GetValue<string>() == title)) { message.Text = "Enter a unique profile name."; return; }
             var type = kind.SelectedItem as string ?? "shell";
             var profile = new JsonObject { ["name"] = title, ["kind"] = type == "shell" ? "shell" : "agent" };
-            if (type != "shell") { profile["backend"] = type; if (!string.IsNullOrWhiteSpace(profileModel.Text)) profile["model"] = profileModel.Text.Trim(); }
+            // The daemon's profile schema names these agent_backend / agent_model and rejects unknown fields (issue #31).
+            if (type != "shell") { profile["agent_backend"] = type; if (!string.IsNullOrWhiteSpace(profileModel.Text)) profile["agent_model"] = profileModel.Text.Trim(); }
             profiles.Add(profile); RefreshProfiles(); name.Text = ""; message.Text = "Save to apply the new profile.";
         };
         panel.Children.Add(add); panel.Children.Add(message);

@@ -190,6 +190,9 @@ const backendEndedPanes = new Set();
 let backendConfig = {};
 // When true, get_config rejects (a wedged daemon) — pins the M2 save block.
 let failGetConfig = false;
+// When set, get_config answers only after this promise settles (a slow
+// daemon) — pins the save block while the settings form is still loading.
+let getConfigGate = null;
 // (M2) send_agent_message injection: "fail" rejects immediately, "hang"
 // never settles (drives the 60s invoke-timeout path).
 let sendAgentMessageMode = "ok";
@@ -271,6 +274,7 @@ async function stubInvoke(command, args = {}) {
     }
     case "get_config":
       if (failGetConfig) throw new Error("daemon wedged");
+      if (getConfigGate) return getConfigGate.then(() => backendConfig);
       return backendConfig;
     case "send_agent_message":
       if (sendAgentMessageMode === "fail") throw new Error("daemon dead");
@@ -624,8 +628,13 @@ describe("main.js boot against the stubbed native bridge", () => {
 
   it("saves settings via write_config — the exact backend command name (H1)", async () => {
     document.querySelector("#open-settings").click();
-    // The modal fetches the current config before it can be saved.
+    // The modal fetches the current config before it can be saved, and Save
+    // stays off until that request has answered (issue #33).
     await waitFor(() => commandsInvoked("get_config").length >= 2, "settings get_config");
+    await waitFor(
+      () => document.querySelector("#settings-save").disabled === false,
+      "save enabled once the config loaded",
+    );
 
     document.querySelector("#cfg-font-size").value = "14";
     document
@@ -825,6 +834,62 @@ describe("main.js boot against the stubbed native bridge", () => {
       scrub_env: ["SECRET_TOKEN"],
       agent_permission_mode: "plan",
       agent_claude_bin: "C:\\tools\\claude.exe",
+    });
+    await waitFor(
+      () => document.querySelector("#settings-overlay").hidden === true,
+      "settings modal closed",
+    );
+    backendConfig = {};
+  });
+
+  it("keeps Save off while the config is loading and keeps edits made meanwhile (#33)", async () => {
+    backendConfig = { font_size: 12, shell: "/bin/zsh", agent_claude_bin: "/opt/claude" };
+    let release;
+    getConfigGate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const writesBefore = commandsInvoked("write_config").length;
+    document.querySelector("#open-settings").click();
+    await waitFor(
+      () => document.querySelector("#settings-overlay").hidden === false,
+      "settings modal open",
+    );
+    expect(document.querySelector("#settings-save").disabled).toBe(true);
+
+    // A submit before the load answers must not write an empty config.
+    document
+      .querySelector("#settings-form")
+      .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(commandsInvoked("write_config").length).toBe(writesBefore);
+
+    // An edit made while loading survives; untouched fields still fill in.
+    // The native setter is how a real keystroke reaches React's change
+    // tracking; assigning `.value` directly would bypass the controller.
+    const fontSize = document.querySelector("#cfg-font-size");
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(fontSize, "16");
+    fontSize.dispatchEvent(new Event("input", { bubbles: true }));
+    release();
+    getConfigGate = null;
+    await waitFor(
+      () => document.querySelector("#settings-save").disabled === false,
+      "save enabled once the config loaded",
+    );
+    expect(document.querySelector("#cfg-font-size").value).toBe("16");
+    expect(document.querySelector("#cfg-shell").value).toBe("/bin/zsh");
+
+    document
+      .querySelector("#settings-form")
+      .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await waitFor(
+      () => commandsInvoked("write_config").length > writesBefore,
+      "write_config after the load",
+    );
+    const writes = commandsInvoked("write_config");
+    expect(writes[writes.length - 1].args.config).toMatchObject({
+      font_size: 16,
+      shell: "/bin/zsh",
+      agent_claude_bin: "/opt/claude",
     });
     await waitFor(
       () => document.querySelector("#settings-overlay").hidden === true,
