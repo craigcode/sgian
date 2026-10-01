@@ -14,6 +14,16 @@ exercised at least once on each platform.
 These are operator gates. Neither Sgian nor a coding-agent session pushes
 tags or publishes releases.
 
+## Source release
+
+A release without installers, as 0.1.0 is. It needs none of the signing
+prerequisites above: the version pull request below, a passing
+`scripts/audit-public-history.sh`, the visibility change in
+`public-readiness.md`, then the owner creates the `v<version>` tag on the
+merge commit and publishes a release whose notes are that version's
+changelog section, with no artifacts attached. The README tells readers to
+build from the tag. Sections 2 and 3 do not apply.
+
 ## 1. Version pull request
 
 - The owner picks the version. Set it in `src-tauri/Cargo.toml`,
