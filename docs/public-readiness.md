@@ -1,10 +1,9 @@
 # Public-readiness gate
 
-**Status (2026-09-16):** repository private; code and CI green; distribution
-machinery unexercised. Making Sgian public exposes every reachable Git object
-and every release asset. It is an operator action, separate from merging
-ordinary changes. Keep the repository private until every item below is true,
-then follow `releasing.md`.
+**Status (2026-09-30):** repository public; `v0.1.0` published as a source
+release (`docs/reviews/release-0.1.0.md`). The distribution machinery is
+still unexercised: every unticked item below gates the first release that
+carries installers, and none gated 0.1.0.
 
 Kranz needed a history rewrite into a fresh public origin. Sgian does not:
 `scripts/audit-public-history.sh` passes on the existing origin (gitleaks over
@@ -33,8 +32,7 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
       `src-tauri/Cargo.toml`, `package.json` and `src-tauri/tauri.conf.json`
       (`npm run release:check` verifies they agree). The owner creates the
       `v0.1.0` tag after the visibility change.
-- [ ] Repository description on GitHub reviewed; the current one predates the
-      lease/ledger work. Draft to paste: "Terminal multiplexer for supervising
+- [x] Repository description and topics set on 2026-09-30: "Terminal multiplexer for supervising
       coding agents: a Rust daemon keeps shells and agent sessions alive per
       workspace, with native macOS and Windows clients, keyboard leases, a
       hash-chained ledger and a scriptable ctl." Suggested topics:
@@ -89,9 +87,9 @@ gates the first release that carries installers.
 - [ ] The `native-release` environment requires owner approval for the
       publish job (a paid-plan feature on private repositories; verify after
       the visibility change).
-- [ ] Private vulnerability reporting enabled (unavailable while private).
-- [ ] Dependabot alerts and security updates, secret scanning and push
-      protection enabled where the plan permits.
+- [x] Private vulnerability reporting enabled (2026-09-30).
+- [x] Dependabot alerts and security updates, secret scanning and push
+      protection enabled (2026-09-30).
 
 ## Visibility change
 
