@@ -58,7 +58,8 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             Environment.CurrentDirectory,
             Path.GetPathRoot(Environment.CurrentDirectory),
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            Directory.Exists);
+            Directory.Exists,
+            [Environment.SystemDirectory, Environment.GetFolderPath(Environment.SpecialFolder.Windows), AppContext.BaseDirectory]);
         _terminalFontSize = settings.TerminalFontSize is >= 9 and <= 30
             ? settings.TerminalFontSize
             : 13;
@@ -117,6 +118,9 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         private set => Set(ref _errorMessage, value);
     }
 
+    /// <summary>Surface a failure that happened in the view (a picker that could not open) in the error bar.</summary>
+    public void ReportError(string message) => ErrorMessage = message;
+
     public string WorkspacePath
     {
         get => _workspacePath;
@@ -169,11 +173,20 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
 
     public async Task ConnectAsync(string workspace)
     {
-        var fullPath = Path.GetFullPath(workspace);
+        string fullPath;
+        try { fullPath = Path.GetFullPath(workspace); }
+        catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException or System.Security.SecurityException)
+        {
+            ErrorMessage = $"Not a usable workspace path: {error.Message}";
+            return;
+        }
         if (!Directory.Exists(fullPath))
         {
             ErrorMessage = $"Workspace does not exist: {fullPath}";
-            Status = "Connection failed";
+            // Only a client with no live connection has failed to connect; a
+            // stale entry picked while connected elsewhere leaves that
+            // connection, and its status, alone.
+            if (_client is null) Status = "Connection failed";
             // Forget a workspace that is gone so the next launch does not trip
             // over it again; the empty state offers the picker.
             RecentWorkspaces = RecentWorkspaces
@@ -583,10 +596,17 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             _agentUsage.Remove(stale.Id);
         }
         _projects = new Dictionary<string, Project>(snapshot.Projects, StringComparer.Ordinal);
+        // The snapshot carries the counts only; the description of the first
+        // opaque string arrives on the event, so keep the one already held.
+        var previousWarnings = new Dictionary<string, OutputTricks>(_outputWarnings);
         _outputWarnings.Clear();
         foreach (var (warnedPaneId, warning) in snapshot.OutputWarnings)
         {
-            if (warning.Total > 0) _outputWarnings[warnedPaneId] = warning;
+            if (warning.Total > 0)
+                _outputWarnings[warnedPaneId] = warning with
+                {
+                    Sample = warning.Sample ?? (previousWarnings.TryGetValue(warnedPaneId, out var held) ? held.Sample : null),
+                };
         }
         _agentUsage.Clear();
         foreach (var (usagePaneId, usage) in snapshot.AgentUsage)
@@ -604,7 +624,8 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                 ? info.Attention
                 : null;
             item.Mode = info?.Mode;
-            item.Unattended = info?.Unattended ?? false;
+            // An older daemon's snapshot may lack the flag; derive it from the mode as the event path does.
+            item.Unattended = info is not null && (info.Unattended || AgentPaneInfo.IsUnattendedMode(info.Mode));
             item.AgentSpec = snapshot.AgentSpecs.TryGetValue(pane.Id, out var spec) ? spec : null;
             ApplyLease(item, snapshot.Leases.TryGetValue(pane.Id, out var lease) ? lease : null);
             if (pane.Kind == "agent")

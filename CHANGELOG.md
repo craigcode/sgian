@@ -5,6 +5,23 @@ follow SemVer once the first public tag exists.
 
 ## Unreleased
 
+### Fixes
+
+- `ctl send` treats a real line feed in the text as Enter, like the `\n`
+  escape, so `sgian ctl send pane $'text\n'` submits to a shell and to a
+  full-screen agent input alike; `--lf` and `--raw` still send it as given.
+- Panes the native clients did not place themselves (created by `ctl`,
+  Kranz or another client) share the width evenly instead of each new one
+  taking half and squeezing those before it.
+- Windows: an agent profile chosen from the command palette opens an agent
+  pane instead of failing; the empty state follows the connection status
+  and offers Choose workspace when a workspace is missing; the output
+  badge keeps its "first seen" text across a refresh; a stale workspace
+  picked while connected no longer shows "Connection failed"; a launch
+  from the Start menu opens the user profile rather than the system
+  directory; and the unattended flag is derived for an older daemon's
+  snapshot as it already was for its events.
+
 ## 0.1.0 - 2026-09-30
 
 The first public release, published as source: build it from the `v0.1.0`

@@ -54,6 +54,12 @@ public sealed partial class MainWindow : Window
         {
             if (args.PropertyName is nameof(ViewModel.Status) or nameof(ViewModel.ErrorMessage) or
                 nameof(ViewModel.WorkspacePath) or nameof(ViewModel.LeaseNotice)) RefreshChrome();
+            // The empty state shows the status and the error; rebuild it when
+            // either changes so it does not keep saying "Connecting" after a
+            // failure, and so the picker button appears when a workspace is
+            // missing before any layout was ever shown.
+            if (args.PropertyName is nameof(ViewModel.Status) or nameof(ViewModel.ErrorMessage) && ViewModel.Panes.Count == 0)
+                ShowLayout();
         };
         Closed += MainWindow_Closed;
         AddShortcut(VirtualKey.D, VirtualKeyModifiers.Control | VirtualKeyModifiers.Shift, () => ViewModel.CreateShellAsync("row"));
@@ -345,7 +351,16 @@ public sealed partial class MainWindow : Window
             if (config["profiles"] is System.Text.Json.Nodes.JsonArray profiles)
                 foreach (var profile in profiles)
                     if (profile?["name"]?.GetValue<string>() is { } name)
-                        actions.Add(($"New pane with profile: {name}", () => ViewModel.CreateShellAsync(profile: name)));
+                    {
+                        // The daemon refuses create_pane for an agent profile, so an
+                        // agent profile opens an agent pane with its backend and model.
+                        var backend = profile["agent_backend"]?.GetValue<string>();
+                        var model = profile["agent_model"]?.GetValue<string>();
+                        Func<Task> run = WorkspaceStartup.IsAgentProfile(profile["kind"]?.GetValue<string>(), backend, model)
+                            ? () => ViewModel.CreateAgentAsync(backend ?? "claude", model)
+                            : () => ViewModel.CreateShellAsync(profile: name);
+                        actions.Add(($"New pane with profile: {name}", run));
+                    }
         }
         catch (Exception error) { App.TraceSmoke($"Command profile loading: {error.Message}"); }
         var input = new TextBox { PlaceholderText = "Search commands and panes" };
@@ -387,7 +402,7 @@ public sealed partial class MainWindow : Window
             TextAlignment = TextAlignment.Center,
             HorizontalAlignment = HorizontalAlignment.Center,
         });
-        if (ViewModel.Status != "Connected")
+        if (ViewModel.Status is not ("Connected" or "Connecting"))
         {
             // A missing or unreachable workspace must not leave a dead end:
             // offer the picker right where the message is.
@@ -465,17 +480,26 @@ public sealed partial class MainWindow : Window
 
     private async Task ChooseWorkspaceAsync()
     {
-        var picker = new FolderPicker
+        // Reached from async-void handlers: an exception here would end the
+        // app (the folder picker is known to throw in an elevated process).
+        try
         {
-            SuggestedStartLocation = PickerLocationId.ComputerFolder,
-            CommitButtonText = "Open workspace",
-        };
-        picker.FileTypeFilter.Add("*");
-        WinRT.Interop.InitializeWithWindow.Initialize(
-            picker,
-            WinRT.Interop.WindowNative.GetWindowHandle(this));
-        var folder = await picker.PickSingleFolderAsync();
-        if (folder is not null) await ViewModel.ConnectAsync(folder.Path);
+            var picker = new FolderPicker
+            {
+                SuggestedStartLocation = PickerLocationId.ComputerFolder,
+                CommitButtonText = "Open workspace",
+            };
+            picker.FileTypeFilter.Add("*");
+            WinRT.Interop.InitializeWithWindow.Initialize(
+                picker,
+                WinRT.Interop.WindowNative.GetWindowHandle(this));
+            var folder = await picker.PickSingleFolderAsync();
+            if (folder is not null) await ViewModel.ConnectAsync(folder.Path);
+        }
+        catch (Exception error)
+        {
+            ViewModel.ReportError($"The workspace picker could not open: {error.Message}");
+        }
     }
 
     private async void Settings_Click(object sender, RoutedEventArgs e) =>

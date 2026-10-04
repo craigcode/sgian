@@ -52,7 +52,10 @@ internal static class WorkspaceSettingsDialog
             {
                 if (item is null) continue;
                 var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
-                row.Children.Add(new TextBlock { Text = $"{item["name"]?.GetValue<string>()} · {item["kind"]?.GetValue<string>()}", VerticalAlignment = VerticalAlignment.Center });
+                // The daemon omits an unset kind; infer it as the daemon does and name the backend.
+                var rowBackend = item["agent_backend"]?.GetValue<string>();
+                var rowIsAgent = WorkspaceStartup.IsAgentProfile(item["kind"]?.GetValue<string>(), rowBackend, item["agent_model"]?.GetValue<string>());
+                row.Children.Add(new TextBlock { Text = $"{item["name"]?.GetValue<string>()} · {(rowIsAgent ? $"agent ({rowBackend ?? "claude"})" : "shell")}", VerticalAlignment = VerticalAlignment.Center });
                 var remove = new Button { Content = "Remove" };
                 remove.Click += (_, _) => { profiles.Remove(item); RefreshProfiles(); };
                 row.Children.Add(remove); profileList.Children.Add(row);

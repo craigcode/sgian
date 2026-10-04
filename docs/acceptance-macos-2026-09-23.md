@@ -104,11 +104,22 @@ in a daemon pane, and the native client attached afterwards.
   badge from a hook and the `hook.received` ledger record still rest on
   the unit tests.
 
-Two notes for anyone scripting a pass with `ctl send`. A line is submitted
-only when the text contains a newline. Claude Code's input treats a burst
-of text ending in a carriage return as a paste and keeps the newline in the
-box, so send the text and then a separate `send --raw $'\r'`; the shell
-prompt has no such rule.
+A later session (2026-10-04) exercised the two paths left open above. In a
+session started with `--permission-mode default`, asking Claude to run the
+tests raised a permission prompt: the pane went to needs input and the
+ledger recorded `hook.received` for the `permission_prompt` notification,
+"Claude needs your permission". A minute of idleness produced the
+`idle_prompt` notification the same way. Every lane has now been seen
+working end to end.
+
+One note for anyone scripting a pass with `ctl send`: it does not add Enter
+for you. End the text with the `\n` escape, or with a real line feed, and
+it is sent as a carriage return, which is what both a shell and Claude
+Code's input treat as submit. An earlier version of this note blamed paste
+detection for a prompt that sat unsubmitted; the real causes were a literal
+line feed, which `ctl send` then passed through unchanged and which Claude
+reads as a new line, and separately a login refresh that several Claude
+Code processes started at once had collided on.
 
 ## Procedure
 
