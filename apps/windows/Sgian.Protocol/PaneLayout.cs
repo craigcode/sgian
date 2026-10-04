@@ -17,9 +17,9 @@ public sealed record PaneLayout
 
     public static double Clamp(double ratio) => double.IsFinite(ratio) ? Math.Clamp(ratio, 0.18, 0.82) : 0.5;
     public static PaneLayout Leaf(string id) => new() { Id = id };
-    public static PaneLayout Join(PaneLayout first, PaneLayout second, string direction) => new()
+    public static PaneLayout Join(PaneLayout first, PaneLayout second, string direction, double ratio = 0.5) => new()
     {
-        Type = "split", Id = $"split-{Guid.NewGuid()}", Direction = direction, First = first, Second = second,
+        Type = "split", Id = $"split-{Guid.NewGuid()}", Direction = direction, Ratio = Clamp(ratio), First = first, Second = second,
     };
 
     public static PaneLayout? Parse(JsonElement? value, int depth = 0)
@@ -47,7 +47,10 @@ public sealed record PaneLayout
         foreach (var stale in tree?.PaneIds.Except(ids).ToArray() ?? []) tree = tree?.Remove(stale);
         foreach (var id in ids)
             if (tree is null) tree = Leaf(id);
-            else if (!tree.PaneIds.Contains(id)) tree = Join(tree, Leaf(id), "row");
+            // A pane this client did not place joins weighted by pane count so
+            // every pane ends up the same width; a fixed half would halve
+            // everything placed before it.
+            else if (!tree.PaneIds.Contains(id)) tree = Join(tree, Leaf(id), "row", tree.PaneIds.Count / (tree.PaneIds.Count + 1.0));
         return tree;
     }
 

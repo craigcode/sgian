@@ -41,14 +41,21 @@ indirect enum PaneLayout: Equatable {
         let live = Set(paneIDs)
         var tree = layout
         for id in layout?.paneIDs ?? [] where !live.contains(id) { tree = tree?.removing(id) }
+        // A pane this client did not place (created by `ctl`, Kranz or
+        // another client) joins the existing layout weighted by pane count,
+        // so every pane ends up the same width. A fixed half would give the
+        // newest pane half the window and halve everything placed before it.
         for id in paneIDs where !(tree?.paneIDs.contains(id) ?? false) {
-            tree = tree.map { joined($0, .leaf(id), direction: "row") } ?? .leaf(id)
+            tree = tree.map {
+                let existing = Double($0.paneIDs.count)
+                return joined($0, .leaf(id), direction: "row", ratio: existing / (existing + 1))
+            } ?? .leaf(id)
         }
         return tree
     }
 
-    static func joined(_ first: PaneLayout, _ second: PaneLayout, direction: String) -> PaneLayout {
-        .split(id: "split-\(UUID().uuidString)", direction: direction, ratio: 0.5, first: first, second: second)
+    static func joined(_ first: PaneLayout, _ second: PaneLayout, direction: String, ratio: Double = 0.5) -> PaneLayout {
+        .split(id: "split-\(UUID().uuidString)", direction: direction, ratio: clamp(ratio), first: first, second: second)
     }
 
     func inserting(_ paneID: String, beside anchor: String?, direction: String) -> PaneLayout {

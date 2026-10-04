@@ -190,6 +190,27 @@ static void WorkspaceStartupResolution()
     Equal(@"C:\x", WorkspaceStartup.Resolve(null, @"C:\w\gone", new[] { @"C:\w\gone" }, @"C:\x", @"C:\", @"C:\Users\me", exists));
     Equal(@"C:\Users\me", WorkspaceStartup.Resolve(null, null, null, @"C:\", @"C:\", @"C:\Users\me", exists));
     Equal(@"C:\x", WorkspaceStartup.Resolve("", null, null, @"C:\x", @"C:\", @"C:\Users\me", exists));
+    // A Start-menu or packaged launch starts in the system or install directory: not a project.
+    var nowhere = new[] { @"C:\Windows\System32", @"C:\Windows", @"C:\Program Files\WindowsApps\Sgian\", null };
+    Equal(@"C:\Users\me", WorkspaceStartup.Resolve(null, null, null, @"C:\Windows\System32", @"C:\", @"C:\Users\me", exists, nowhere));
+    Equal(@"C:\Users\me", WorkspaceStartup.Resolve(null, null, null, @"C:\WINDOWS\system32\wbem", @"C:\", @"C:\Users\me", exists, nowhere));
+    Equal(@"C:\Users\me", WorkspaceStartup.Resolve(null, null, null, @"C:\Program Files\WindowsApps\Sgian", @"C:\", @"C:\Users\me", exists, nowhere));
+    Equal(@"C:\WindowsApps", WorkspaceStartup.Resolve(null, null, null, @"C:\WindowsApps", @"C:\", @"C:\Users\me", exists, nowhere));
+    Equal(@"C:\w\alive", WorkspaceStartup.Resolve(null, @"C:\w\alive", null, @"C:\Windows\System32", @"C:\", @"C:\Users\me", exists, nowhere));
+
+    Equal(true, WorkspaceStartup.IsAgentProfile("agent", "droid", null));
+    Equal(true, WorkspaceStartup.IsAgentProfile(null, null, "m1"));
+    Equal(true, WorkspaceStartup.IsAgentProfile(null, "claude", null));
+    Equal(false, WorkspaceStartup.IsAgentProfile("shell", "claude", "m1"));
+    Equal(false, WorkspaceStartup.IsAgentProfile(null, null, null));
+
+    // Panes placed by others share the width evenly instead of halving what came before.
+    var four = PaneLayout.Reconcile(null, new[] { "a", "b", "c", "d" })!;
+    static Dictionary<string, double> Widths(PaneLayout node, double share) => node.IsLeaf
+        ? new() { [node.Id] = share }
+        : Widths(node.First!, share * node.Ratio).Concat(Widths(node.Second!, share * (1 - node.Ratio))).ToDictionary(pair => pair.Key, pair => pair.Value);
+    foreach (var share in Widths(four, 1).Values) Equal(true, Math.Abs(share - 0.25) < 0.001);
+    Equal(0.5, PaneLayout.Join(PaneLayout.Leaf("x"), PaneLayout.Leaf("y"), "column").Ratio);
 }
 
 static void OutputWarningSample()

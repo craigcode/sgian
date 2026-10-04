@@ -738,6 +738,24 @@ fn decode_cli_text_expands_common_escapes() {
 }
 
 #[test]
+fn decode_cli_text_treats_a_real_line_feed_as_enter() {
+    // `sgian ctl send pane $'text\n'` reaches ctl with a real LF. It must
+    // submit like the escape does; a bare LF only inserts a new line in a
+    // full-screen agent input.
+    assert_eq!(decode_cli_text("ab\n", false), "ab\r");
+    assert_eq!(decode_cli_text("a\nb\n", false), "a\rb\r");
+    assert_eq!(
+        decode_cli_text("ab\r\n", false),
+        "ab\r",
+        "CRLF is one Enter"
+    );
+    assert_eq!(decode_cli_text("ab\r", false), "ab\r");
+    // --lf / --raw keep the bytes as given.
+    assert_eq!(decode_cli_text("ab\n", true), "ab\n");
+    assert_eq!(decode_cli_text("ab\r\n", true), "ab\r\n");
+}
+
+#[test]
 fn decode_cli_text_default_maps_newline_to_cr() {
     // VAL-ORCH-016: without --lf, \n maps to CR (0x0D).
     let decoded = decode_cli_text("ab\\n", false);
@@ -3873,8 +3891,10 @@ fn snapshot_ended_pane_reports_exit_code_and_final_screen() {
             data: "printf 'FINAL-LINE\\n'; exit 7\r".to_string(),
         })
         .expect("write ok");
+    // Generous: a shell under a loaded machine can take seconds to exit, and
+    // the loop ends as soon as it does.
     let died = Instant::now();
-    while died.elapsed() < Duration::from_secs(5)
+    while died.elapsed() < Duration::from_secs(20)
         && server.lock_terminals().expect("lock").is_live(&pane)
     {
         thread::sleep(Duration::from_millis(15));

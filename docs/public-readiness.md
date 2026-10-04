@@ -51,9 +51,12 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
       full-screen TUI in the packaged app through splits and resizes; the
       lease dialog, unattended badge and project views exercised by a person.
       CI compiles the WinUI client; nobody has used these screens on it.
-- [ ] **macOS architecture scope decided**: the workflow ships
-      runner-architecture builds; the runbook promises a universal DMG. Make
-      the workflow match the decision.
+- [x] **macOS architecture scope decided: universal.** One app covers Apple
+      Silicon and Intel. The release workflow already builds with
+      `SGIAN_MAC_ARCH=universal` (only the per-push validation job builds for
+      the runner's architecture), and a local universal build on 2026-10-04
+      produced a client and a bundled helper that both carry `x86_64` and
+      `arm64` slices. The Intel slice has not been run on Intel hardware.
 - [x] Rust, vitest, Swift and Windows protocol tests green on every job for
       every merged pull request; RustSec and npm audits are gates.
 - [x] Output-flood, process-tree kill, IPC fault and transport soak

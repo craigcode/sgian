@@ -26,3 +26,24 @@ import Testing
     #expect(PaneLayout.clamp(.nan) == 0.5)
     #expect(tree.resizing(tree.json["id"]!.stringValue!, ratio: 100).json["ratio"]?.numberValue == 0.82)
 }
+
+@Test func panesPlacedByOthersShareTheWidthEvenly() throws {
+    // Four panes created outside the client (ctl, Kranz): each column must
+    // end up a quarter of the width, not 1/8, 1/8, 1/4, 1/2.
+    let tree = try #require(PaneLayout.reconcile(nil, paneIDs: ["a", "b", "c", "d"]))
+    func widths(_ node: PaneLayout, _ share: Double) -> [String: Double] {
+        switch node {
+        case let .leaf(id): return [id: share]
+        case let .split(_, _, ratio, first, second):
+            return widths(first, share * ratio).merging(widths(second, share * (1 - ratio))) { a, _ in a }
+        }
+    }
+    let shares = widths(tree, 1)
+    #expect(shares.count == 4)
+    for (_, share) in shares { #expect(abs(share - 0.25) < 0.001) }
+    // One more pane arriving later joins at a fifth.
+    let five = try #require(PaneLayout.reconcile(tree, paneIDs: ["a", "b", "c", "d", "e"]))
+    #expect(abs((widths(five, 1)["e"] ?? 0) - 0.2) < 0.001)
+    // A pane the person split by hand keeps the half it was given.
+    if case let .split(_, _, ratio, _, _) = PaneLayout.joined(.leaf("x"), .leaf("y"), direction: "column") { #expect(ratio == 0.5) }
+}

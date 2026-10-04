@@ -5073,8 +5073,21 @@ pub(crate) fn match_pane_ref(list: &PaneList, pane_ref: &str) -> Result<String, 
 /// `\r` always maps to CR in both modes.
 pub(crate) fn decode_cli_text(input: &str, literal_lf: bool) -> String {
     let mut output = String::new();
-    let mut chars = input.chars();
+    let mut chars = input.chars().peekable();
     while let Some(char) = chars.next() {
+        // A real line feed means Enter exactly as the `\n` escape does, so a
+        // shell-quoted `$'text\n'` submits the line. Only the carriage return
+        // does that for a full-screen agent input such as Claude Code's, where
+        // a bare LF inserts a new line. CRLF is one Enter, not two.
+        if !literal_lf && char == '\n' {
+            output.push('\r');
+            continue;
+        }
+        if !literal_lf && char == '\r' && chars.peek() == Some(&'\n') {
+            chars.next();
+            output.push('\r');
+            continue;
+        }
         if char != '\\' {
             output.push(char);
             continue;
