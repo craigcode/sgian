@@ -10,6 +10,16 @@ on you. A scriptable `ctl` command, keyboard leases with a hash-chained ledger
 and per-client credentials make it a place to run several agents at once
 without losing track of who typed what.
 
+![The macOS client with two Claude Code agents side by side. One has finished and is marked unattended with the keyboard lease held; the other is waiting on a permission prompt. The sidebar shows the project and its attention roll-up.](docs/images/two-agents.png)
+
+*Two Claude Code agents in one workspace: one running unattended with the
+keyboard held, one waiting on a permission prompt, and the roll-up in the
+sidebar.*
+
+<img src="docs/images/phone-overview.png" alt="The session overview in the served web view at phone width: the project roll-up, then a card per pane with its agent state, keyboard holder and usage." width="340">
+
+*The same session from a phone, through `sgian ctl serve` over an SSH tunnel.*
+
 ## Install
 
 0.1.0 is a source release: build it yourself, on macOS 13+, Windows 10

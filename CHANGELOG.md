@@ -5,6 +5,11 @@ follow SemVer once the first public tag exists.
 
 ## Unreleased
 
+### Project
+
+- The README shows the macOS client and the served phone view, captured
+  from a real session with two Claude Code agents.
+
 ### Fixes
 
 - `ctl send` treats a real line feed in the text as Enter, like the `\n`
