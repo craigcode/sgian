@@ -105,15 +105,21 @@ walks through obtaining each credential below. The environment needs:
 | `APPLE_API_KEY`, `APPLE_API_ISSUER` | Notary API identifiers |
 | `SPARKLE_PRIVATE_KEY` | Sparkle Ed25519 private key exported as base64 text |
 | **Variable** `SPARKLE_PUBLIC_KEY` | Corresponding 32-byte public key, base64 |
-| `WINDOWS_CERTIFICATE` | Base64 Windows Authenticode PFX |
+| `WINDOWS_CERTIFICATE` | Base64 Windows Authenticode PFX (the PFX signing path) |
 | `WINDOWS_CERTIFICATE_PASSWORD` | PFX password |
+| `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | Azure Trusted Signing path instead of a PFX: the app registration the workflow logs in as, through OIDC |
+| **Variables** `TRUSTED_SIGNING_ENDPOINT`, `TRUSTED_SIGNING_ACCOUNT`, `TRUSTED_SIGNING_PROFILE`, `WINDOWS_PUBLISHER` | Trusted Signing endpoint, account and certificate profile, and the certificate subject the MSIX publisher must equal |
 | `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Existing Linux updater signing key |
 
 Keep signing keys in their protected secret store and retain secure backups.
-Do not paste them into an issue or PR. The Windows builder derives the package
-Publisher from the certificate, stamps the package version, signs the daemon
-and portable app, creates and verifies the signed MSIX, and restores the source
-manifest afterward. It removes only certificates imported by that build.
+Do not paste them into an issue or PR. The Windows job uses the PFX when
+`WINDOWS_CERTIFICATE` is set and Azure Trusted Signing otherwise. With a PFX
+the builder derives the package Publisher from the certificate and MSBuild
+signs the MSIX; with Trusted Signing the Publisher comes from the
+`WINDOWS_PUBLISHER` variable and the MSIX is signed after packaging through
+signtool's plug-in. Either way it stamps the package version, signs the daemon
+and portable app, verifies the MSIX, and restores the source manifest
+afterward. It removes only certificates imported by that build.
 
 ## Create a candidate
 

@@ -116,6 +116,9 @@ jobs:
     needs: validation
     runs-on: windows-latest
     environment: native-release
+    permissions:
+      contents: read
+      id-token: write # azure/login OIDC, used only on the Trusted Signing path
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
@@ -125,18 +128,52 @@ jobs:
         with:
           toolchain: 1.94.0
       - run: node scripts/verify-release-config.mjs
+      # Two signing paths. A PFX certificate (WINDOWS_CERTIFICATE) is used when
+      # present; otherwise Azure Trusted Signing, which keeps the key in
+      # Microsoft's service and signs through signtool's plug-in with the
+      # OIDC identity below. Secrets cannot appear in `if`, so a step decides.
+      - name: Choose the signing path
+        id: signing
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        run: |
+          if ($env:WINDOWS_CERTIFICATE) { "mode=pfx" >> $env:GITHUB_OUTPUT }
+          elseif ($env:AZURE_CLIENT_ID) { "mode=trusted" >> $env:GITHUB_OUTPUT }
+          else { throw "Neither WINDOWS_CERTIFICATE nor the Azure Trusted Signing secrets are set" }
       - name: Prepare Windows certificate
+        if: steps.signing.outputs.mode == 'pfx'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
         run: |
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP/native-signing.pfx", [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+      - name: Log in to Azure for Trusted Signing
+        if: steps.signing.outputs.mode == 'trusted'
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Install the Trusted Signing signtool plug-in
+        if: steps.signing.outputs.mode == 'trusted'
+        shell: pwsh
+        run: |
+          nuget install Microsoft.Trusted.Signing.Client -Version 1.0.95 -x -OutputDirectory "$env:RUNNER_TEMP/trusted-signing"
+          $dlib = Get-ChildItem "$env:RUNNER_TEMP/trusted-signing" -Recurse -Filter Azure.CodeSigning.Dlib.dll | Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1
+          if (-not $dlib) { throw "Azure.CodeSigning.Dlib.dll (x64) not found in the package" }
+          "SGIAN_TRUSTED_SIGNING_DLIB=$($dlib.FullName)" >> $env:GITHUB_ENV
       - name: Build and verify signed native Windows package
         shell: pwsh
         env:
           SGIAN_WINDOWS_CERTIFICATE_PATH: ${{ runner.temp }}/native-signing.pfx
           SGIAN_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: ./scripts/build-windows-native.ps1 -ReleaseSigning
+          SGIAN_TRUSTED_SIGNING_ENDPOINT: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
+          SGIAN_TRUSTED_SIGNING_ACCOUNT: ${{ vars.TRUSTED_SIGNING_ACCOUNT }}
+          SGIAN_TRUSTED_SIGNING_PROFILE: ${{ vars.TRUSTED_SIGNING_PROFILE }}
+          SGIAN_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER }}
+        run: ./scripts/build-windows-native.ps1 -ReleaseSigning -SigningMode ${{ steps.signing.outputs.mode }}
       - name: Remove certificate file
         if: always()
         shell: pwsh

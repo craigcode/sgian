@@ -11,6 +11,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_call:
+  # Weekly on main as well, so a dependency advisory published between
+  # pushes fails here (cargo audit, npm audit) and reaches the owner as a
+  # failed run instead of waiting for the next change to find it.
+  schedule:
+    - cron: '17 6 * * 1'
 
 # Serialize repeated runs of a ref; never cancel in-progress signing.
 concurrency:
