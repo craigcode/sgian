@@ -51,6 +51,27 @@ the Rust helper. `SGIAN_BUILD_CONFIGURATION=debug` selects a development build.
 The builder embeds Sparkle, its nested helpers, resources and licenses, then
 signs nested code before the outer app. Versions come from `package.json`.
 
+The packaging step can be rehearsed without Apple credentials:
+
+```sh
+SGIAN_MAC_ARCH=universal SGIAN_SPARKLE_PUBLIC_KEY=<throwaway public key> scripts/build-macos-native.sh
+SGIAN_PACKAGE_REHEARSAL=1 SGIAN_SPARKLE_PRIVATE_KEY_FILE=<throwaway key file> scripts/package-macos-native.sh
+```
+
+A rehearsal runs the bundle checks, builds the DMG, generates the Sparkle
+appcast and verifies the archive against the embedded public key with a
+throwaway Ed25519 key pair, with ad-hoc signing and no notarization. Its
+output lands in `apps/macos/build/rehearsal`, which the release workflow
+never uploads from, and nothing in it may be published. Use a throwaway
+key pair, never the release key: `generate_keys --account sgian-rehearsal
+-x <file>` from Sparkle's `bin` directory makes one under its own keychain
+account and exports it. To make one outside the keychain instead, the file
+Sparkle reads is the base64 of 96 bytes: the 64-byte private key in the
+form its bundled Ed25519 library uses (SHA-512 of the 32-byte seed, clamped,
+with the second half as the prefix) followed by the 32-byte public key. A
+file holding the raw seed signs with the wrong key and fails the
+verification step, which is the check working as intended.
+
 On Windows with Rust, Node 22, .NET 8 and the Windows SDK:
 
 ```powershell

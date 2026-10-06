@@ -9,6 +9,11 @@ follow SemVer once the first public tag exists.
 
 - The README shows the macOS client and the served phone view, captured
   from a real session with two Claude Code agents.
+- `scripts/package-macos-native.sh` gains a rehearsal mode
+  (`SGIAN_PACKAGE_REHEARSAL=1`) that runs the bundle checks, the DMG, the
+  Sparkle appcast and its verification with ad-hoc signing and no
+  notarization, writing under `build/rehearsal`; the first run proved the
+  pipeline end to end before any signing credential exists.
 
 ### Fixes
 

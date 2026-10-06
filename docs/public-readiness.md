@@ -65,7 +65,11 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
 ## Signing and updates
 
 0.1.0 ships as source, so nothing in this section gates it. Every item here
-gates the first release that carries installers.
+gates the first release that carries installers. The macOS packaging path
+was rehearsed locally on 2026-10-05 with `SGIAN_PACKAGE_REHEARSAL=1` and a
+throwaway Sparkle key: universal bundle checks, DMG, appcast and the
+independent signature check all passed, so only notarization and the
+installed acceptance below remain unexercised on that platform.
 
 - [ ] The 11 repository secrets and the `SPARKLE_PUBLIC_KEY` variable named
       in `native-release.md` are provisioned. As of 2026-09-16 the
