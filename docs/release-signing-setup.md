@@ -201,10 +201,9 @@ gives you. The workflow as written imports a PFX. Three ways through:
   by an authority that still offers an exportable key. Use it as is.
 - **Azure Trusted Signing**, Microsoft's cloud signing service. No PFX
   exists; `signtool` signs through a plug-in with an Azure identity. This is
-  the cheapest and least fragile path for a new project, but it needs an
-  Azure subscription, an identity validation that takes a few days, and a
-  change to the Windows job of the workflow, which is a small piece of work
-  I can do once you have the account.
+  the cheapest and least fragile path for a new project. It needs an Azure
+  subscription and an identity validation that takes a few days. The
+  workflow already carries this path; the steps are below.
 - **A certificate on a hardware token** cannot be used by a GitHub-hosted
   runner at all; it needs a self-hosted Windows runner with the token
   attached.
@@ -224,6 +223,46 @@ gh secret set WINDOWS_CERTIFICATE_PASSWORD --env native-release
 Remove-Item cert.pfx.b64
 ```
 
+The workflow uses the PFX whenever `WINDOWS_CERTIFICATE` is set, so leave
+that secret unset if you take the Trusted Signing path.
+
+### Azure Trusted Signing
+
+1. In the Azure portal create a **Trusted Signing account** (the East US or
+   West Europe regions offer it; the Basic tier is enough). Note its
+   account name and its endpoint URL, which looks like
+   `https://eus.codesigning.azure.net/`.
+2. Under the account, complete an **identity validation** as an individual
+   or an organization. This is the part that takes days, and the validated
+   name becomes the certificate subject.
+3. Create a **certificate profile** of type Public Trust bound to that
+   validation. Its subject, as shown on the profile, is the exact string
+   for the `WINDOWS_PUBLISHER` variable, for example
+   `CN=Craig Martin, O=Craig Martin, L=…, S=…, C=GB`.
+4. Create an **app registration** for GitHub Actions and give it a
+   federated credential: issuer `https://token.actions.githubusercontent.com`,
+   subject `repo:craigcode/sgian:environment:native-release`, audience
+   `api://AzureADTokenExchange`. No client secret is needed; the workflow
+   logs in with a short-lived OIDC token.
+5. On the Trusted Signing account, assign that app registration the role
+   **Trusted Signing Certificate Profile Signer**.
+6. Set the values:
+
+   ```bash
+   gh secret set AZURE_CLIENT_ID --env native-release
+   gh secret set AZURE_TENANT_ID --env native-release
+   gh secret set AZURE_SUBSCRIPTION_ID --env native-release
+   gh variable set TRUSTED_SIGNING_ENDPOINT --env native-release --body "https://eus.codesigning.azure.net/"
+   gh variable set TRUSTED_SIGNING_ACCOUNT --env native-release --body "<account name>"
+   gh variable set TRUSTED_SIGNING_PROFILE --env native-release --body "<profile name>"
+   gh variable set WINDOWS_PUBLISHER --env native-release --body "CN=…"
+   ```
+
+The Windows job then logs in to Azure, installs Microsoft's signtool
+plug-in, signs the daemon, the app binaries and the MSIX through it, and
+verifies the MSIX. This path has been written against Microsoft's documented
+procedure but has not run yet; its first run is the first candidate.
+
 ## 6. Check, then rehearse, then run
 
 ```bash
@@ -231,7 +270,9 @@ gh secret list --env native-release
 gh variable list --env native-release
 ```
 
-Eleven secrets and one variable. Then, before dispatching the workflow, run
+Eleven secrets and one variable on the PFX path; on the Trusted Signing
+path, twelve secrets and five variables, with the two PFX secrets left
+unset. Then, before dispatching the workflow, run
 the macOS packaging rehearsal from `native-release.md` once more with your
 real Sparkle public key in the build and a throwaway private key in the
 rehearsal. It costs nothing and proves the embedded public key is the one

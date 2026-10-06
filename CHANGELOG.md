@@ -9,6 +9,12 @@ follow SemVer once the first public tag exists.
 
 - The README shows the macOS client and the served phone view, captured
   from a real session with two Claude Code agents.
+- The Windows release job can sign through Azure Trusted Signing when no
+  PFX certificate is set: it logs in with an OIDC identity, installs
+  Microsoft's signtool plug-in, takes the MSIX publisher from a variable
+  and signs the package after building it. The PFX path is unchanged.
+  CI also runs weekly on `main`, so a dependency advisory published between
+  pushes fails a run instead of waiting for the next change.
 - `docs/release-signing-setup.md`: a step-by-step for obtaining the
   eleven signing secrets and the Sparkle public key, including the
   Windows certificate decision the workflow's PFX import now forces.
