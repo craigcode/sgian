@@ -9,6 +9,9 @@ follow SemVer once the first public tag exists.
 
 - The README shows the macOS client and the served phone view, captured
   from a real session with two Claude Code agents.
+- `docs/release-signing-setup.md`: a step-by-step for obtaining the
+  eleven signing secrets and the Sparkle public key, including the
+  Windows certificate decision the workflow's PFX import now forces.
 - `scripts/package-macos-native.sh` gains a rehearsal mode
   (`SGIAN_PACKAGE_REHEARSAL=1`) that runs the bundle checks, the DMG, the
   Sparkle appcast and its verification with ad-hoc signing and no
