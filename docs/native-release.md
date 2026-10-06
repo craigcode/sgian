@@ -93,7 +93,8 @@ replace real provider-TUI, accessibility or installed-update acceptance.
 ## Signing configuration
 
 Configure a protected GitHub Actions environment named `native-release` and
-restrict it to the protected `main` branch. The environment needs:
+restrict it to the protected `main` branch. `release-signing-setup.md`
+walks through obtaining each credential below. The environment needs:
 
 | Secret / variable | Purpose |
 | --- | --- |

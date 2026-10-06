@@ -72,8 +72,11 @@ independent signature check all passed, so only notarization and the
 installed acceptance below remain unexercised on that platform.
 
 - [ ] The 11 repository secrets and the `SPARKLE_PUBLIC_KEY` variable named
-      in `native-release.md` are provisioned. As of 2026-09-16 the
-      repository has **zero** secrets and variables.
+      in `native-release.md` are provisioned; `release-signing-setup.md` is
+      the walk-through. As of 2026-10-06 the repository has **zero**
+      secrets and variables. The Windows certificate needs a decision
+      first: a new certificate no longer comes as an exportable PFX, which
+      is what the workflow imports.
 - [ ] A candidate built by the manual workflow from protected `main`
       installs on clean macOS, Windows and Linux hosts.
 - [ ] A second candidate updates an installed first candidate (Sparkle on
