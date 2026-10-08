@@ -26,6 +26,11 @@ follow SemVer once the first public tag exists.
 
 ### Fixes
 
+- The vendored `portable-pty` fork drops its serial-port module and with it
+  the `serial` crate, unmaintained since 2017; Sgian never opened serial
+  ports. `.cargo/audit.toml` records the two advisories that remain
+  accepted on purpose, each with its reason and removal condition, so a
+  new audit warning fails CI instead of joining a known list.
 - `ctl send` treats a real line feed in the text as Enter, like the `\n`
   escape, so `sgian ctl send pane $'text\n'` submits to a shell and to a
   full-screen agent input alike; `--lf` and `--raw` still send it as given.
