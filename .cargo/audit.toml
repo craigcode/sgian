@@ -1,0 +1,19 @@
+# cargo-audit configuration. CI runs `cargo audit --file src-tauri/Cargo.lock`
+# from the repository root, which reads this file; run it the same way locally.
+#
+# Every advisory listed here is accepted deliberately, with the reason and the
+# condition for removing the entry. Anything not listed fails the audit.
+[advisories]
+ignore = [
+  # proc-macro-error is unmaintained. It reaches the build only on Linux,
+  # through glib-macros 0.18, which glib 0.18 requires, which GTK3 requires,
+  # which Tauri 2 requires. Nothing in this repository calls it. Remove this
+  # entry when Tauri builds on GTK4 / glib 0.20, where glib-macros no longer
+  # depends on it.
+  "RUSTSEC-2024-0370",
+  # glib 0.18.5 VariantStrIter unsoundness. The declared version is flagged,
+  # but the build uses the vendored copy at src-tauri/vendor/glib, which
+  # carries upstream's fix (see its SGIAN-PATCH.md). Remove this entry with
+  # that vendored patch.
+  "RUSTSEC-2024-0429",
+]

@@ -38,7 +38,9 @@ The four required checks on `main` are the ones to run locally:
    `cargo test --locked`; from the repo root, `npm test`,
    `npm run release:check`, `python3 scripts/test-native-release.py` and
    `node --test scripts/test-native-terminal.mjs`. The same job runs
-   `cargo audit`, `npm audit --audit-level=moderate` and the secret scan
+   `cargo audit --file src-tauri/Cargo.lock` from the repository root (so
+   it reads `.cargo/audit.toml`, where every accepted advisory carries its
+   reason), `npm audit --audit-level=moderate` and the secret scan
    (`scripts/audit-public-history.sh`, which needs `gitleaks`).
 2. `build app bundle`: the Tauri `.app` plus the native macOS app, each
    launched against a temporary daemon.
