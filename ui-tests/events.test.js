@@ -667,7 +667,7 @@ describe("output warnings and projects", () => {
       callbacks,
     );
     expect(state.outputWarnings.get("pane-1")).toEqual({
-      counts: { conceal: 1, clipboard: 0, hyperlink_mismatch: 0, string_controls: 0, c1_controls: 0 },
+      counts: { conceal: 1, clipboard: 0, hyperlink_mismatch: 0, string_controls: 0, c1_controls: 0, invisible: 0 },
       total: 1,
     });
     expect(callbacks.calls.render).toBe(1);

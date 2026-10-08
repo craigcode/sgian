@@ -231,9 +231,12 @@ Open, in order:
 
 - **Execution grants** (`docs/design/execution-grants.md`): the Sgian half
   once `kranz-acp` and Kranz's `TerminalProvider` seam exist.
-- **Output-guard stripping for agent panes**, and per-project shared
-  context notes under git. The badges and project rendering the native
-  clients were missing shipped in #29.
+- **Per-project shared context notes under git.** The output-guard
+  stripping for agent panes shipped: the daemon scrubs every string in a
+  normalized agent event before it is logged or shown, dropping escape
+  sequences and controls, and counting SGR 8, OSC 52, mismatched links,
+  opaque strings and the bidi and zero-width characters that reorder or
+  hide text (`invisible`), against the pane like a shell pane's output.
 - **M5 SSM / ECS Exec target**: needs an AWS host to test against.
 - **Hands-on acceptance on a phone**: the served view over `ssh -L` from a
   real device (the phone-width layout was checked in a desktop browser at

@@ -225,6 +225,9 @@ static void OutputWarningSample()
     Equal("APC \"Ga=T,f=100;iVBOR\"", warnings["p1"].Sample);
     Equal("p2", ProjectBoard.ApplyWarning(Json("""{"pane_id":"p2","total":{"conceal":1}}"""), warnings));
     Equal(null, warnings["p2"].Sample);
+    var agent = JsonSerializer.Deserialize<OutputTricks>("""{"invisible":3,"conceal":1}""")!;
+    Equal(4, agent.Total);
+    Equal("1 concealed text, 3 invisible characters", agent.Summary);
 }
 
 static void KeyboardLease()

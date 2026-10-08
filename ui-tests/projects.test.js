@@ -64,7 +64,7 @@ describe("output warning normalization", () => {
   it("keeps the daemon's counters and drops empty or malformed entries", () => {
     const warning = normalizeOutputWarning({ conceal: 2, clipboard: 1, bogus: 9 });
     expect(warning).toEqual({
-      counts: { conceal: 2, clipboard: 1, hyperlink_mismatch: 0, string_controls: 0, c1_controls: 0 },
+      counts: { conceal: 2, clipboard: 1, hyperlink_mismatch: 0, string_controls: 0, c1_controls: 0, invisible: 0 },
       total: 3,
     });
     expect(normalizeOutputWarning({ conceal: 0 })).toBeNull();
@@ -80,6 +80,10 @@ describe("output warning normalization", () => {
   it("summarises the non-zero counters in display order", () => {
     expect(outputWarningSummary(normalizeOutputWarning({ c1_controls: 1, conceal: 2 }))).toBe(
       "2 concealed text, 1 C1 controls",
+    );
+    // The agent-pane counter from a newer daemon reads as the last entry.
+    expect(outputWarningSummary(normalizeOutputWarning({ invisible: 3, conceal: 1 }))).toBe(
+      "1 concealed text, 3 invisible characters",
     );
     expect(outputWarningSummary(null)).toBe("");
   });

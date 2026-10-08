@@ -157,6 +157,13 @@ pub struct OutputTricks {
     /// Raw C1 control characters (U+0080..U+009F) in the text stream.
     #[serde(default)]
     pub c1_controls: u32,
+    /// Characters that hide or reorder text without being seen: bidi
+    /// overrides and isolates (the "Trojan Source" set), zero-width spaces
+    /// and joiners that carry no script, and a byte-order mark inside text.
+    /// Counted in agent-pane text, where no emulator stands between the
+    /// agent and the person.
+    #[serde(default)]
+    pub invisible: u32,
 }
 
 impl OutputTricks {
@@ -166,6 +173,7 @@ impl OutputTricks {
             + self.hyperlink_mismatch
             + self.string_controls
             + self.c1_controls
+            + self.invisible
     }
 
     pub(crate) fn add(&mut self, other: &OutputTricks) {
@@ -176,6 +184,7 @@ impl OutputTricks {
             .saturating_add(other.hyperlink_mismatch);
         self.string_controls = self.string_controls.saturating_add(other.string_controls);
         self.c1_controls = self.c1_controls.saturating_add(other.c1_controls);
+        self.invisible = self.invisible.saturating_add(other.invisible);
     }
 
     pub(crate) fn minus(&self, other: &OutputTricks) -> OutputTricks {
@@ -187,8 +196,100 @@ impl OutputTricks {
                 .saturating_sub(other.hyperlink_mismatch),
             string_controls: self.string_controls.saturating_sub(other.string_controls),
             c1_controls: self.c1_controls.saturating_sub(other.c1_controls),
+            invisible: self.invisible.saturating_sub(other.invisible),
         }
     }
+}
+
+/// True for a character that can hide or reorder text in a chat view: the
+/// bidi overrides and isolates (U+202A..U+202E, U+2066..U+2069), the
+/// zero-width space, word joiner and invisible operators (U+200B, U+2060..
+/// U+2064) and a byte-order mark (U+FEFF). The zero-width joiner and
+/// non-joiner are not included: emoji sequences and several scripts need
+/// them, and they cannot reorder text.
+pub(crate) fn is_invisible_trick(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200b}' | '\u{2060}'..='\u{2064}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}'
+    )
+}
+
+/// Scrub text that an agent pane will show as chat rather than through a
+/// terminal: drop every escape sequence and control character (keeping line
+/// feeds, carriage returns and tabs) and every invisible trick, and count
+/// what mattered. Colour codes in a tool's output are dropped without being
+/// counted; SGR 8, OSC 52, a mismatched OSC 8 link and opaque string
+/// controls count exactly as they do for a shell pane, and each invisible
+/// trick counts once. The sample names the first opaque string control.
+pub(crate) fn scrub_agent_text(text: &str) -> (String, OutputTricks, Option<String>) {
+    let (mut tricks, sample) = scan_output_tricks_detailed(text);
+    let mut clean = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') | Some('P') | Some('_') | Some('^') | Some('X') => {
+                    let mut previous_esc = false;
+                    for next in chars.by_ref() {
+                        if next == '\u{7}' || (previous_esc && next == '\\') {
+                            break;
+                        }
+                        previous_esc = next == '\u{1b}';
+                    }
+                }
+                _ => {}
+            },
+            '\n' | '\r' | '\t' => clean.push(c),
+            '\u{0}'..='\u{1f}' | '\u{7f}' | '\u{80}'..='\u{9f}' => {}
+            c if is_invisible_trick(c) => tricks.invisible += 1,
+            c => clean.push(c),
+        }
+    }
+    (clean, tricks, sample)
+}
+
+/// Scrub every string in a normalized agent event in place (text deltas,
+/// tool results, tool inputs, permission requests: anything a person reads
+/// or approves) and return what was counted.
+pub(crate) fn scrub_agent_event(event: &mut serde_json::Value) -> (OutputTricks, Option<String>) {
+    let mut total = OutputTricks::default();
+    let mut first_sample = None;
+    fn walk(value: &mut serde_json::Value, total: &mut OutputTricks, sample: &mut Option<String>) {
+        match value {
+            serde_json::Value::String(text) => {
+                if text.bytes().any(|byte| !(0x20..0x80).contains(&byte)) {
+                    let (clean, found, found_sample) = scrub_agent_text(text);
+                    total.add(&found);
+                    if sample.is_none() {
+                        *sample = found_sample;
+                    }
+                    if clean != *text {
+                        *text = clean;
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, total, sample);
+                }
+            }
+            serde_json::Value::Object(entries) => {
+                for item in entries.values_mut() {
+                    walk(item, total, sample);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(event, &mut total, &mut first_sample);
+    (total, first_sample)
 }
 
 /// The host of a URL-ish string (`scheme://host[:port]/…` or `www.host…`),

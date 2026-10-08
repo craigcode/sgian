@@ -119,7 +119,9 @@ roll-up in each header, and the Windows sidebar shows one roll-up line per
 project above the list and names each pane's project in its subtitle.
 The bootstrap snapshot may carry `output_warnings` (pane_id → per-kind
 counts of output that hides content: `conceal`, `clipboard`,
-`hyperlink_mismatch`, `string_controls`, `c1_controls`), and subscribers may
+`hyperlink_mismatch`, `string_controls`, `c1_controls`, and `invisible` for
+bidi overrides and zero-width characters, which the daemon counts in agent
+panes), and subscribers may
 receive `output_warning` events with `added` and `total`, plus `sample` (the
 kind and a bounded, escaped prefix of the pane's first opaque DCS/APC/PM/SOS
 string, present only when one was counted) so a badge can say what was
