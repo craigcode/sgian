@@ -11,6 +11,7 @@ export const OUTPUT_TRICK_KEYS = [
   ["hyperlink_mismatch", "mismatched links"],
   ["string_controls", "opaque control strings"],
   ["c1_controls", "C1 controls"],
+  ["invisible", "invisible characters"],
 ];
 
 /**

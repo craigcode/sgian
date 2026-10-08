@@ -284,6 +284,17 @@ impl OutputRouter {
             return;
         }
         let (found, sample) = scan_output_tricks_detailed(data);
+        self.note_output_tricks(pane_id, found, sample);
+    }
+
+    /// Count tricks already found in a pane's output (an agent pane's chat
+    /// text is scrubbed before it is shown) and announce as above.
+    pub(crate) fn note_output_tricks(
+        &self,
+        pane_id: &str,
+        found: OutputTricks,
+        sample: Option<String>,
+    ) {
         if found.total() == 0 {
             return;
         }

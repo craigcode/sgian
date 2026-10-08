@@ -1130,6 +1130,15 @@ pub(crate) struct AgentEventLog {
 #[cfg(any(unix, windows))]
 impl AgentEventLog {
     pub(crate) fn emit(&mut self, router: &OutputRouter, pane_id: &str, mut event: Value) {
+        // No emulator stands between an agent pane and the person, so the
+        // chat text is scrubbed here, before it is logged or shown: escape
+        // sequences and controls go, invisible and reordering characters go,
+        // and what mattered counts against the pane exactly as a shell
+        // pane's output would (ledger `output.suspicious`, badge).
+        let (found, sample) = scrub_agent_event(&mut event);
+        if found.total() > 0 {
+            router.note_output_tricks(pane_id, found, sample);
+        }
         self.next_seq += 1;
         event["seq"] = json!(self.next_seq);
         if let Some(log) = self.log.as_mut() {

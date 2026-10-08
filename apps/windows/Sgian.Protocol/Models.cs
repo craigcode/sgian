@@ -118,6 +118,10 @@ public sealed record OutputTricks
     [JsonPropertyName("c1_controls")]
     public int C1Controls { get; init; }
 
+    /// <summary>Bidi overrides, zero-width characters and the like in agent-pane text.</summary>
+    [JsonPropertyName("invisible")]
+    public int Invisible { get; init; }
+
     /// <summary>What the pane's first opaque string control looked like, from the <c>output_warning</c> event; not part of the counts object.</summary>
     [JsonIgnore]
     public string? Sample { get; init; }
@@ -125,7 +129,7 @@ public sealed record OutputTricks
     [JsonIgnore]
     public int Total =>
         Math.Max(0, Conceal) + Math.Max(0, Clipboard) + Math.Max(0, HyperlinkMismatch)
-        + Math.Max(0, StringControls) + Math.Max(0, C1Controls);
+        + Math.Max(0, StringControls) + Math.Max(0, C1Controls) + Math.Max(0, Invisible);
 
     /// <summary>"2 concealed text, 1 clipboard writes": the non-zero counters in display order.</summary>
     [JsonIgnore]
@@ -136,6 +140,7 @@ public sealed record OutputTricks
             (HyperlinkMismatch, "mismatched links"),
             (StringControls, "opaque control strings"),
             (C1Controls, "C1 controls"),
+            (Invisible, "invisible characters"),
         }
         .Where(entry => entry.Item1 > 0)
         .Select(entry => $"{entry.Item1} {entry.Item2}"));

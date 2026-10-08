@@ -187,20 +187,23 @@ struct OutputTricks: Codable, Equatable, Sendable {
     var hyperlinkMismatch = 0
     var stringControls = 0
     var c1Controls = 0
+    /// Bidi overrides, zero-width characters and the like in agent-pane text.
+    var invisible = 0
 
     enum CodingKeys: String, CodingKey {
-        case conceal, clipboard
+        case conceal, clipboard, invisible
         case hyperlinkMismatch = "hyperlink_mismatch"
         case stringControls = "string_controls"
         case c1Controls = "c1_controls"
     }
 
-    init(conceal: Int = 0, clipboard: Int = 0, hyperlinkMismatch: Int = 0, stringControls: Int = 0, c1Controls: Int = 0) {
+    init(conceal: Int = 0, clipboard: Int = 0, hyperlinkMismatch: Int = 0, stringControls: Int = 0, c1Controls: Int = 0, invisible: Int = 0) {
         self.conceal = conceal
         self.clipboard = clipboard
         self.hyperlinkMismatch = hyperlinkMismatch
         self.stringControls = stringControls
         self.c1Controls = c1Controls
+        self.invisible = invisible
     }
 
     init(from decoder: Decoder) throws {
@@ -210,9 +213,10 @@ struct OutputTricks: Codable, Equatable, Sendable {
         hyperlinkMismatch = max(0, try container.decodeIfPresent(Int.self, forKey: .hyperlinkMismatch) ?? 0)
         stringControls = max(0, try container.decodeIfPresent(Int.self, forKey: .stringControls) ?? 0)
         c1Controls = max(0, try container.decodeIfPresent(Int.self, forKey: .c1Controls) ?? 0)
+        invisible = max(0, try container.decodeIfPresent(Int.self, forKey: .invisible) ?? 0)
     }
 
-    var total: Int { conceal + clipboard + hyperlinkMismatch + stringControls + c1Controls }
+    var total: Int { conceal + clipboard + hyperlinkMismatch + stringControls + c1Controls + invisible }
 
     /// "2 concealed text, 1 clipboard writes": the non-zero counters in display order.
     var summary: String {
@@ -222,6 +226,7 @@ struct OutputTricks: Codable, Equatable, Sendable {
             (hyperlinkMismatch, "mismatched links"),
             (stringControls, "opaque control strings"),
             (c1Controls, "C1 controls"),
+            (invisible, "invisible characters"),
         ]
         .filter { $0.0 > 0 }
         .map { "\($0.0) \($0.1)" }

@@ -3929,3 +3929,137 @@ fn agent_state_event_carries_unattended_derived_from_mode() {
         DaemonEvent::agent_state("p".to_string(), None, None, None)
     );
 }
+
+#[test]
+fn agent_text_scrub_strips_escapes_and_counts_only_the_tricks() {
+    // Colour in a tool's output is dropped without being counted: the chat
+    // view has no emulator to render it and nothing is hidden by it.
+    let (clean, tricks, sample) = scrub_agent_text("\u{1b}[32mok\u{1b}[0m 3 passed\r\n\tdone");
+    assert_eq!(clean, "ok 3 passed\r\n\tdone");
+    assert_eq!(tricks, OutputTricks::default());
+    assert_eq!(sample, None);
+    // The same tricks a shell pane counts still count, and are stripped.
+    let (clean, tricks, sample) = scrub_agent_text(
+        "see \u{1b}[8mhidden\u{1b}[28m \u{1b}]52;c;Zm9v\u{7} \u{1b}_Ga=T;iVBOR\u{1b}\\ end",
+    );
+    assert_eq!(
+        clean, "see hidden   end",
+        "each stripped sequence leaves its neighbours"
+    );
+    assert_eq!(tricks.conceal, 1);
+    assert_eq!(tricks.clipboard, 1);
+    assert_eq!(tricks.string_controls, 1);
+    assert_eq!(sample.as_deref(), Some("APC \"Ga=T;iVBOR\""));
+    // Raw controls go, line structure stays.
+    let (clean, tricks, _) = scrub_agent_text("a\u{7}b\u{85}c\u{0}d");
+    assert_eq!(clean, "abcd");
+    assert_eq!(tricks.c1_controls, 1);
+    // Trojan Source: a right-to-left override and an isolate reverse what a
+    // person reads; a zero-width space hides a boundary. All counted and
+    // stripped. A zero-width joiner in an emoji sequence is neither.
+    let (clean, tricks, _) = scrub_agent_text(
+        "if access \u{202e}// check\u{202c} ok \u{2066}x\u{2069} a\u{200b}b 👨\u{200d}👩",
+    );
+    assert_eq!(clean, "if access // check ok x ab 👨\u{200d}👩");
+    assert_eq!(tricks.invisible, 5);
+    assert_eq!(tricks.total(), 5);
+}
+
+#[test]
+fn agent_event_scrub_walks_every_string_and_counts_once() {
+    let mut event = json!({
+        "kind": "tool_result",
+        "tool_use_id": "toolu_1",
+        "content": [
+            {"type": "text", "text": "\u{1b}[1mbold\u{1b}[0m and \u{202e}reversed\u{202c}"},
+            {"type": "text", "text": "plain"}
+        ],
+        "is_error": false,
+        "nested": {"input": {"command": "rm -rf \u{200b}/"}}
+    });
+    let (tricks, sample) = scrub_agent_event(&mut event);
+    assert_eq!(tricks.invisible, 3);
+    assert_eq!(tricks.total(), 3);
+    assert_eq!(sample, None);
+    assert_eq!(event["content"][0]["text"], json!("bold and reversed"));
+    assert_eq!(event["content"][1]["text"], json!("plain"));
+    assert_eq!(event["nested"]["input"]["command"], json!("rm -rf /"));
+    assert_eq!(event["tool_use_id"], json!("toolu_1"));
+    assert_eq!(event["is_error"], json!(false));
+    // A clean event is untouched and counts nothing.
+    let mut clean = json!({"kind": "text_delta", "text": "all good ✓"});
+    let before = clean.clone();
+    assert_eq!(scrub_agent_event(&mut clean).0, OutputTricks::default());
+    assert_eq!(clean, before);
+}
+
+#[test]
+fn agent_pane_tricks_reach_the_ledger_and_the_broadcast_text_is_clean() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let router = OutputRouter::new(dir.path().join("scrollback"));
+    let ledger_dir = dir.path().join(LEDGER_DIR);
+    fs::create_dir_all(&ledger_dir).expect("ledger dir");
+    router.set_ledger(Arc::new(Mutex::new(LedgerSink::new(ledger_dir.clone()))));
+    fs::create_dir_all(dir.path().join("scrollback")).expect("scrollback dir");
+    router.ensure_model("agent-1", 80, 24);
+    let (client_stream, server_stream) =
+        test_transport_pair().expect("transport pair should be available");
+    router
+        .add_subscriber(server_stream, 1)
+        .expect("subscribe within the cap");
+    client_stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("set read timeout");
+    let mut reader = std::io::BufReader::new(client_stream);
+
+    let events = Mutex::new(AgentEventLog {
+        log: None,
+        next_seq: 0,
+    });
+    append_and_emit_agent_event(
+        &router,
+        &events,
+        "agent-1",
+        json!({"kind": "text_delta", "text": "run \u{202e}this\u{202c} now"}),
+    );
+
+    // The warning is announced first, then the scrubbed event follows.
+    let mut lines = Vec::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut line).expect("event should arrive");
+        lines.push(serde_json::from_str::<Value>(&line).expect("event json"));
+    }
+    let warning = lines
+        .iter()
+        .find(|event| event["event"] == json!("output_warning"))
+        .expect("an output_warning is broadcast");
+    assert_eq!(warning["total"]["invisible"], json!(2));
+    let agent = lines
+        .iter()
+        .find(|event| event["event"] == json!("agent_event"))
+        .expect("the agent event is broadcast");
+    let text = agent
+        .get("payload")
+        .and_then(|p| p.get("text"))
+        .or_else(|| agent.pointer("/event/text"))
+        .and_then(Value::as_str);
+    let serialized = serde_json::to_string(agent).expect("serialize");
+    assert!(
+        text == Some("run this now") || serialized.contains("run this now"),
+        "the broadcast text must be scrubbed: {serialized}"
+    );
+    assert!(
+        !serialized.contains('\u{202e}'),
+        "no override reaches a client: {serialized}"
+    );
+
+    let records = read_ledger_tail(&ledger_path(&ledger_dir, "agent-1"), 0);
+    let suspicious: Vec<&Value> = records
+        .iter()
+        .filter(|record| record["type"] == json!("output.suspicious"))
+        .collect();
+    assert_eq!(suspicious.len(), 1);
+    assert_eq!(suspicious[0]["payload"]["total"]["invisible"], json!(2));
+    assert_eq!(router.output_tricks("agent-1").invisible, 2);
+}

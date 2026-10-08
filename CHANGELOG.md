@@ -24,6 +24,21 @@ follow SemVer once the first public tag exists.
   notarization, writing under `build/rehearsal`; the first run proved the
   pipeline end to end before any signing credential exists.
 
+### Agents
+
+- Agent panes get the output guard. No emulator stands between an agent
+  and the person in a chat pane, so the daemon now scrubs every string in a
+  normalized agent event before it is logged or shown: terminal escape
+  sequences and control characters are dropped (colour codes in a tool's
+  output silently), and SGR 8 conceal, OSC 52 clipboard writes, mismatched
+  OSC 8 links and opaque string controls count exactly as in a shell pane.
+  A new `invisible` counter covers the bidi overrides and isolates, the
+  zero-width space and word joiner, and a byte-order mark inside text, the
+  "Trojan Source" set that can reorder or hide what a person reads or
+  approves; those characters are removed from the text. The badge, the
+  `output.suspicious` ledger record and `ctl agent` show the counts; all
+  three clients name the new counter.
+
 ### Fixes
 
 - `ctl send` treats a real line feed in the text as Enter, like the `\n`
