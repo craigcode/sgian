@@ -248,7 +248,69 @@ fn project_notes_are_written_listed_scrubbed_and_ledgered() {
     });
     assert!(unknown.unwrap_err().contains("unknown project"));
 
-    // Credentials: a viewer reads, cannot write; a writer writes as itself.
+    // Remove: ledgered with the hash of what went.
+    let removed: Value = client
+        .request(DaemonRequest::ProjectNoteRemove {
+            name: "feature".into(),
+            file: file.clone(),
+            holder: "craig@mac".into(),
+        })
+        .expect("remove note");
+    assert_eq!(removed["hash"], added["hash"]);
+    assert!(!notes_dir.join(&file).exists());
+    let again: Result<Value, String> = client.request(DaemonRequest::ProjectNoteRemove {
+        name: "feature".into(),
+        file: file.clone(),
+        holder: "craig@mac".into(),
+    });
+    assert!(again.unwrap_err().contains("no note"));
+    let ledger: Value = client
+        .request(DaemonRequest::ProjectLedger {
+            name: "feature".into(),
+            limit: 0,
+        })
+        .expect("project ledger");
+    let kinds: Vec<&str> = ledger["records"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .filter(|record| record["pane_id"] == json!("project-feature"))
+        .filter_map(|record| record["type"].as_str())
+        .collect();
+    assert_eq!(kinds, vec!["note.added", "note.removed"]);
+
+    // The ctl document is bounded and marks the guarded note.
+    let listing: Value = client
+        .request(DaemonRequest::ProjectNotes {
+            name: "feature".into(),
+        })
+        .expect("list notes");
+    let mut out = Vec::new();
+    write_notes_document(&mut out, &listing).expect("document");
+    let text = String::from_utf8(out).expect("utf8");
+    assert!(text.starts_with("feature\t1 note(s)\t"), "{text}");
+    assert!(text.contains("## 2020-01-01-raw.md\tfile\t-\n2020-01-01-raw\n\nred text\n"));
+
+    daemon.shutdown();
+}
+
+/// Credentials bind the writer: a viewer lists but cannot write, a writer
+/// writes as itself and nobody else. Unix only, like the other credential
+/// tests: the helper hello-s over the Unix socket.
+#[cfg(unix)]
+#[test]
+fn project_notes_honour_client_credentials() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let daemon = TestDaemon::spawn(Config::default());
+    let client = daemon.client();
+    let _: Project = client
+        .request(DaemonRequest::ProjectCreate {
+            name: "feature".into(),
+            goal: None,
+            repo: Some(repo.path().display().to_string()),
+        })
+        .expect("create project");
+
     let viewer: Value = client
         .request(DaemonRequest::IdentityIssue {
             holder: "phone".into(),
@@ -316,49 +378,18 @@ fn project_notes_are_written_listed_scrubbed_and_ledgered() {
     assert!(as_self.ok, "{as_self:?}");
     assert_eq!(as_self.result["holder"], json!("kranz-run-7"));
 
-    // Remove: ledgered with the hash of what went.
-    let removed: Value = client
-        .request(DaemonRequest::ProjectNoteRemove {
-            name: "feature".into(),
-            file: file.clone(),
-            holder: "craig@mac".into(),
-        })
-        .expect("remove note");
-    assert_eq!(removed["hash"], added["hash"]);
-    assert!(!notes_dir.join(&file).exists());
-    let again: Result<Value, String> = client.request(DaemonRequest::ProjectNoteRemove {
-        name: "feature".into(),
-        file: file.clone(),
-        holder: "craig@mac".into(),
-    });
-    assert!(again.unwrap_err().contains("no note"));
-    let ledger: Value = client
-        .request(DaemonRequest::ProjectLedger {
-            name: "feature".into(),
-            limit: 0,
-        })
-        .expect("project ledger");
-    let kinds: Vec<&str> = ledger["records"]
-        .as_array()
-        .expect("records")
-        .iter()
-        .filter(|record| record["pane_id"] == json!("project-feature"))
-        .filter_map(|record| record["type"].as_str())
-        .collect();
-    assert_eq!(kinds, vec!["note.added", "note.added", "note.removed"]);
-
-    // The ctl document is bounded and marks the guarded note.
     let listing: Value = client
         .request(DaemonRequest::ProjectNotes {
             name: "feature".into(),
         })
         .expect("list notes");
+    assert_eq!(listing["total"], json!(1));
+    assert_eq!(listing["notes"][0]["holder"], json!("kranz-run-7"));
     let mut out = Vec::new();
     write_notes_document(&mut out, &listing).expect("document");
-    let text = String::from_utf8(out).expect("utf8");
-    assert!(text.starts_with("feature\t2 note(s)\t"), "{text}");
-    assert!(text.contains("## 2020-01-01-raw.md\tfile\t-\n2020-01-01-raw\n\nred text\n"));
-    assert!(text.contains("\tkranz-run-7\t"));
+    assert!(String::from_utf8(out)
+        .expect("utf8")
+        .contains("\tkranz-run-7\t"));
 
     daemon.shutdown();
 }
