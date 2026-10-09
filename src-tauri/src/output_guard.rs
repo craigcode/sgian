@@ -214,81 +214,114 @@ pub(crate) fn is_invisible_trick(c: char) -> bool {
     )
 }
 
+/// True when a string can contain anything the agent-pane scrub would
+/// remove or count: an escape, a C0 control other than LF, CR and TAB, DEL,
+/// or a UTF-8 lead byte that can start a C1 control (0xC2), a character in
+/// the U+2000 block (0xE2) or a byte-order mark (0xEF). Plain text in any
+/// script, including emoji, passes without a second look.
+fn may_need_scrub(text: &str) -> bool {
+    text.bytes().any(|byte| {
+        matches!(byte, 0x1b | 0x7f | 0xc2 | 0xe2 | 0xef)
+            || (byte < 0x20 && !matches!(byte, b'\n' | b'\r' | b'\t'))
+    })
+}
+
 /// Scrub text that an agent pane will show as chat rather than through a
 /// terminal: drop every escape sequence and control character (keeping line
 /// feeds, carriage returns and tabs) and every invisible trick, and count
 /// what mattered. Colour codes in a tool's output are dropped without being
 /// counted; SGR 8, OSC 52, a mismatched OSC 8 link and opaque string
 /// controls count exactly as they do for a shell pane, and each invisible
-/// trick counts once. The sample names the first opaque string control.
+/// trick counts once. An escape left open at the end is dropped; use
+/// [`scrub_agent_text_streaming`] for text that continues.
 pub(crate) fn scrub_agent_text(text: &str) -> (String, OutputTricks, Option<String>) {
-    let (mut tricks, sample) = scan_output_tricks_detailed(text);
-    let mut clean = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\u{1b}' => match chars.next() {
-                Some('[') => {
-                    for next in chars.by_ref() {
-                        if ('\u{40}'..='\u{7e}').contains(&next) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') | Some('P') | Some('_') | Some('^') | Some('X') => {
-                    let mut previous_esc = false;
-                    for next in chars.by_ref() {
-                        if next == '\u{7}' || (previous_esc && next == '\\') {
-                            break;
-                        }
-                        previous_esc = next == '\u{1b}';
-                    }
-                }
-                _ => {}
-            },
-            '\n' | '\r' | '\t' => clean.push(c),
-            '\u{0}'..='\u{1f}' | '\u{7f}' | '\u{80}'..='\u{9f}' => {}
-            c if is_invisible_trick(c) => tricks.invisible += 1,
-            c => clean.push(c),
-        }
-    }
-    (clean, tricks, sample)
+    let scan = walk_text(text, true);
+    (scan.clean, scan.tricks, scan.sample)
+}
+
+/// [`scrub_agent_text`] for one chunk of a stream: `carry` holds an escape
+/// sequence the previous chunk ended inside, which is prepended here, and
+/// receives any sequence this chunk ends inside. A streamed sequence is
+/// therefore counted and stripped once it completes instead of leaking its
+/// tail into the chat as text.
+pub(crate) fn scrub_agent_text_streaming(
+    text: &str,
+    carry: &mut String,
+) -> (String, OutputTricks, Option<String>) {
+    let scan = if carry.is_empty() {
+        walk_text(text, true)
+    } else {
+        let mut joined = std::mem::take(carry);
+        joined.push_str(text);
+        walk_text(&joined, true)
+    };
+    *carry = scan.pending;
+    (scan.clean, scan.tricks, scan.sample)
 }
 
 /// Scrub every string in a normalized agent event in place (text deltas,
 /// tool results, tool inputs, permission requests: anything a person reads
-/// or approves) and return what was counted.
-pub(crate) fn scrub_agent_event(event: &mut serde_json::Value) -> (OutputTricks, Option<String>) {
+/// or approves) and return what was counted. When anything counted, the
+/// event gains a `scrubbed` object with the counts, so a client can say
+/// beside the text that characters were removed. A `text_delta` is scrubbed
+/// as a stream through `carry`.
+pub(crate) fn scrub_agent_event(
+    event: &mut serde_json::Value,
+    carry: &mut String,
+) -> (OutputTricks, Option<String>) {
     let mut total = OutputTricks::default();
     let mut first_sample = None;
-    fn walk(value: &mut serde_json::Value, total: &mut OutputTricks, sample: &mut Option<String>) {
-        match value {
-            serde_json::Value::String(text) => {
-                if text.bytes().any(|byte| !(0x20..0x80).contains(&byte)) {
-                    let (clean, found, found_sample) = scrub_agent_text(text);
-                    total.add(&found);
-                    if sample.is_none() {
-                        *sample = found_sample;
+    let streamed = event.get("kind").and_then(serde_json::Value::as_str) == Some("text_delta");
+    if streamed {
+        if let Some(serde_json::Value::String(text)) = event.get_mut("text") {
+            if !carry.is_empty() || may_need_scrub(text) {
+                let (clean, found, sample) = scrub_agent_text_streaming(text, carry);
+                total.add(&found);
+                first_sample = sample;
+                if clean != *text {
+                    *text = clean;
+                }
+            }
+        }
+    } else {
+        fn walk(
+            value: &mut serde_json::Value,
+            total: &mut OutputTricks,
+            sample: &mut Option<String>,
+        ) {
+            match value {
+                serde_json::Value::String(text) => {
+                    if may_need_scrub(text) {
+                        let (clean, found, found_sample) = scrub_agent_text(text);
+                        total.add(&found);
+                        if sample.is_none() {
+                            *sample = found_sample;
+                        }
+                        if clean != *text {
+                            *text = clean;
+                        }
                     }
-                    if clean != *text {
-                        *text = clean;
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        walk(item, total, sample);
                     }
                 }
-            }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    walk(item, total, sample);
+                serde_json::Value::Object(entries) => {
+                    for item in entries.values_mut() {
+                        walk(item, total, sample);
+                    }
                 }
+                _ => {}
             }
-            serde_json::Value::Object(entries) => {
-                for item in entries.values_mut() {
-                    walk(item, total, sample);
-                }
-            }
-            _ => {}
+        }
+        walk(event, &mut total, &mut first_sample);
+    }
+    if total.total() > 0 {
+        if let Some(object) = event.as_object_mut() {
+            object.insert("scrubbed".to_string(), serde_json::json!(total));
         }
     }
-    walk(event, &mut total, &mut first_sample);
     (total, first_sample)
 }
 
@@ -361,122 +394,174 @@ fn describe_string_control(kind: char, body: &str) -> String {
     format!("{name} {shown:?}{suffix}")
 }
 
-/// [`scan_output_tricks_detailed`] without the sample.
-#[cfg(test)]
-pub(crate) fn scan_output_tricks(text: &str) -> OutputTricks {
-    scan_output_tricks_detailed(text).0
+/// Everything one pass over a chunk of text yields: the counts, a description
+/// of the first opaque string control, the text with every escape sequence,
+/// control character and invisible trick removed, and any escape sequence
+/// left unterminated at the end of the chunk (for a caller that streams).
+pub(crate) struct TextScan {
+    pub(crate) tricks: OutputTricks,
+    pub(crate) sample: Option<String>,
+    pub(crate) clean: String,
+    pub(crate) pending: String,
 }
 
-/// Scan one output chunk. Sequences split across chunks are missed, which is
-/// acceptable for a counter meant to raise a flag, not to censor. The second
-/// value describes the first opaque string control counted, if any.
-pub(crate) fn scan_output_tricks_detailed(text: &str) -> (OutputTricks, Option<String>) {
+/// The one walker both the shell-pane scan and the agent-pane scrub use, so
+/// what is counted and what is stripped can never disagree. `keep` says
+/// whether to build the cleaned text (the shell path only counts).
+///
+/// String controls (OSC, DCS, APC, PM, SOS) end at BEL, at ESC `\`, or at
+/// the C1 string terminator U+009C. A CSI ends at its final byte. An
+/// escape sequence still open when the text ends is returned as `pending`
+/// rather than counted, so a streaming caller can prepend it to the next
+/// chunk; a caller with complete text drops it.
+fn walk_text(text: &str, keep: bool) -> TextScan {
     let mut tricks = OutputTricks::default();
     let mut sample: Option<String> = None;
-    let mut chars = text.chars().peekable();
+    let mut clean = String::with_capacity(if keep { text.len() } else { 0 });
+    let mut pending = String::new();
+    let mut chars = text.char_indices().peekable();
     // The open OSC 8 target host while inside a hyperlink, and the visible
     // text collected under it.
     let mut link_host: Option<String> = None;
     let mut link_text = String::new();
-    while let Some(c) = chars.next() {
+    while let Some((start, c)) = chars.next() {
         match c {
-            '\u{1b}' => match chars.next() {
-                Some('[') => {
-                    let mut params = String::new();
-                    let mut final_byte = None;
-                    for next in chars.by_ref() {
-                        if ('\u{40}'..='\u{7e}').contains(&next) {
-                            final_byte = Some(next);
-                            break;
+            '\u{1b}' => {
+                let Some((_, kind)) = chars.next() else {
+                    pending = text[start..].to_string();
+                    break;
+                };
+                match kind {
+                    '[' => {
+                        let mut params = String::new();
+                        let mut final_byte = None;
+                        for (_, next) in chars.by_ref() {
+                            if ('\u{40}'..='\u{7e}').contains(&next) {
+                                final_byte = Some(next);
+                                break;
+                            }
+                            params.push(next);
                         }
-                        params.push(next);
-                    }
-                    if final_byte == Some('m') {
-                        // SGR: a standalone `8` conceals; `38;5;8` (a colour
-                        // index) does not.
-                        let mut parts = params.split(';');
-                        while let Some(part) = parts.next() {
-                            match part {
-                                "8" => tricks.conceal += 1,
-                                "38" | "48" | "58" => match parts.next() {
-                                    Some("5") => {
-                                        parts.next();
-                                    }
-                                    Some("2") => {
-                                        for _ in 0..3 {
+                        let Some(final_byte) = final_byte else {
+                            pending = text[start..].to_string();
+                            break;
+                        };
+                        if final_byte == 'm' {
+                            // SGR: a standalone `8` conceals; `38;5;8` (a colour
+                            // index) does not.
+                            let mut parts = params.split(';');
+                            while let Some(part) = parts.next() {
+                                match part {
+                                    "8" => tricks.conceal += 1,
+                                    "38" | "48" | "58" => match parts.next() {
+                                        Some("5") => {
                                             parts.next();
                                         }
-                                    }
+                                        Some("2") => {
+                                            for _ in 0..3 {
+                                                parts.next();
+                                            }
+                                        }
+                                        _ => {}
+                                    },
                                     _ => {}
-                                },
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                Some(']') => {
-                    let mut body = String::new();
-                    let mut previous_esc = false;
-                    for next in chars.by_ref() {
-                        if next == '\u{7}' || (previous_esc && next == '\\') {
-                            break;
-                        }
-                        previous_esc = next == '\u{1b}';
-                        if !previous_esc {
-                            body.push(next);
-                        }
-                    }
-                    if body.starts_with("52;") {
-                        tricks.clipboard += 1;
-                    } else if let Some(rest) = body.strip_prefix("8;") {
-                        let target = rest.split_once(';').map(|(_, t)| t).unwrap_or("");
-                        if target.is_empty() {
-                            // Closing the link: compare what was shown with where it went.
-                            if let (Some(host), Some(shown)) =
-                                (link_host.take(), url_host(&link_text))
-                            {
-                                if shown != host {
-                                    tricks.hyperlink_mismatch += 1;
                                 }
                             }
-                            link_text.clear();
-                        } else {
-                            link_host = url_host(target);
-                            link_text.clear();
                         }
                     }
-                }
-                Some(kind @ ('P' | '_' | '^' | 'X')) => {
-                    let mut body = String::new();
-                    let mut previous_esc = false;
-                    for next in chars.by_ref() {
-                        if next == '\u{7}' || (previous_esc && next == '\\') {
+                    ']' | 'P' | '_' | '^' | 'X' => {
+                        let mut body = String::new();
+                        let mut previous_esc = false;
+                        let mut terminated = false;
+                        for (_, next) in chars.by_ref() {
+                            if next == '\u{7}' || next == '\u{9c}' || (previous_esc && next == '\\')
+                            {
+                                terminated = true;
+                                break;
+                            }
+                            previous_esc = next == '\u{1b}';
+                            if !previous_esc {
+                                body.push(next);
+                            }
+                        }
+                        if !terminated {
+                            pending = text[start..].to_string();
                             break;
                         }
-                        previous_esc = next == '\u{1b}';
-                        if !previous_esc {
-                            body.push(next);
+                        if kind == ']' {
+                            if body.starts_with("52;") {
+                                tricks.clipboard += 1;
+                            } else if let Some(rest) = body.strip_prefix("8;") {
+                                let target = rest.split_once(';').map(|(_, t)| t).unwrap_or("");
+                                if target.is_empty() {
+                                    // Closing the link: compare what was shown with where it went.
+                                    if let (Some(host), Some(shown)) =
+                                        (link_host.take(), url_host(&link_text))
+                                    {
+                                        if shown != host {
+                                            tricks.hyperlink_mismatch += 1;
+                                        }
+                                    }
+                                    link_text.clear();
+                                } else {
+                                    link_host = url_host(target);
+                                    link_text.clear();
+                                }
+                            }
+                        } else if !is_terminal_capability_traffic(kind, &body) {
+                            tricks.string_controls += 1;
+                            if sample.is_none() {
+                                sample = Some(describe_string_control(kind, &body));
+                            }
                         }
                     }
-                    if is_terminal_capability_traffic(kind, &body) {
-                        continue;
-                    }
-                    tricks.string_controls += 1;
-                    if sample.is_none() {
-                        sample = Some(describe_string_control(kind, &body));
-                    }
+                    // Two-character escapes (ESC 7, ESC =, charset selection …)
+                    // carry nothing and are dropped whole.
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
+            '\n' | '\r' | '\t' => {
+                if keep {
+                    clean.push(c);
+                }
+                if link_host.is_some() {
+                    link_text.push(c);
+                }
+            }
+            '\u{0}'..='\u{1f}' | '\u{7f}' => {}
             '\u{80}'..='\u{9f}' => tricks.c1_controls += 1,
+            c if keep && is_invisible_trick(c) => tricks.invisible += 1,
             c => {
+                if keep {
+                    clean.push(c);
+                }
                 if link_host.is_some() {
                     link_text.push(c);
                 }
             }
         }
     }
-    (tricks, sample)
+    TextScan {
+        tricks,
+        sample,
+        clean,
+        pending,
+    }
+}
+
+/// [`scan_output_tricks_detailed`] without the sample.
+#[cfg(test)]
+pub(crate) fn scan_output_tricks(text: &str) -> OutputTricks {
+    scan_output_tricks_detailed(text).0
+}
+
+/// Count the tricks in one chunk of shell-pane output. Sequences split
+/// across chunks are missed, which is acceptable for a counter meant to
+/// raise a flag, not to censor. The second value describes the first opaque
+/// string control counted, if any.
+pub(crate) fn scan_output_tricks_detailed(text: &str) -> (OutputTricks, Option<String>) {
+    let scan = walk_text(text, false);
+    (scan.tricks, scan.sample)
 }
 
 /// Announce at most this often per pane (ledger + event); counts always accumulate.

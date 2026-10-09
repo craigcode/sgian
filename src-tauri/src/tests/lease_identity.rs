@@ -3977,8 +3977,14 @@ fn agent_event_scrub_walks_every_string_and_counts_once() {
         "is_error": false,
         "nested": {"input": {"command": "rm -rf \u{200b}/"}}
     });
-    let (tricks, sample) = scrub_agent_event(&mut event);
+    let mut carry = String::new();
+    let (tricks, sample) = scrub_agent_event(&mut event, &mut carry);
     assert_eq!(tricks.invisible, 3);
+    assert_eq!(
+        event["scrubbed"]["invisible"],
+        json!(3),
+        "the event says what was removed"
+    );
     assert_eq!(tricks.total(), 3);
     assert_eq!(sample, None);
     assert_eq!(event["content"][0]["text"], json!("bold and reversed"));
@@ -3987,10 +3993,56 @@ fn agent_event_scrub_walks_every_string_and_counts_once() {
     assert_eq!(event["tool_use_id"], json!("toolu_1"));
     assert_eq!(event["is_error"], json!(false));
     // A clean event is untouched and counts nothing.
-    let mut clean = json!({"kind": "text_delta", "text": "all good ✓"});
+    let mut clean = json!({"kind": "text_delta", "text": "all good ✓ café 👨\u{200d}👩"});
     let before = clean.clone();
-    assert_eq!(scrub_agent_event(&mut clean).0, OutputTricks::default());
-    assert_eq!(clean, before);
+    assert_eq!(
+        scrub_agent_event(&mut clean, &mut carry).0,
+        OutputTricks::default()
+    );
+    assert_eq!(
+        clean, before,
+        "plain text in any script is untouched and gains no marker"
+    );
+}
+
+#[test]
+fn agent_text_scrub_handles_c1_terminators_and_streamed_escapes() {
+    // A string control ended by the C1 ST must not swallow what follows.
+    let (clean, tricks, _) = scrub_agent_text("\u{1b}]0;title\u{9c}real output");
+    assert_eq!(clean, "real output");
+    assert_eq!(tricks.total(), 0);
+    assert_eq!(
+        scan_output_tricks("\u{1b}]52;c;Zm9v\u{9c}after").clipboard,
+        1
+    );
+    // An escape split across two streamed deltas is stripped whole and the
+    // conceal inside it is counted once it completes; nothing leaks as text.
+    let mut carry = String::new();
+    let (first, tricks1, _) = scrub_agent_text_streaming("visible \u{1b}[3", &mut carry);
+    assert_eq!(first, "visible ");
+    assert_eq!(tricks1.total(), 0);
+    assert_eq!(carry, "\u{1b}[3");
+    let (second, tricks2, _) =
+        scrub_agent_text_streaming("8;5;8m hidden\u{1b}[8msecret\u{1b}[0m", &mut carry);
+    assert_eq!(second, " hiddensecret");
+    assert_eq!(tricks2.conceal, 1);
+    assert!(carry.is_empty());
+    // A lone ESC at the very end is carried too.
+    let (text, _, _) = scrub_agent_text_streaming("tail\u{1b}", &mut carry);
+    assert_eq!(text, "tail");
+    assert_eq!(carry, "\u{1b}");
+    let (text, _, _) = scrub_agent_text_streaming("[0mdone", &mut carry);
+    assert_eq!(text, "done");
+    // Through the event path a text_delta uses the carry.
+    let mut carry = String::new();
+    let mut a = json!({"kind": "text_delta", "text": "x\u{1b}["});
+    let mut b = json!({"kind": "text_delta", "text": "8mhidden"});
+    scrub_agent_event(&mut a, &mut carry);
+    let (tricks, _) = scrub_agent_event(&mut b, &mut carry);
+    assert_eq!(a["text"], json!("x"));
+    assert_eq!(b["text"], json!("hidden"));
+    assert_eq!(tricks.conceal, 1);
+    assert_eq!(b["scrubbed"]["conceal"], json!(1));
 }
 
 #[test]
@@ -4015,6 +4067,7 @@ fn agent_pane_tricks_reach_the_ledger_and_the_broadcast_text_is_clean() {
     let events = Mutex::new(AgentEventLog {
         log: None,
         next_seq: 0,
+        pending_escape: String::new(),
     });
     append_and_emit_agent_event(
         &router,
@@ -4062,4 +4115,46 @@ fn agent_pane_tricks_reach_the_ledger_and_the_broadcast_text_is_clean() {
     assert_eq!(suspicious.len(), 1);
     assert_eq!(suspicious[0]["payload"]["total"]["invisible"], json!(2));
     assert_eq!(router.output_tricks("agent-1").invisible, 2);
+}
+
+/// Throughput of the agent-pane scrub over text shaped like a build log with
+/// colour codes, so the cost of scrubbing every agent event is a measured
+/// number rather than an assumption. Ignored by default; run with
+/// `cargo test agent_scrub_throughput -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn agent_scrub_throughput() {
+    let line = "\u{1b}[32m   Compiling\u{1b}[0m sgian v0.1.0 (/Users/someone/Data/sgian/src-tauri) ─ 42 passed · café\n";
+    let text: String = std::iter::repeat_n(line, 40_000).collect();
+    let bytes = text.len();
+    let started = Instant::now();
+    let rounds = 5;
+    let mut total = 0usize;
+    for _ in 0..rounds {
+        let (clean, _, _) = scrub_agent_text(&text);
+        total += clean.len();
+    }
+    let elapsed = started.elapsed();
+    let per_mb = elapsed / rounds / (bytes / (1024 * 1024)) as u32;
+    println!(
+        "scrub_agent_text: {} MiB per pass, {:?} per MiB (cleaned {} bytes)",
+        bytes / (1024 * 1024),
+        per_mb,
+        total / rounds as usize
+    );
+    let plain: String = std::iter::repeat_n(
+        "plain text with no escapes at all, café 👨\u{200d}👩\n",
+        40_000,
+    )
+    .collect();
+    let started = Instant::now();
+    for _ in 0..rounds {
+        let mut event = json!({"kind": "tool_result", "content": plain});
+        let mut carry = String::new();
+        scrub_agent_event(&mut event, &mut carry);
+    }
+    println!(
+        "scrub_agent_event on plain text: {:?} per MiB",
+        started.elapsed() / rounds / (plain.len() / (1024 * 1024)) as u32
+    );
 }
