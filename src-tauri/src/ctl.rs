@@ -5173,8 +5173,9 @@ Commands (PANE is a pane id or title; defaults to the active pane):
   restart [PANE]                Restart a pane's shell (alias: pane restart)
   send <PANE> [--lf|--raw] [--as HOLDER] [--generation N] [--] <TEXT...>
                                 Send text to a pane    (alias: pane send)
-                                  By default \n and \r submit a line as Enter/CR.
-                                  --lf / --raw sends a literal LF (0x0A) instead of CR.
+                                  By default the \n escape, a real line feed and \r
+                                  each submit a line as Enter (CR); CRLF is one Enter.
+                                  --lf / --raw sends line feeds as given (0x0A), not CR.
                                   --as HOLDER attributes the input to a lease holder
                                   -- ends flag parsing (send a literal "--lf" etc.)
                                   To an agent pane, send posts a chat message

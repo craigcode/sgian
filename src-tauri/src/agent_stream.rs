@@ -1125,6 +1125,9 @@ pub(crate) fn append_and_emit_agent_event(
 pub(crate) struct AgentEventLog {
     pub(crate) log: Option<AgentLogWriter>,
     pub(crate) next_seq: u64,
+    /// An escape sequence the last `text_delta` ended inside, carried into
+    /// the next one so it is stripped whole instead of leaking its tail.
+    pub(crate) pending_escape: String,
 }
 
 #[cfg(any(unix, windows))]
@@ -1135,9 +1138,16 @@ impl AgentEventLog {
         // sequences and controls go, invisible and reordering characters go,
         // and what mattered counts against the pane exactly as a shell
         // pane's output would (ledger `output.suspicious`, badge).
-        let (found, sample) = scrub_agent_event(&mut event);
+        let (found, sample) = scrub_agent_event(&mut event, &mut self.pending_escape);
         if found.total() > 0 {
             router.note_output_tricks(pane_id, found, sample);
+        }
+        if matches!(
+            event.get("kind").and_then(Value::as_str),
+            Some("message_complete") | Some("turn_complete")
+        ) {
+            // A sequence still open when the message ends never completes.
+            self.pending_escape.clear();
         }
         self.next_seq += 1;
         event["seq"] = json!(self.next_seq);
@@ -1650,6 +1660,7 @@ impl TerminalStore {
         let events = Arc::new(Mutex::new(AgentEventLog {
             log: AgentLogWriter::open(&self.agents_dir, pane_id),
             next_seq: agent_log_last_seq(&self.agents_dir, pane_id),
+            pending_escape: String::new(),
         }));
         let input = spawn_input_writer_raw(Box::new(stdin), None);
         if let Some(line) = initial_input {
