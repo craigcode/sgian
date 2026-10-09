@@ -231,7 +231,8 @@ Open, in order:
 
 - **Execution grants** (`docs/design/execution-grants.md`): the Sgian half
   once `kranz-acp` and Kranz's `TerminalProvider` seam exist.
-- **Per-project shared context notes under git.** The output-guard
+- **Per-project shared context notes under git**: designed in
+  `docs/design/shared-context-notes.md`, not built. The output-guard
   stripping for agent panes shipped: the daemon scrubs every string in a
   normalized agent event before it is logged or shown, dropping escape
   sequences and controls, and counting SGR 8, OSC 52, mismatched links,
