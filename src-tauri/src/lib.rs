@@ -1210,6 +1210,26 @@ enum DaemonRequest {
         #[serde(default)]
         lines: usize,
     },
+    /// Shared context notes (docs/design/shared-context-notes.md): short
+    /// Markdown files under the project's repo that every pane in the
+    /// project can read. `holder` is the writer; a credentialed connection
+    /// must match its own holder, as for input and leases.
+    ProjectNoteAdd {
+        name: String,
+        title: String,
+        body: String,
+        holder: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+    },
+    ProjectNotes {
+        name: String,
+    },
+    ProjectNoteRemove {
+        name: String,
+        file: String,
+        holder: String,
+    },
     /// (M6) Issue a per-client credential: the token is returned once.
     IdentityIssue {
         holder: String,
@@ -2071,6 +2091,7 @@ mod output_guard;
 use output_guard::*;
 mod ledger;
 use ledger::*;
+mod notes;
 mod probe;
 use probe::*;
 /// The v2 length-prefixed framed wire envelope (architecture.md §5.1):
@@ -2110,6 +2131,8 @@ struct DaemonServer {
     /// takes it last, after registry → terminals).
     leases: Arc<Mutex<HashMap<String, HeldLease>>>,
     workspace_key: String,
+    /// The workspace directory: the default root for a project's notes.
+    cwd: PathBuf,
     log_dispatch: tracing::dispatcher::Dispatch,
     /// Keeps the non-blocking log writer alive (flushes on drop). Must be held for
     /// the lifetime of the server so log entries are not lost.
@@ -2258,6 +2281,7 @@ impl DaemonServer {
         prune_orphan_agent_logs(&agents_dir, &live_pane_ids);
 
         let ws_key = workspace_key(&cwd);
+        let cwd_for_notes = cwd.clone();
 
         // Set up structured logging via tracing + tracing-appender. The log file
         // lives in the workspace data dir (per-workspace isolation), is opened in
@@ -2373,6 +2397,7 @@ impl DaemonServer {
             leases,
             next_lease_generation: AtomicU64::new(next_lease_generation),
             workspace_key: ws_key,
+            cwd: cwd_for_notes,
             log_dispatch,
             _log_guard: log_guard,
             token,
@@ -2631,10 +2656,11 @@ impl DaemonServer {
             .map_err(|_| "ledger lock poisoned".to_string())?
             .dir
             .clone();
-        let mut records: Vec<Value> = project
-            .panes
+        let mut keys = project.panes.clone();
+        keys.push(project_ledger_key(name));
+        let mut records: Vec<Value> = keys
             .iter()
-            .flat_map(|pane_id| read_ledger_tail(&ledger_path(&dir, pane_id), 0))
+            .flat_map(|key| read_ledger_tail(&ledger_path(&dir, key), 0))
             .collect();
         records.sort_by_key(|record| {
             (
@@ -2815,13 +2841,123 @@ impl DaemonServer {
                 pane
             })
             .collect();
+        let project_ledger = ledger_path(&dir, &project_ledger_key(name));
+        let chain = if project_ledger.exists() {
+            match ledger_verify(&project_ledger) {
+                Ok(summary) => json!({
+                    "verified": true,
+                    "records": summary.records,
+                    "head": summary.head,
+                }),
+                Err(broken) => json!({ "verified": false, "break": broken }),
+            }
+        } else {
+            json!({ "verified": true, "records": 0, "head": "" })
+        };
+        let notes = self.handle_project_notes(name)?;
         Ok(json!({
             "format": PROJECT_DOSSIER_FORMAT,
             "generated_at_ms": now_millis(),
             "workspace": self.workspace_key,
             "summary": detail["summary"],
+            "ledger": {
+                "chain": chain,
+                "records": read_ledger_tail(&project_ledger, 0),
+            },
+            "notes": notes,
             "panes": panes,
         }))
+    }
+
+    // ----- Shared context notes (docs/design/shared-context-notes.md) -----
+
+    /// Where a project's notes live: under its `repo` when it names one,
+    /// the workspace directory otherwise.
+    fn project_notes_dir(&self, name: &str) -> Result<PathBuf, String> {
+        let project = self
+            .projects_snapshot()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown project '{name}'"))?;
+        let root = project
+            .repo
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.cwd.clone());
+        Ok(notes::notes_dir(&root, name))
+    }
+
+    fn handle_project_note_add(
+        &self,
+        name: &str,
+        title: &str,
+        body: &str,
+        holder: &str,
+        pane_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let dir = self.project_notes_dir(name)?;
+        let title = validate_bounded_text(title, "title", notes::NOTE_TITLE_MAX_BYTES)?;
+        if title.contains('\n') {
+            return Err("title must be one line".to_string());
+        }
+        let body = validate_bounded_text(body, "body", notes::NOTE_MAX_BYTES)?;
+        let holder = validate_holder(holder)?;
+        if let Some(pane_id) = pane_id {
+            self.ensure_pane_exists(pane_id)?;
+        }
+        let meta = notes::NoteMeta {
+            title: title.clone(),
+            holder: holder.clone(),
+            pane: pane_id.map(str::to_string),
+            written_at_ms: now_millis(),
+        };
+        let written = notes::add_note(&dir, &meta, &body)?;
+        let _ = self.ledger_record(
+            &project_ledger_key(name),
+            "note.added",
+            json!({
+                "project": name,
+                "file": written.file,
+                "title": title,
+                "holder": holder,
+                "pane_id": pane_id,
+                "hash": written.hash,
+                "bytes": written.bytes,
+            }),
+        );
+        Ok(json!({
+            "project": name,
+            "file": written.file,
+            "path": written.path.display().to_string(),
+            "title": title,
+            "holder": holder,
+            "pane_id": pane_id,
+            "hash": written.hash,
+            "bytes": written.bytes,
+        }))
+    }
+
+    fn handle_project_notes(&self, name: &str) -> Result<Value, String> {
+        let dir = self.project_notes_dir(name)?;
+        let listing = notes::list_notes(&dir, name)?;
+        Ok(json!(listing))
+    }
+
+    fn handle_project_note_remove(
+        &self,
+        name: &str,
+        file: &str,
+        holder: &str,
+    ) -> Result<Value, String> {
+        let dir = self.project_notes_dir(name)?;
+        let holder = validate_holder(holder)?;
+        let (hash, bytes) = notes::remove_note(&dir, file)?;
+        let _ = self.ledger_record(
+            &project_ledger_key(name),
+            "note.removed",
+            json!({ "project": name, "file": file, "holder": holder, "hash": hash, "bytes": bytes }),
+        );
+        Ok(json!({ "project": name, "file": file, "holder": holder, "hash": hash, "bytes": bytes }))
     }
 
     // ----- Kranz bindings (M4, docs/design/keyboard-lease-and-ledger.md) -----
@@ -3368,6 +3504,17 @@ impl DaemonServer {
             DaemonRequest::ProjectShow { name } => self.handle_project_show(&name),
             DaemonRequest::ProjectDossier { name, lines } => {
                 self.handle_project_dossier(&name, lines)
+            }
+            DaemonRequest::ProjectNoteAdd {
+                name,
+                title,
+                body,
+                holder,
+                pane_id,
+            } => self.handle_project_note_add(&name, &title, &body, &holder, pane_id.as_deref()),
+            DaemonRequest::ProjectNotes { name } => self.handle_project_notes(&name),
+            DaemonRequest::ProjectNoteRemove { name, file, holder } => {
+                self.handle_project_note_remove(&name, &file, &holder)
             }
             DaemonRequest::AgentStatus { pid, payload } => {
                 Ok(self.handle_agent_status(pid, &payload))

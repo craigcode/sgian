@@ -235,3 +235,6 @@ pub(crate) use agents::*;
 mod lease_identity;
 #[allow(unused_imports)]
 pub(crate) use lease_identity::*;
+mod notes;
+#[allow(unused_imports)]
+pub(crate) use notes::*;

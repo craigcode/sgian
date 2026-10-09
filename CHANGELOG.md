@@ -26,6 +26,18 @@ follow SemVer once the first public tag exists.
 
 ### Agents
 
+- Shared context notes for a project (`docs/design/shared-context-notes.md`,
+  step 1). `ctl project note add NAME --title TEXT` writes a short Markdown
+  file under `<repo>/.sgian/projects/NAME/notes/` with the writer, the pane
+  and the time in its front matter; `ctl project notes NAME` prints every
+  note newest first as one bounded document; `ctl project note rm` removes
+  one. The author is the connection's credential holder, never a declared
+  name, and every write goes into the project's own ledger with the file's
+  hash, which `project ledger` merges and `project dossier` carries beside
+  the notes themselves. Bodies are scrubbed on read as agent output is, and
+  a note that hid text is marked; a file written outside the daemon is
+  listed with evidence `file`. One note is at most 16 KiB, a project's
+  notes at most 1 MiB and 256 files.
 - Agent panes get the output guard. No emulator stands between an agent
   and the person in a chat pane, so the daemon now scrubs every string in a
   normalized agent event before it is logged or shown: terminal escape

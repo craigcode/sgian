@@ -781,7 +781,7 @@ pub(crate) fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             let parsed = parse_project_args(&options.args[1..])?;
             let client = if matches!(
                 parsed.verb,
-                ProjectVerb::List | ProjectVerb::Show | ProjectVerb::Ledger
+                ProjectVerb::List | ProjectVerb::Show | ProjectVerb::Ledger | ProjectVerb::Notes
             ) {
                 DaemonClient::connect_existing(options.workspace)?
             } else {
@@ -2045,6 +2045,12 @@ pub(crate) enum ProjectVerb {
     Delete,
     Ledger,
     Dossier,
+    /// `project notes NAME`: every note, newest first.
+    Notes,
+    /// `project note add NAME --title T [--body TEXT | --file PATH] [--pane PANE] [--as HOLDER]`
+    NoteAdd,
+    /// `project note rm NAME FILE [--as HOLDER]`
+    NoteRm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2057,12 +2063,21 @@ pub(crate) struct ProjectArgs {
     pub(crate) limit: usize,
     pub(crate) lines: usize,
     pub(crate) out: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) body: Option<String>,
+    pub(crate) body_file: Option<String>,
+    pub(crate) note_file: Option<String>,
+    pub(crate) pane: Option<String>,
+    pub(crate) holder: Option<String>,
 }
 
 /// `project list | show NAME | new NAME [--goal TEXT] [--repo PATH] |
 /// add NAME PANE... | rm PANE... | delete NAME | ledger NAME [-n N] |
-/// dossier NAME [--lines N] [--out FILE]`.
+/// dossier NAME [--lines N] [--out FILE] | notes NAME |
+/// note add NAME --title T [--body TEXT | --file PATH] [--pane PANE] [--as HOLDER] |
+/// note rm NAME FILE [--as HOLDER]`.
 pub(crate) fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String> {
+    let mut index = if args.is_empty() { 0 } else { 1 };
     let verb = match args.first().map(String::as_str) {
         None | Some("list") => ProjectVerb::List,
         Some("show") => ProjectVerb::Show,
@@ -2072,6 +2087,16 @@ pub(crate) fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String>
         Some("delete") => ProjectVerb::Delete,
         Some("ledger") => ProjectVerb::Ledger,
         Some("dossier") => ProjectVerb::Dossier,
+        Some("notes") => ProjectVerb::Notes,
+        Some("note") => {
+            index = 2;
+            match args.get(1).map(String::as_str) {
+                Some("add") => ProjectVerb::NoteAdd,
+                Some("rm") | Some("remove") => ProjectVerb::NoteRm,
+                Some(other) => return Err(format!("unknown project note command: {other}")),
+                None => return Err("project note needs add or rm".to_string()),
+            }
+        }
         Some(other) => return Err(format!("unknown project command: {other}")),
     };
     let mut parsed = ProjectArgs {
@@ -2083,9 +2108,14 @@ pub(crate) fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String>
         limit: 0,
         lines: 0,
         out: None,
+        title: None,
+        body: None,
+        body_file: None,
+        note_file: None,
+        pane: None,
+        holder: None,
     };
     let mut positionals: Vec<String> = Vec::new();
-    let mut index = if args.is_empty() { 0 } else { 1 };
     while index < args.len() {
         match args[index].as_str() {
             "--goal" => {
@@ -2133,6 +2163,45 @@ pub(crate) fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String>
                 );
                 index += 1;
             }
+            "--title" => {
+                parsed.title = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .ok_or_else(|| "--title requires TEXT".to_string())?,
+                );
+                index += 1;
+            }
+            "--body" => {
+                parsed.body = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .ok_or_else(|| "--body requires TEXT".to_string())?,
+                );
+                index += 1;
+            }
+            "--file" => {
+                parsed.body_file = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .ok_or_else(|| "--file requires a PATH".to_string())?,
+                );
+                index += 1;
+            }
+            "--pane" => {
+                parsed.pane = Some(
+                    args.get(index + 1)
+                        .cloned()
+                        .ok_or_else(|| "--pane requires a PANE".to_string())?,
+                );
+                index += 1;
+            }
+            "--as" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--as requires a HOLDER".to_string())?;
+                parsed.holder = Some(validate_holder(value)?);
+                index += 1;
+            }
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(format!("unexpected argument for project: {other}"));
             }
@@ -2150,10 +2219,30 @@ pub(crate) fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String>
         | ProjectVerb::Delete
         | ProjectVerb::New
         | ProjectVerb::Ledger
-        | ProjectVerb::Dossier => {
+        | ProjectVerb::Dossier
+        | ProjectVerb::Notes => {
             if positionals.len() != 1 {
                 return Err("expected exactly one project NAME".to_string());
             }
+            parsed.name = positionals.pop();
+        }
+        ProjectVerb::NoteAdd => {
+            if positionals.len() != 1 {
+                return Err("project note add needs exactly one project NAME".to_string());
+            }
+            parsed.name = positionals.pop();
+            if parsed.title.as_deref().is_none_or(|t| t.trim().is_empty()) {
+                return Err("project note add needs --title TEXT".to_string());
+            }
+            if parsed.body.is_some() && parsed.body_file.is_some() {
+                return Err("--body and --file are alternatives".to_string());
+            }
+        }
+        ProjectVerb::NoteRm => {
+            if positionals.len() != 2 {
+                return Err("project note rm needs a project NAME and a note FILE".to_string());
+            }
+            parsed.note_file = positionals.pop();
             parsed.name = positionals.pop();
         }
         ProjectVerb::Add => {
@@ -2178,6 +2267,17 @@ pub(crate) fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String>
     }
     if verb != ProjectVerb::Dossier && (parsed.lines != 0 || parsed.out.is_some()) {
         return Err("--lines/--out apply to `project dossier`".to_string());
+    }
+    if verb != ProjectVerb::NoteAdd
+        && (parsed.title.is_some()
+            || parsed.body.is_some()
+            || parsed.body_file.is_some()
+            || parsed.pane.is_some())
+    {
+        return Err("--title/--body/--file/--pane apply to `project note add`".to_string());
+    }
+    if !matches!(verb, ProjectVerb::NoteAdd | ProjectVerb::NoteRm) && parsed.holder.is_some() {
+        return Err("--as applies to `project note add|rm`".to_string());
     }
     Ok(parsed)
 }
@@ -2332,6 +2432,69 @@ pub(crate) fn control_project(
                     .map_err(|error| format!("failed to write stdout: {error}"))?;
             }
             Ok(())
+        }
+        ProjectVerb::Notes => {
+            let listing: Value = client.request(DaemonRequest::ProjectNotes {
+                name: parsed.name.unwrap_or_default(),
+            })?;
+            if json_output {
+                return write_json_stdout(&listing);
+            }
+            write_notes_document(&mut stdout, &listing)
+        }
+        ProjectVerb::NoteAdd => {
+            let body = match (parsed.body, parsed.body_file) {
+                (Some(body), _) => body,
+                (None, Some(path)) => fs::read_to_string(&path)
+                    .map_err(|error| format!("failed to read {path}: {error}"))?,
+                (None, None) => {
+                    let mut raw = String::new();
+                    std::io::stdin()
+                        .take(CTL_STDIN_PAYLOAD_MAX)
+                        .read_to_string(&mut raw)
+                        .map_err(|error| format!("failed to read stdin: {error}"))?;
+                    raw
+                }
+            };
+            let pane_id = match parsed.pane {
+                Some(pane_ref) => Some(resolve_pane_ref(client, &pane_ref)?),
+                None => None,
+            };
+            let result: Value = client.request(DaemonRequest::ProjectNoteAdd {
+                name: parsed.name.unwrap_or_default(),
+                title: parsed.title.unwrap_or_default(),
+                body,
+                holder: parsed.holder.unwrap_or_else(default_holder),
+                pane_id,
+            })?;
+            if json_output {
+                return write_json_stdout(&result);
+            }
+            writeln!(
+                stdout,
+                "{}\t{}\t{}",
+                result["file"].as_str().unwrap_or("-"),
+                result["holder"].as_str().unwrap_or("-"),
+                result["hash"].as_str().unwrap_or("-")
+            )
+            .map_err(|error| format!("failed to write stdout: {error}"))
+        }
+        ProjectVerb::NoteRm => {
+            let result: Value = client.request(DaemonRequest::ProjectNoteRemove {
+                name: parsed.name.unwrap_or_default(),
+                file: parsed.note_file.unwrap_or_default(),
+                holder: parsed.holder.unwrap_or_else(default_holder),
+            })?;
+            if json_output {
+                return write_json_stdout(&result);
+            }
+            writeln!(
+                stdout,
+                "{}\tremoved\t{}",
+                result["file"].as_str().unwrap_or("-"),
+                result["hash"].as_str().unwrap_or("-")
+            )
+            .map_err(|error| format!("failed to write stdout: {error}"))
         }
         ProjectVerb::Dossier => {
             let result: Value = client.request(DaemonRequest::ProjectDossier {
@@ -5008,6 +5171,47 @@ pub(crate) fn parse_name_option(args: &[String]) -> Result<Option<String>, Strin
     Ok(title)
 }
 
+/// `project notes` as one bounded document for a person, a reviewer or a
+/// Kranz gate: a header line, then each note newest first with its file,
+/// writer (or `file` when it was written outside the daemon), date, title
+/// and scrubbed body. Notes that tripped the output guard are marked.
+pub(crate) fn write_notes_document(out: &mut impl Write, listing: &Value) -> Result<(), String> {
+    let mut write = |line: String| -> Result<(), String> {
+        writeln!(out, "{line}").map_err(|error| format!("failed to write stdout: {error}"))
+    };
+    write(format!(
+        "{}\t{} note(s)\t{} bytes\t{}",
+        listing["project"].as_str().unwrap_or("-"),
+        listing["total"].as_u64().unwrap_or(0),
+        listing["bytes"].as_u64().unwrap_or(0),
+        listing["dir"].as_str().unwrap_or("-")
+    ))?;
+    for note in listing["notes"].as_array().into_iter().flatten() {
+        let when = note["written_at_ms"]
+            .as_u64()
+            .map(crate::notes::civil_date)
+            .unwrap_or_else(|| "-".to_string());
+        let who = note["holder"].as_str().unwrap_or("file");
+        let guard = if note["tricks"].is_object() {
+            "\tGUARD"
+        } else {
+            ""
+        };
+        write(String::new())?;
+        write(format!(
+            "## {}\t{}\t{}{}",
+            note["file"].as_str().unwrap_or("-"),
+            who,
+            when,
+            guard
+        ))?;
+        write(note["title"].as_str().unwrap_or("").to_string())?;
+        write(String::new())?;
+        write(note["body"].as_str().unwrap_or("").to_string())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_pane_ref(client: &DaemonClient, pane_ref: &str) -> Result<String, String> {
     let list: PaneList = client.request(DaemonRequest::ListPanes)?;
     match_pane_ref(&list, pane_ref)
@@ -5244,8 +5448,18 @@ Commands (PANE is a pane id or title; defaults to the active pane):
   project dossier <NAME> [--lines N] [--out FILE]
                                 One JSON document for a reviewer or a Kranz
                                   gate: the roll-up, every member pane's state,
-                                  its full ledger (chain verified) and the last
-                                  N scrollback lines (default 40)
+                                  its full ledger (chain verified), the last
+                                  N scrollback lines (default 40) and the notes
+  project notes <NAME>          The project's shared context notes, newest
+                                  first, as one bounded document (bodies
+                                  scrubbed; GUARD marks a note that hid text)
+  project note add <NAME> --title TEXT [--body TEXT | --file PATH] [--pane PANE] [--as HOLDER]
+                                Write a note under <repo>/.sgian/projects/
+                                  <NAME>/notes/ (body from stdin when neither
+                                  --body nor --file); ledgered with its hash.
+                                  A credentialed client writes as itself.
+  project note rm <NAME> <FILE> [--as HOLDER]
+                                Remove a note; ledgered with its hash
   kranz status                  List panes bound to Kranz missions (auto: a
                                   `kranz run` under the pane; manual: bind)
   kranz bind [PANE] [--repo PATH]

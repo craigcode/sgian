@@ -117,6 +117,22 @@ diff. The Tauri client groups its session overview by project with a per-
 project roll-up; the macOS sidebar groups its sections by project with the
 roll-up in each header, and the Windows sidebar shows one roll-up line per
 project above the list and names each pane's project in its subtitle.
+`project_note_add {name, title, body, holder, pane_id?}`, `project_notes
+{name}` and `project_note_remove {name, file, holder}` manage a project's
+shared context notes (`docs/design/shared-context-notes.md`): Markdown files
+under `<repo>/.sgian/projects/<name>/notes/` (the workspace directory when
+the project names no repo). `project_notes` returns `{format:
+"sgian.notes.v1", project, dir, total, bytes, tricks?, notes: [{file, title,
+evidence, holder?, pane?, written_at_ms?, bytes, hash, body, tricks?}]}`,
+newest first, with bodies scrubbed as agent output is and the hidden-text
+tricks counted per note and in all; `evidence` is `daemon` when the file
+carries the front matter the daemon wrote and `file` when something else
+wrote it. Every write is a `note.added` / `note.removed` record with the
+content hash in the project's own ledger (`ledger/project-<name>.jsonl`,
+`pane_id: "project-<name>"`), which `project_ledger` merges with the member
+panes' and `project_dossier` carries as `ledger`, beside the listing as
+`notes`. A credentialed connection's `holder` must match its own, as for
+input and leases; a read-only credential can list but not write.
 The bootstrap snapshot may carry `output_warnings` (pane_id → per-kind
 counts of output that hides content: `conceal`, `clipboard`,
 `hyperlink_mismatch`, `string_controls`, `c1_controls`, and `invisible` for
