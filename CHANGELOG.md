@@ -37,7 +37,11 @@ follow SemVer once the first public tag exists.
   "Trojan Source" set that can reorder or hide what a person reads or
   approves; those characters are removed from the text. The badge, the
   `output.suspicious` ledger record and `ctl agent` show the counts; all
-  three clients name the new counter.
+  three clients name the new counter. An event that had something removed
+  carries `scrubbed` with the counts; a streamed `text_delta` that ends
+  inside an escape sequence is joined with the next before scrubbing, so
+  nothing leaks as text; and a string control ended by the C1 terminator
+  no longer swallows the text after it, in shell panes too.
 
 ### Fixes
 

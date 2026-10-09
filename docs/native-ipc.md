@@ -129,6 +129,14 @@ seen; all additive, and a client should mark such a pane (the Tauri client shows
 beside the agent badge, with the per-kind counts in its title; macOS an
 orange eye-slash icon in the pane row; Windows `⚠ N hidden` in the subtitle).
 
+Agent events (`agent_event`) are scrubbed by the daemon before they are
+logged or sent: escape sequences and control characters are removed from
+every string, and the characters the `invisible` counter covers are removed
+too. When anything was counted, the event carries `scrubbed`, an
+`OutputTricks` object with those counts, so a client can mark the text
+beside which characters were removed. Additive; the per-pane conversation
+log holds the scrubbed text.
+
 The bootstrap snapshot may carry `agent_usage` (pane_id → `{ model?,
 model_id?, context_used_percentage?, context_window_size?, five_hour?,
 seven_day?, total_cost_cents?, session_id?, updated_at_ms }`, windows as
