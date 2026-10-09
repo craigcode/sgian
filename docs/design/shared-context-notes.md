@@ -1,8 +1,13 @@
 # Shared context notes for a project
 
-**Status: design, not built.** The last roadmap item that is not blocked on
-something outside this repository. Written before code because the hard
-questions are about ownership and trust, not plumbing.
+**Status: step 1 built; steps 2 to 4 not.** The daemon writes, lists and
+removes notes (`project_note_add`, `project_notes`, `project_note_remove`;
+`ctl project notes`, `ctl project note add|rm`), ledgers every write with a
+content hash, caps the sizes, and scrubs bodies on read. The file watch is
+deferred to step 2 with the event: a file written outside the daemon is
+recognised on read by its missing front matter and listed with evidence
+`file`. Written before code because the hard questions are about ownership
+and trust, not plumbing.
 
 ## What it is for
 
@@ -113,8 +118,8 @@ directory an injection surface, and the design treats it as one:
 ## Build order, when it is built
 
 1. Daemon: `project note add|list|rm` requests and `ctl` verbs, the ledger
-   records, the file watch with `file` evidence, the size caps, and the
-   scrub on read. Tests at the request level.
+   records, `file` evidence for notes written outside the daemon, the size
+   caps, and the scrub on read. Tests at the request level. **Built.**
 2. `ctl project notes` and the `project_notes_changed` event, with a line
    in `native-ipc.md`.
 3. Clients: a notes list beside the project in the overview, with author

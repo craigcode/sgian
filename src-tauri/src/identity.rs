@@ -170,6 +170,7 @@ pub(crate) fn request_scope(request: &DaemonRequest) -> ClientScope {
         | DaemonRequest::ProjectShow { .. }
         | DaemonRequest::ProjectLedger { .. }
         | DaemonRequest::ProjectDossier { .. }
+        | DaemonRequest::ProjectNotes { .. }
         | DaemonRequest::AgentStatus { .. }
         | DaemonRequest::AgentSignal { .. }
         | DaemonRequest::GetScrollback { .. }
@@ -225,6 +226,8 @@ pub(crate) fn bind_holder(
         DaemonRequest::SendInputAs { ref holder, .. }
         | DaemonRequest::TakeLease { ref holder, .. }
         | DaemonRequest::ReleaseLease { ref holder, .. }
+        | DaemonRequest::ProjectNoteAdd { ref holder, .. }
+        | DaemonRequest::ProjectNoteRemove { ref holder, .. }
             if holder != own =>
         {
             return Err(mismatch(holder));

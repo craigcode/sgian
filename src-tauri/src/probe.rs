@@ -180,6 +180,12 @@ pub(crate) const PROJECT_DOSSIER_DEFAULT_LINES: usize = 40;
 /// The dossier document's format tag; bump when a consumer could misread it.
 pub(crate) const PROJECT_DOSSIER_FORMAT: &str = "sgian.dossier.v1";
 
+/// The ledger a project's own records (notes) chain in: `project-<name>`,
+/// beside the pane ledgers and disjoint from their `pane-N` ids.
+pub(crate) fn project_ledger_key(name: &str) -> String {
+    format!("project-{name}")
+}
+
 /// Project names are keys and appear in ledgers and shell output: short,
 /// `[A-Za-z0-9._-]`, no leading dot.
 pub(crate) fn validate_project_name(raw: &str) -> Result<String, String> {
