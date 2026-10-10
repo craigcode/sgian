@@ -6173,6 +6173,15 @@ fn lease_status(pane_id: String, state: State<'_, AppState>) -> Result<LeaseInfo
         .request(DaemonRequest::LeaseStatus { pane_id })
 }
 
+/// A project's shared context notes, newest first, bodies scrubbed
+/// (docs/design/shared-context-notes.md).
+#[tauri::command]
+fn project_notes(name: String, state: State<'_, AppState>) -> Result<Value, String> {
+    state
+        .client()?
+        .request(DaemonRequest::ProjectNotes { name })
+}
+
 #[tauri::command]
 fn resize_pane_terminal(
     pane_id: String,
@@ -6409,6 +6418,7 @@ pub fn run() {
             take_lease,
             release_lease,
             lease_status,
+            project_notes,
             install_update,
             ui_smoke_enabled,
             complete_ui_smoke

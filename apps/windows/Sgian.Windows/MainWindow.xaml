@@ -16,6 +16,7 @@
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
@@ -67,7 +68,13 @@
                 <TextBlock x:Name="ProjectSummary" Grid.Row="2" FontSize="11" TextWrapping="Wrap"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" Visibility="Collapsed" />
 
-                <ListView x:Name="PaneList" Grid.Row="3" SelectionMode="Single"
+                <!-- Shared context notes beside each project (docs/design/shared-context-notes.md):
+                     a summary and the newest few, titles only; bodies never reach the board. -->
+                <TextBlock x:Name="ProjectNotes" Grid.Row="3" FontSize="11" TextWrapping="Wrap"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" Visibility="Collapsed"
+                           AutomationProperties.Name="Project notes" />
+
+                <ListView x:Name="PaneList" Grid.Row="4" SelectionMode="Single"
                           IsItemClickEnabled="True" SelectionChanged="PaneList_SelectionChanged">
                     <ListView.ItemTemplate>
                         <DataTemplate>
@@ -88,7 +95,7 @@
                     </ListView.ItemTemplate>
                 </ListView>
 
-                <Button Grid.Row="4" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                <Button Grid.Row="5" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
                         Click="ChooseWorkspace_Click" ToolTipService.ToolTip="Choose workspace">
                     <Grid ColumnSpacing="9">
                         <Grid.ColumnDefinitions>

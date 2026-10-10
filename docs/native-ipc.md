@@ -140,7 +140,12 @@ note is written, changed or removed: the daemon's own writes announce at
 once, and a file watch over each root's `.sgian/projects` tree covers edits
 made outside it (an agent's file tools, an editor). `hash` is the SHA-256 of
 the file now there and is absent once it is gone. The event never carries
-the note's contents. The web bridge forwards it as `project-notes-changed`.
+the note's contents. The web bridge forwards it as `project-notes-changed`
+and exposes `project_notes {name}` as a frontend command. All three clients
+show a project's notes beside it on the board: a summary ("2 notes · 1 hid
+text") and the newest few as one line each (title, writer or `file`, date,
+⚠ when the guard removed hidden text), re-read on the event; bodies never
+reach the board.
 The bootstrap snapshot may carry `output_warnings` (pane_id → per-kind
 counts of output that hides content: `conceal`, `clipboard`,
 `hyperlink_mismatch`, `string_controls`, `c1_controls`, and `invisible` for

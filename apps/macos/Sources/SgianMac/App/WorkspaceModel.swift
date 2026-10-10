@@ -12,6 +12,8 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var leases: [String: LeaseInfo] = [:]
     /// Projects by name (ENHANCEMENTS "projects"); the sidebar groups by them.
     @Published private(set) var projects: [String: Project] = [:]
+    /// Shared context notes per project (docs/design/shared-context-notes.md).
+    @Published private(set) var notes: [String: [ProjectNote]] = [:]
     /// Panes whose output hid something (docs/design/keyboard-lease-and-ledger.md §7).
     @Published private(set) var outputWarnings: [String: OutputTricks] = [:]
     /// Per-pane usage from Claude Code's status line (`sgian ctl statusline`).
@@ -422,6 +424,38 @@ final class WorkspaceModel: ObservableObject {
         ProjectBoard.group(panes: panes, projects: projects)
     }
 
+    /// The notes lines a project header shows (none for unassigned panes).
+    func noteLines(for group: ProjectGroup) -> [String] {
+        guard let name = group.name else { return [] }
+        return ProjectBoard.noteLines(notes[name] ?? [])
+    }
+
+    /// Keep the notes table aligned with the project table: drop projects
+    /// that are gone, fetch those not read yet.
+    private func syncNotes() {
+        for name in notes.keys where projects[name] == nil {
+            notes.removeValue(forKey: name)
+        }
+        for name in projects.keys where notes[name] == nil {
+            refreshNotes(name)
+        }
+    }
+
+    /// Re-read one project's notes. The listing is bounded by the daemon; a
+    /// failure keeps the previous listing (the board is a glance, not a
+    /// report) and is not surfaced.
+    private func refreshNotes(_ name: String) {
+        perform(reportErrors: false) { [weak self] client in
+            let listing: JSONValue = try await client.request([
+                "command": .string("project_notes"),
+                "name": .string(name),
+            ], as: JSONValue.self)
+            guard let self, self.client === client, self.projects[name] != nil else { return }
+            let next = ProjectNote.list(from: listing)
+            if self.notes[name] != next { self.notes[name] = next }
+        }
+    }
+
     func rollupText(for group: ProjectGroup) -> String {
         ProjectBoard.rollup(
             panes: group.panes,
@@ -567,6 +601,7 @@ final class WorkspaceModel: ObservableObject {
         agentStates = snapshot.agentStates
         leases = snapshot.leases
         projects = snapshot.projects
+        syncNotes()
         outputWarnings = snapshot.outputWarnings
         agentUsage = snapshot.agentUsage
         agentSpecs = snapshot.agentSpecs
@@ -644,6 +679,12 @@ final class WorkspaceModel: ObservableObject {
 
         case "projects_changed":
             Project.apply(event: .object(event.payload), to: &projects)
+            syncNotes()
+
+        case "project_notes_changed":
+            if let name = ProjectNote.changedProject(event: .object(event.payload)) {
+                refreshNotes(name)
+            }
 
         case "output_warning":
             OutputTricks.apply(event: .object(event.payload), to: &outputWarnings)

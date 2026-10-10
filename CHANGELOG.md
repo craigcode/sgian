@@ -65,6 +65,15 @@ follow SemVer once the first public tag exists.
   nothing leaks as text; and a string control ended by the C1 terminator
   no longer swallows the text after it, in shell panes too.
 
+### Clients
+
+- Shared context notes on the board. The macOS sidebar, the Windows sidebar
+  and the web overview show each project's notes beside it: a summary ("2
+  notes · 1 hid text") and the newest few as one line each with the title,
+  the writer (or `file` for a note written outside the daemon), the date and
+  ⚠ when the output guard removed hidden text. The list is re-read when the
+  daemon announces a change; note bodies never reach the board.
+
 ### Fixes
 
 - The vendored `portable-pty` fork drops its serial-port module and with it

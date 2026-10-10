@@ -43,6 +43,18 @@ struct ProjectRollup: Equatable {
 /// Pure grouping and roll-up for the project board; no model access so it is
 /// testable with plain values.
 enum ProjectBoard {
+    /// What a project header shows for its shared context notes: a summary
+    /// ("2 notes · 1 hid text") then the newest `limit` notes, one line each;
+    /// empty when the project has none.
+    static func noteLines(_ notes: [ProjectNote], limit: Int = 3) -> [String] {
+        if notes.isEmpty { return [] }
+        var lines = ["\(notes.count) note\(notes.count == 1 ? "" : "s")"]
+        let guarded = notes.filter(\.guarded).count
+        if guarded > 0 { lines[0] += " · \(guarded) hid text" }
+        lines.append(contentsOf: notes.prefix(limit).map(\.line))
+        return lines
+    }
+
     /// Projects sorted by name, member panes in project order; panes in no
     /// project last under `name: nil` (omitted when every pane is assigned).
     /// A member id the client does not know is skipped: it closed between two

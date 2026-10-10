@@ -237,7 +237,8 @@ Open, in order:
   ledgers each write with its hash, caps sizes and scrubs on read;
   `ctl project notes` and `ctl project note add|rm`) and step 2 (the
   `project_notes_changed` event, from the daemon's own writes and a file
-  watch over each root). The client views and the opt-in prompt line are
+  watch over each root) and step 3 (each client shows a project's notes
+  beside it on the board, re-read on the event). The opt-in prompt line is
   not built. The output-guard
   stripping for agent panes shipped: the daemon scrubs every string in a
   normalized agent event before it is logged or shown, dropping escape

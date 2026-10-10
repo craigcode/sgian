@@ -34,7 +34,8 @@ struct SidebarView: View {
                                 title: group.title,
                                 goal: group.goal,
                                 rollup: model.rollupText(for: group),
-                                limit: model.limitText(for: group)
+                                limit: model.limitText(for: group),
+                                notes: model.noteLines(for: group)
                             )
                         }
                     }
@@ -128,6 +129,8 @@ private struct ProjectHeader: View {
     let goal: String?
     let rollup: String
     var limit: String? = nil
+    /// Shared context notes: a summary line then the newest few, one each.
+    var notes: [String] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
@@ -148,9 +151,19 @@ private struct ProjectHeader: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            ForEach(Array(notes.enumerated()), id: \.offset) { index, line in
+                Text(line)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .padding(.leading, index == 0 ? 0 : 8)
+            }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(title). \(rollup)\(limit.map { ". " + $0 } ?? "")")
+        .accessibilityLabel(
+            "\(title). \(rollup)\(limit.map { ". " + $0 } ?? "")"
+                + (notes.isEmpty ? "" : ". " + notes.joined(separator: ". "))
+        )
     }
 }
 

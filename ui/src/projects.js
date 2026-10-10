@@ -257,3 +257,63 @@ export function groupLimitText(panes, state, nowSeconds = Math.floor(Date.now() 
   if (!freshest) return "";
   return usageText({ ...freshest, model: null, context: null }, nowSeconds);
 }
+
+// Shared context notes (docs/design/shared-context-notes.md): what the
+// overview shows beside a project. Bodies never reach the board; a note is a
+// title, who wrote it (or `file` when it was written outside the daemon), a
+// date and whether the output guard removed hidden text from it.
+
+/**
+ * Normalize a `project_notes` listing into an array of
+ * `{ file, title, evidence, holder, pane, writtenAtMs, hash, guarded }`,
+ * newest first as the daemon sends them. Malformed entries are dropped.
+ */
+export function normalizeProjectNotes(listing) {
+  const entries = Array.isArray(listing?.notes) ? listing.notes : [];
+  const notes = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    if (typeof entry.file !== "string" || !entry.file) continue;
+    notes.push({
+      file: entry.file,
+      title: typeof entry.title === "string" && entry.title ? entry.title : entry.file,
+      evidence: entry.evidence === "daemon" ? "daemon" : "file",
+      holder: typeof entry.holder === "string" && entry.holder ? entry.holder : null,
+      pane: typeof entry.pane === "string" && entry.pane ? entry.pane : null,
+      writtenAtMs: Number.isFinite(entry.written_at_ms) ? entry.written_at_ms : null,
+      hash: typeof entry.hash === "string" ? entry.hash : "",
+      guarded: Boolean(entry.tricks && typeof entry.tricks === "object"),
+    });
+  }
+  return notes;
+}
+
+export function projectNotesEqual(a, b) {
+  if (!a || !b) return a === b;
+  if (a.length !== b.length) return false;
+  return a.every((note, index) => {
+    const other = b[index];
+    return note.file === other.file && note.hash === other.hash && note.guarded === other.guarded;
+  });
+}
+
+/** `YYYY-MM-DD` (UTC) for a daemon millisecond timestamp, or "–". */
+export function noteDate(writtenAtMs) {
+  if (!Number.isFinite(writtenAtMs)) return "–";
+  return new Date(writtenAtMs).toISOString().slice(0, 10);
+}
+
+/** "Flaky auth test — craig@mac · 2026-10-09 ⚠" (⚠ when the guard removed hidden text). */
+export function noteLine(note) {
+  const who = note.holder ?? "file";
+  return `${note.title} — ${who} · ${noteDate(note.writtenAtMs)}${note.guarded ? " ⚠" : ""}`;
+}
+
+/** "2 notes · 1 hid text", or null when the project has no notes. */
+export function notesSummaryText(notes) {
+  if (!Array.isArray(notes) || notes.length === 0) return null;
+  const parts = [`${notes.length} note${notes.length === 1 ? "" : "s"}`];
+  const guarded = notes.filter((note) => note.guarded).length;
+  if (guarded > 0) parts.push(`${guarded} hid text`);
+  return parts.join(" · ");
+}

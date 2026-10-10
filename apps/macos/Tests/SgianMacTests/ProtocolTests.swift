@@ -432,3 +432,33 @@ func daemonRoundTrip() async throws {
     #expect(CredentialStore.save("   ", for: workspace))
     #expect(CredentialStore.load(for: workspace) == nil, "blank removes")
 }
+
+@Test func projectNotesDecodeAndRenderForTheBoard() throws {
+    let listing = try JSONDecoder().decode(JSONValue.self, from: Data(#"""
+    {"format":"sgian.notes.v1","project":"feature","total":2,"notes":[
+      {"file":"2026-10-09-flaky-auth-test.md","title":"Flaky auth test","evidence":"daemon","holder":"craig@mac","pane":"pane-1","written_at_ms":1791633600000,"hash":"aa","body":"never shown","tricks":{"invisible":1}},
+      {"file":"2020-01-01-raw.md","title":"2020-01-01-raw","evidence":"file","hash":"bb","body":"x"},
+      {"title":"dropped"},
+      "junk"]}
+    """#.utf8))
+    let notes = ProjectNote.list(from: listing)
+    #expect(notes.map(\.file) == ["2026-10-09-flaky-auth-test.md", "2020-01-01-raw.md"])
+    #expect(notes[0].holder == "craig@mac")
+    #expect(notes[0].guarded)
+    #expect(notes[0].line == "Flaky auth test — craig@mac · 2026-10-10 ⚠")
+    #expect(notes[1].evidence == "file")
+    #expect(notes[1].holder == nil)
+    #expect(notes[1].line == "2020-01-01-raw — file · –")
+    #expect(ProjectBoard.noteLines(notes) == [
+        "2 notes · 1 hid text",
+        "Flaky auth test — craig@mac · 2026-10-10 ⚠",
+        "2020-01-01-raw — file · –",
+    ])
+    #expect(ProjectBoard.noteLines([]).isEmpty)
+    #expect(ProjectBoard.noteLines(notes, limit: 1).count == 2)
+
+    let changed = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"project_notes_changed","project":"feature","file":"a.md","hash":"aa"}"#.utf8))
+    #expect(ProjectNote.changedProject(event: changed) == "feature")
+    let malformed = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"project_notes_changed"}"#.utf8))
+    #expect(ProjectNote.changedProject(event: malformed) == nil)
+}

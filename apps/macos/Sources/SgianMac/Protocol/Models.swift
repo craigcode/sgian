@@ -457,3 +457,69 @@ enum ConnectionStatus: Equatable {
         }
     }
 }
+
+/// One shared context note as the board shows it
+/// (docs/design/shared-context-notes.md): who wrote it, when, and whether
+/// the output guard removed hidden text. The body never reaches the board.
+struct ProjectNote: Equatable, Sendable {
+    var file: String
+    var title: String
+    /// `daemon` when the daemon wrote it with its front matter, `file` when
+    /// something else did.
+    var evidence: String
+    var holder: String?
+    var pane: String?
+    var writtenAtMs: Double?
+    var hash: String
+    var guarded: Bool
+
+    /// Decode a `project_notes` listing (newest first), dropping malformed
+    /// entries.
+    static func list(from value: JSONValue) -> [ProjectNote] {
+        guard let entries = value["notes"]?.arrayValue else { return [] }
+        var notes: [ProjectNote] = []
+        for entry in entries {
+            guard let file = entry["file"]?.stringValue, !file.isEmpty else { continue }
+            let title = entry["title"]?.stringValue
+            notes.append(ProjectNote(
+                file: file,
+                title: (title?.isEmpty == false) ? title! : file,
+                evidence: entry["evidence"]?.stringValue == "daemon" ? "daemon" : "file",
+                holder: entry["holder"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 },
+                pane: entry["pane"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 },
+                writtenAtMs: entry["written_at_ms"]?.numberValue,
+                hash: entry["hash"]?.stringValue ?? "",
+                guarded: entry["tricks"]?.objectValue != nil
+            ))
+        }
+        return notes
+    }
+
+    /// The project a `project_notes_changed` event names, or nil when
+    /// malformed. The event carries a file and a hash, never contents, so
+    /// the client re-reads the listing.
+    static func changedProject(event: JSONValue) -> String? {
+        guard let project = event["project"]?.stringValue, !project.isEmpty else { return nil }
+        return project
+    }
+
+    /// `YYYY-MM-DD` (UTC) for the daemon's timestamp, "–" when unknown.
+    var dateText: String {
+        guard let writtenAtMs else { return "–" }
+        let date = Date(timeIntervalSince1970: writtenAtMs / 1000)
+        return ProjectNote.dateFormatter.string(from: date)
+    }
+
+    /// "Flaky auth test — craig@mac · 2026-10-09 ⚠" (⚠ when the guard removed hidden text).
+    var line: String {
+        "\(title) — \(holder ?? "file") · \(dateText)\(guarded ? " ⚠" : "")"
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+}

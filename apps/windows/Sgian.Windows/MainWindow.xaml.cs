@@ -108,6 +108,9 @@ public sealed partial class MainWindow : Window
         var projectSummary = ViewModel.ProjectSummary;
         ProjectSummary.Text = projectSummary;
         ProjectSummary.Visibility = projectSummary.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+        var projectNotes = ViewModel.ProjectNotesSummary;
+        ProjectNotes.Text = projectNotes;
+        ProjectNotes.Visibility = projectNotes.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         RenameButton.Visibility = pane is null ? Visibility.Collapsed : Visibility.Visible;
         CloseButton.Visibility = pane is null ? Visibility.Collapsed : Visibility.Visible;
         RestartButton.Visibility = pane?.State == "ended"

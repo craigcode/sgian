@@ -33,6 +33,7 @@ var tests = new (string Name, Action Body)[]
     ("Agent usage from the status line", AgentUsageModel),
     ("Workspace startup resolution", WorkspaceStartupResolution),
     ("Output warning sample", OutputWarningSample),
+    ("Project notes on the board", ProjectNotesModel),
 };
 
 var failures = new List<string>();
@@ -255,6 +256,32 @@ static void KeyboardLease()
     Equal(true, LeaseState.IsRefusal("read-only credential: 'write' scope required for send_input"));
     Equal("Read-only: this credential cannot type (no write scope).", LeaseState.NoticeText("read-only credential: 'write' scope required for send_input"));
     Equal(false, LeaseState.IsRefusal("terminal session ended: pane-2"));
+}
+
+static void ProjectNotesModel()
+{
+    var listing = Json("""
+    {"format":"sgian.notes.v1","project":"feature","total":2,"notes":[
+      {"file":"2026-10-09-flaky-auth-test.md","title":"Flaky auth test","evidence":"daemon","holder":"craig@mac","pane":"pane-1","written_at_ms":1791633600000,"hash":"aa","body":"never shown","tricks":{"invisible":1}},
+      {"file":"2020-01-01-raw.md","title":"2020-01-01-raw","evidence":"file","hash":"bb","body":"x"},
+      {"title":"dropped"},
+      "junk"]}
+    """);
+    var notes = ProjectNotes.Parse(listing) ?? throw new Exception("notes did not parse");
+    Equal(2, notes.Count);
+    Equal("craig@mac", notes[0].Holder);
+    Equal(true, notes[0].Guarded);
+    Equal("Flaky auth test — craig@mac · 2026-10-10 ⚠", notes[0].Line);
+    Equal("file", notes[1].Evidence);
+    Equal(null, notes[1].Holder);
+    Equal("2020-01-01-raw — file · –", notes[1].Line);
+    Equal("2 notes · 1 hid text|Flaky auth test — craig@mac · 2026-10-10 ⚠|2020-01-01-raw — file · –",
+        string.Join("|", ProjectNotes.Lines(notes)));
+    Equal(0, ProjectNotes.Lines([]).Count);
+    Equal(2, ProjectNotes.Lines(notes, limit: 1).Count);
+    Equal(true, ProjectNotes.Parse(Json("""{"project":"feature"}""")) is null);
+    Equal("feature", ProjectNotes.ChangedProject(Json("""{"event":"project_notes_changed","project":"feature","file":"a.md","hash":"aa"}""")));
+    Equal(null, ProjectNotes.ChangedProject(Json("""{"event":"project_notes_changed"}""")));
 }
 
 static void ProjectBoardModel()
