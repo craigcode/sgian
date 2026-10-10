@@ -6177,7 +6177,9 @@ fn lease_status(pane_id: String, state: State<'_, AppState>) -> Result<LeaseInfo
 /// (docs/design/shared-context-notes.md).
 #[tauri::command]
 fn project_notes(name: String, state: State<'_, AppState>) -> Result<Value, String> {
-    state.client()?.request(DaemonRequest::ProjectNotes { name })
+    state
+        .client()?
+        .request(DaemonRequest::ProjectNotes { name })
 }
 
 #[tauri::command]

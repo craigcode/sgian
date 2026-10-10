@@ -131,9 +131,9 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     /// </summary>
     private async Task RefreshNotesAsync(string name)
     {
-        if (!_projects.ContainsKey(name)) return;
+        if (_client is not { } client || !_projects.ContainsKey(name)) return;
         using var document = await RunRequestAsync(
-            () => _client.RequestAsync<JsonDocument>(Request(("command", "project_notes"), ("name", name))),
+            () => client.RequestAsync<JsonDocument>(Request(("command", "project_notes"), ("name", name))),
             showError: false);
         if (document is null || !_projects.ContainsKey(name)) return;
         var notes = ProjectNotes.Parse(document.RootElement);
