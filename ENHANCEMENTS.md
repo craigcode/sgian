@@ -235,8 +235,10 @@ Open, in order:
   `docs/design/shared-context-notes.md`; step 1 built (the daemon writes,
   lists and removes notes under `<repo>/.sgian/projects/<name>/notes/`,
   ledgers each write with its hash, caps sizes and scrubs on read;
-  `ctl project notes` and `ctl project note add|rm`). The event, the
-  client views and the opt-in prompt line are not built. The output-guard
+  `ctl project notes` and `ctl project note add|rm`) and step 2 (the
+  `project_notes_changed` event, from the daemon's own writes and a file
+  watch over each root). The client views and the opt-in prompt line are
+  not built. The output-guard
   stripping for agent panes shipped: the daemon scrubs every string in a
   normalized agent event before it is logged or shown, dropping escape
   sequences and controls, and counting SGR 8, OSC 52, mismatched links,

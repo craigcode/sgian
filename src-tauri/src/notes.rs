@@ -28,11 +28,14 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 
+use notify::Watcher;
 use serde::{Deserialize, Serialize};
 
 use crate::daemon_client::hex_encode;
 use crate::output_guard::{scrub_agent_text, OutputTricks};
+use crate::probe::validate_project_name;
 
 /// One note's body, after trimming, at most this many bytes.
 pub(crate) const NOTE_MAX_BYTES: usize = 16 * 1024;
@@ -379,4 +382,83 @@ pub(crate) fn remove_note(dir: &Path, file: &str) -> Result<(String, usize), Str
     })?;
     fs::remove_file(&path).map_err(|error| format!("failed to remove {file}: {error}"))?;
     Ok((note_hash(&raw), raw.len()))
+}
+
+/// Watches every root's `.sgian/projects` tree (step 2 of the design) and
+/// sends each changed path to the daemon, which turns it into a
+/// `project_notes_changed` event. One recursive watch per root covers every
+/// project under it, including projects created after the watch began.
+pub(crate) struct NotesWatch {
+    watcher: notify::RecommendedWatcher,
+    watched: HashSet<PathBuf>,
+}
+
+impl NotesWatch {
+    pub(crate) fn new(tx: Sender<PathBuf>) -> Option<Self> {
+        let watcher = notify::RecommendedWatcher::new(
+            move |result: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = result {
+                    if matches!(
+                        event.kind,
+                        notify::EventKind::Modify(_)
+                            | notify::EventKind::Create(_)
+                            | notify::EventKind::Remove(_)
+                    ) {
+                        for path in event.paths {
+                            let _ = tx.send(path);
+                        }
+                    }
+                }
+            },
+            notify::Config::default(),
+        )
+        .ok()?;
+        Some(Self {
+            watcher,
+            watched: HashSet::new(),
+        })
+    }
+
+    /// Watch `<root>/.sgian/projects` for every root that has one and drop
+    /// watches on roots no project names any more. A root without the
+    /// directory yet is picked up on the next sync, which the daemon runs
+    /// after it writes a note there.
+    pub(crate) fn sync_roots(&mut self, roots: impl IntoIterator<Item = PathBuf>) {
+        let wanted: HashSet<PathBuf> = roots
+            .into_iter()
+            .map(|root| root.join(".sgian").join("projects"))
+            .filter(|dir| dir.is_dir())
+            .collect();
+        let gone: Vec<PathBuf> = self.watched.difference(&wanted).cloned().collect();
+        for dir in gone {
+            let _ = self.watcher.unwatch(&dir);
+            self.watched.remove(&dir);
+        }
+        let new: Vec<PathBuf> = wanted.difference(&self.watched).cloned().collect();
+        for dir in new {
+            if self
+                .watcher
+                .watch(&dir, notify::RecursiveMode::Recursive)
+                .is_ok()
+            {
+                self.watched.insert(dir);
+            }
+        }
+    }
+}
+
+/// `…/.sgian/projects/<project>/notes/<file>.md` → `(project, file)`; anything
+/// else under the watched tree (a README, a temp file, a directory) is `None`.
+pub(crate) fn note_change_from_path(path: &Path) -> Option<(String, String)> {
+    let parts: Vec<&str> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
+    let n = parts.len();
+    if n < 5 || parts[n - 5] != ".sgian" || parts[n - 4] != "projects" || parts[n - 2] != "notes" {
+        return None;
+    }
+    let project = validate_project_name(parts[n - 3]).ok()?;
+    let file = validate_note_file(parts[n - 1]).ok()?;
+    Some((project, file))
 }

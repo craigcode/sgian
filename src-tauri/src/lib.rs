@@ -1510,6 +1510,18 @@ enum DaemonEvent {
     ProjectsChanged {
         projects: HashMap<String, Project>,
     },
+    /// A shared context note was written, changed or removed
+    /// (docs/design/shared-context-notes.md): the project, the file and the
+    /// content hash of what is now there, `null` once it is gone. The
+    /// daemon's own writes announce synchronously; a file watch covers
+    /// edits made outside it. Never carries the note's contents: a client
+    /// or agent decides to read, it is not fed.
+    ProjectNotesChanged {
+        project: String,
+        file: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hash: Option<String>,
+    },
     /// Keyboard lease transition (docs/design/keyboard-lease-and-ledger.md).
     /// `holder`/`since_ms` describe the lease AFTER the transition (null once
     /// released or revoked); `note` rides a release. Old clients skip the
@@ -2133,6 +2145,13 @@ struct DaemonServer {
     workspace_key: String,
     /// The workspace directory: the default root for a project's notes.
     cwd: PathBuf,
+    /// The file watch over every notes root, and the paths it reports; the
+    /// accept loop drains them into `project_notes_changed` events.
+    notes_watch: Mutex<Option<notes::NotesWatch>>,
+    notes_changes: Mutex<std::sync::mpsc::Receiver<PathBuf>>,
+    /// Notes the daemon itself just wrote or removed, by (project, file) →
+    /// resulting hash, so the watch does not announce them a second time.
+    notes_own_writes: Mutex<HashMap<(String, String), Option<String>>>,
     log_dispatch: tracing::dispatcher::Dispatch,
     /// Keeps the non-blocking log writer alive (flushes on drop). Must be held for
     /// the lifetime of the server so log entries are not lost.
@@ -2282,6 +2301,14 @@ impl DaemonServer {
 
         let ws_key = workspace_key(&cwd);
         let cwd_for_notes = cwd.clone();
+        let (notes_tx, notes_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let notes_watch = notes::NotesWatch::new(notes_tx);
+        if notes_watch.is_none() {
+            tracing::warn!(
+                event = "notes_watch_init_failed",
+                "failed to initialize the notes file watcher; only the daemon's own writes will announce"
+            );
+        }
 
         // Set up structured logging via tracing + tracing-appender. The log file
         // lives in the workspace data dir (per-workspace isolation), is opened in
@@ -2398,6 +2425,9 @@ impl DaemonServer {
             next_lease_generation: AtomicU64::new(next_lease_generation),
             workspace_key: ws_key,
             cwd: cwd_for_notes,
+            notes_watch: Mutex::new(notes_watch),
+            notes_changes: Mutex::new(notes_rx),
+            notes_own_writes: Mutex::new(HashMap::new()),
             log_dispatch,
             _log_guard: log_guard,
             token,
@@ -2581,6 +2611,7 @@ impl DaemonServer {
         self.router.broadcast(&DaemonEvent::ProjectsChanged {
             projects: self.projects_snapshot(),
         });
+        self.refresh_notes_watch();
     }
 
     fn project_summaries(&self) -> Result<Vec<ProjectSummary>, String> {
@@ -2889,30 +2920,101 @@ impl DaemonServer {
             .get(name)
             .cloned()
             .ok_or_else(|| format!("unknown project '{name}'"))?;
-        let root = match project.repo.as_deref() {
-            Some(repo) => {
-                let candidate = self.cwd.join(repo);
-                let root = candidate
-                    .canonicalize()
-                    .map_err(|error| format!("project repo {}: {error}", candidate.display()))?;
-                if !root.is_dir() {
-                    return Err(format!(
-                        "project repo {} is not a directory",
-                        root.display()
-                    ));
-                }
-                let workspace = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
-                if root != workspace && !root.join(".git").exists() {
-                    return Err(format!(
-                        "project repo {} is not a git repository; notes live in one",
-                        root.display()
-                    ));
-                }
-                root
-            }
-            None => self.cwd.clone(),
-        };
+        let root = self.notes_root(project.repo.as_deref())?;
         Ok(notes::notes_dir(&root, name))
+    }
+
+    /// The root a project's notes live under, with the rules above applied.
+    fn notes_root(&self, repo: Option<&str>) -> Result<PathBuf, String> {
+        let Some(repo) = repo else {
+            return Ok(self.cwd.clone());
+        };
+        let candidate = self.cwd.join(repo);
+        let root = candidate
+            .canonicalize()
+            .map_err(|error| format!("project repo {}: {error}", candidate.display()))?;
+        if !root.is_dir() {
+            return Err(format!(
+                "project repo {} is not a directory",
+                root.display()
+            ));
+        }
+        let workspace = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+        if root != workspace && !root.join(".git").exists() {
+            return Err(format!(
+                "project repo {} is not a git repository; notes live in one",
+                root.display()
+            ));
+        }
+        Ok(root)
+    }
+
+    /// Point the file watch at every root a project's notes can live under:
+    /// the workspace and each project's repo. Called when the project table
+    /// changes and after the daemon writes a note (the directory may be new).
+    fn refresh_notes_watch(&self) {
+        let mut roots = vec![self.cwd.clone()];
+        for project in self.projects_snapshot().values() {
+            if let Ok(root) = self.notes_root(project.repo.as_deref()) {
+                roots.push(root);
+            }
+        }
+        if let Ok(mut watch) = self.notes_watch.lock() {
+            if let Some(watch) = watch.as_mut() {
+                watch.sync_roots(roots);
+            }
+        }
+    }
+
+    /// Announce a note the daemon itself wrote or removed, and remember it
+    /// so the file watch's echo of the same change is dropped.
+    fn announce_own_note(&self, project: &str, file: &str, hash: Option<String>) {
+        if let Ok(mut own) = self.notes_own_writes.lock() {
+            own.insert((project.to_string(), file.to_string()), hash.clone());
+        }
+        self.router.broadcast(&DaemonEvent::ProjectNotesChanged {
+            project: project.to_string(),
+            file: file.to_string(),
+            hash,
+        });
+        self.refresh_notes_watch();
+    }
+
+    /// Turn the watch's pending paths into `project_notes_changed` events:
+    /// one per (project, file), with the hash of what is there now. Runs on
+    /// the accept loop's idle tick, so it never blocks a request.
+    pub(crate) fn drain_notes_changes(&self) {
+        let mut changed: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        if let Ok(receiver) = self.notes_changes.lock() {
+            while let Ok(path) = receiver.try_recv() {
+                if let Some(change) = notes::note_change_from_path(&path) {
+                    changed.insert(change);
+                }
+            }
+        }
+        for (project, file) in changed {
+            let Ok(dir) = self.project_notes_dir(&project) else {
+                continue;
+            };
+            let hash = fs::read(dir.join(&file))
+                .ok()
+                .map(|raw| notes::note_hash(&raw));
+            // The daemon's own write already announced exactly this state.
+            let own = self
+                .notes_own_writes
+                .lock()
+                .ok()
+                .and_then(|mut own| own.remove(&(project.clone(), file.clone())));
+            if own.as_ref() == Some(&hash) {
+                continue;
+            }
+            self.router.broadcast(&DaemonEvent::ProjectNotesChanged {
+                project,
+                file,
+                hash,
+            });
+        }
     }
 
     fn handle_project_note_add(
@@ -2951,6 +3053,7 @@ impl DaemonServer {
             "bytes": written.bytes,
         });
         let _ = self.ledger_record(&project_ledger_key(name), "note.added", receipt.clone());
+        self.announce_own_note(name, &written.file, Some(written.hash.clone()));
         receipt["path"] = json!(written.path.display().to_string());
         Ok(receipt)
     }
@@ -2975,6 +3078,7 @@ impl DaemonServer {
             "note.removed",
             json!({ "project": name, "file": file, "holder": holder, "hash": hash, "bytes": bytes }),
         );
+        self.announce_own_note(name, file, None);
         Ok(json!({ "project": name, "file": file, "holder": holder, "hash": hash, "bytes": bytes }))
     }
 

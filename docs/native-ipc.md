@@ -135,6 +135,12 @@ content hash in the project's own ledger (`ledger/project-<name>.jsonl`,
 panes' and `project_dossier` carries as `ledger`, beside the listing as
 `notes`. A credentialed connection's `holder` must match its own, as for
 input and leases; a read-only credential can list but not write.
+Subscribers receive `project_notes_changed {project, file, hash?}` when a
+note is written, changed or removed: the daemon's own writes announce at
+once, and a file watch over each root's `.sgian/projects` tree covers edits
+made outside it (an agent's file tools, an editor). `hash` is the SHA-256 of
+the file now there and is absent once it is gone. The event never carries
+the note's contents. The web bridge forwards it as `project-notes-changed`.
 The bootstrap snapshot may carry `output_warnings` (pane_id → per-kind
 counts of output that hides content: `conceal`, `clipboard`,
 `hyperlink_mismatch`, `string_controls`, `c1_controls`, and `invisible` for
