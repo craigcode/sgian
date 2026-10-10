@@ -34,6 +34,7 @@ import {
   leaseEquals,
   handleOutputWarning,
   handleProjectsChanged,
+  handleProjectNotesChanged,
   handleAgentUsage,
 } from "./events.js";
 import {
@@ -41,6 +42,8 @@ import {
   outputWarningEquals,
   normalizeProjects,
   projectsEqual,
+  normalizeProjectNotes,
+  projectNotesEqual,
   normalizeUsage,
   usageEquals,
 } from "./projects.js";
@@ -117,6 +120,8 @@ function initialState() {
     agentUsage: new Map(),
     // Projects (name → { name, goal, repo, panes }) for the overview board.
     projects: new Map(),
+    // Shared context notes per project (docs/design/shared-context-notes.md).
+    notes: new Map(),
     agentSpecs: new Map(),
     newAgentBackend: "claude",
     newAgentModel: "",
@@ -598,6 +603,7 @@ export function createAppController({
       state.projects = snapshotProjects;
       changed = true;
     }
+    void syncProjectNotes();
 
     const snapshotAgentSpecs = snapshot.agent_specs || {};
     for (const paneId of snapshotIds) {
@@ -1510,10 +1516,44 @@ export function createAppController({
     notify();
   }
 
+  // Shared context notes: fetched per project, re-read when the daemon says
+  // a file changed. The listing is bounded by the daemon; failures leave the
+  // previous listing in place and are not surfaced (the board is a glance).
+  async function refreshProjectNotes(name) {
+    if (!state.projects.has(name)) return;
+    let listing;
+    try {
+      listing = await invokeWithTimeout("project_notes", { name }, 10000);
+    } catch {
+      return;
+    }
+    if (!state.projects.has(name)) return;
+    const next = normalizeProjectNotes(listing);
+    if (projectNotesEqual(state.notes.get(name), next)) return;
+    state.notes.set(name, next);
+    notify();
+  }
+
+  function syncProjectNotes() {
+    let changed = false;
+    for (const name of [...state.notes.keys()]) {
+      if (!state.projects.has(name)) {
+        state.notes.delete(name);
+        changed = true;
+      }
+    }
+    for (const name of state.projects.keys()) {
+      if (!state.notes.has(name)) void refreshProjectNotes(name);
+    }
+    if (changed) notify();
+  }
+
   function eventCallbacks() {
     return {
       appendTerminalOutput: terminals.append,
       render: notify,
+      projectsChanged: syncProjectNotes,
+      refreshProjectNotes: (name) => void refreshProjectNotes(name),
       renderTabs: notify,
       renderStatus: notify,
       schedulePaneReconcile,
@@ -1563,6 +1603,9 @@ export function createAppController({
     });
     await listen("projects-changed", (event) => {
       handleProjectsChanged(state, event.payload || {}, callbacks);
+    });
+    await listen("project-notes-changed", (event) => {
+      handleProjectNotesChanged(state, event.payload || {}, callbacks);
     });
     await listen("agent-usage", (event) => {
       handleAgentUsage(state, event.payload || {}, callbacks);

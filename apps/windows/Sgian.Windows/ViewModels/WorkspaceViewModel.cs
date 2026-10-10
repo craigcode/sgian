@@ -14,6 +14,8 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     private readonly Dictionary<string, PaneSize> _sizes = [];
     /// <summary>Projects by name (ENHANCEMENTS "projects"); the sidebar shows them.</summary>
     private Dictionary<string, Project> _projects = new(StringComparer.Ordinal);
+    /// <summary>Shared context notes per project (docs/design/shared-context-notes.md).</summary>
+    private readonly Dictionary<string, IReadOnlyList<ProjectNote>> _notes = new(StringComparer.Ordinal);
     /// <summary>Panes whose output hid something (docs/design/keyboard-lease-and-ledger.md §7).</summary>
     private readonly Dictionary<string, OutputTricks> _outputWarnings = new(StringComparer.Ordinal);
     /// <summary>Per-pane usage from Claude Code's status line (<c>sgian ctl statusline</c>).</summary>
@@ -86,6 +88,64 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                 .Select(group => $"{group.Title}: {ProjectBoard.Rollup(group.PaneIds.Select(id => facts[id])).Text}");
             return string.Join("\n", lines);
         }
+    }
+
+    /// <summary>
+    /// The shared context notes beside each project: "feature: 2 notes · 1 hid text" then the
+    /// newest few, one line each; empty when no project has notes.
+    /// </summary>
+    public string ProjectNotesSummary
+    {
+        get
+        {
+            var blocks = new List<string>();
+            foreach (var name in _projects.Keys.OrderBy(name => name, StringComparer.Ordinal))
+            {
+                if (!_notes.TryGetValue(name, out var notes) || notes.Count == 0) continue;
+                var lines = ProjectNotes.Lines(notes);
+                blocks.Add($"{name}: {lines[0]}\n  " + string.Join("\n  ", lines.Skip(1)));
+            }
+            return string.Join("\n", blocks);
+        }
+    }
+
+    /// <summary>
+    /// Keep the notes table aligned with the project table: drop projects that are gone, read
+    /// those not read yet.
+    /// </summary>
+    private void SyncNotes()
+    {
+        foreach (var name in _notes.Keys.Where(name => !_projects.ContainsKey(name)).ToList())
+        {
+            _notes.Remove(name);
+        }
+        foreach (var name in _projects.Keys.Where(name => !_notes.ContainsKey(name)).ToList())
+        {
+            _ = RefreshNotesAsync(name);
+        }
+    }
+
+    /// <summary>
+    /// Re-read one project's notes. The listing is bounded by the daemon; a failure keeps the
+    /// previous listing (the board is a glance, not a report) and is not surfaced.
+    /// </summary>
+    private async Task RefreshNotesAsync(string name)
+    {
+        if (!_projects.ContainsKey(name)) return;
+        using var document = await RunRequestAsync(
+            () => _client.RequestAsync<JsonDocument>(Request(("command", "project_notes"), ("name", name))),
+            showError: false);
+        if (document is null || !_projects.ContainsKey(name)) return;
+        var notes = ProjectNotes.Parse(document.RootElement);
+        if (notes is null) return;
+        if (_notes.TryGetValue(name, out var previous)
+            && previous.Count == notes.Count
+            && previous.Zip(notes).All(pair => pair.First.File == pair.Second.File && pair.First.Hash == pair.Second.Hash && pair.First.Guarded == pair.Second.Guarded))
+        {
+            return;
+        }
+        _notes[name] = notes;
+        WorkspaceChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public event EventHandler? WorkspaceChanged;
@@ -596,6 +656,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             _agentUsage.Remove(stale.Id);
         }
         _projects = new Dictionary<string, Project>(snapshot.Projects, StringComparer.Ordinal);
+        SyncNotes();
         // The snapshot carries the counts only; the description of the first
         // opaque string arrives on the event, so keep the one already held.
         var previousWarnings = new Dictionary<string, OutputTricks>(_outputWarnings);
@@ -715,7 +776,15 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                 {
                     _projects = new Dictionary<string, Project>(projects, StringComparer.Ordinal);
                     foreach (var member in Panes) member.ProjectName = ProjectBoard.ProjectFor(member.Id, _projects);
+                    SyncNotes();
                     WorkspaceChanged?.Invoke(this, EventArgs.Empty);
+                }
+                break;
+            case "project_notes_changed":
+                var notedProject = ProjectNotes.ChangedProject(item.Payload);
+                if (notedProject is not null && _projects.ContainsKey(notedProject))
+                {
+                    _ = RefreshNotesAsync(notedProject);
                 }
                 break;
             case "output_warning":

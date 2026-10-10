@@ -1,14 +1,16 @@
 # Shared context notes for a project
 
-**Status: steps 1 and 2 built; 3 and 4 not.** The daemon writes, lists and
+**Status: steps 1 to 3 built; 4 not.** The daemon writes, lists and
 removes notes (`project_note_add`, `project_notes`, `project_note_remove`;
 `ctl project notes`, `ctl project note add|rm`), ledgers every write with a
 content hash, caps the sizes, and scrubs bodies on read. Subscribers get
 `project_notes_changed {project, file, hash?}`: the daemon's own writes
 announce at once, and a file watch over each root's `.sgian/projects` tree
 covers edits made outside it, which are also listed with evidence `file`.
-Written before code because the hard questions are about ownership and
-trust, not plumbing.
+The macOS sidebar, the Windows sidebar and the web overview show each
+project's notes beside it (summary, then the newest few as one line each;
+never the bodies). Written before code because the hard questions are about
+ownership and trust, not plumbing.
 
 ## What it is for
 
@@ -128,6 +130,7 @@ directory an injection surface, and the design treats it as one:
    in `native-ipc.md`. **Built.**
 3. Clients: a notes list beside the project in the overview, with author
    and badge. The macOS sidebar first, since it already groups by project.
+   **Built**, in all three clients.
 4. The opt-in prompt line, last and off by default.
 
 Each step is useful on its own; the first alone gives agents a shared,

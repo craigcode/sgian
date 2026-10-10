@@ -1044,6 +1044,29 @@ h1 {
   font-weight: 400;
 }
 
+.overview-group-notes {
+  display: block;
+  margin-top: 4px;
+  font-weight: 400;
+}
+
+.overview-group-notes-summary {
+  color: var(--muted, #6b6b6b);
+}
+
+.overview-group-notes-list {
+  margin: 2px 0 0;
+  padding-left: 1.1em;
+  color: var(--muted, #6b6b6b);
+}
+
+.overview-group-notes-list li {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+
 .overview-output-warning {
   color: var(--amber);
 }

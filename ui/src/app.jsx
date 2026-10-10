@@ -17,6 +17,8 @@ import {
   outputWarningSummary,
   usageText,
   groupLimitText,
+  noteLine,
+  notesSummaryText,
 } from "./projects.js";
 import { buildPaletteCommands, filterPaletteCommands } from "./palette.js";
 
@@ -1374,6 +1376,23 @@ function SessionOverview({ state, controller }) {
                           {groupLimitText(group.panes, state) && (
                             <span className="overview-group-limit">
                               {groupLimitText(group.panes, state)}
+                            </span>
+                          )}
+                          {group.name !== null && notesSummaryText(state.notes?.get(group.name)) && (
+                            <span className="overview-group-notes">
+                              <span className="overview-group-notes-summary">
+                                {notesSummaryText(state.notes.get(group.name))}
+                              </span>
+                              <ul className="overview-group-notes-list" aria-label={`Notes for ${group.name}`}>
+                                {state.notes
+                                  .get(group.name)
+                                  .slice(0, 3)
+                                  .map((note) => (
+                                    <li key={note.file} title={note.file}>
+                                      {noteLine(note)}
+                                    </li>
+                                  ))}
+                              </ul>
                             </span>
                           )}
                         </th>

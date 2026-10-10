@@ -185,6 +185,9 @@ pub(crate) fn frontend_command(
         "lease_status" => DaemonRequest::LeaseStatus {
             pane_id: text(args, "paneId")?,
         },
+        "project_notes" => DaemonRequest::ProjectNotes {
+            name: text(args, "name")?,
+        },
         "client_holder" => return Ok(FrontendCall::Holder),
         "ui_smoke_enabled" => return Ok(FrontendCall::SmokeDisabled),
         "install_update" => {

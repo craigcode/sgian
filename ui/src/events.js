@@ -224,6 +224,7 @@ export function handleProjectsChanged(state, payload, callbacks) {
   if (projectsEqual(state.projects, next)) return;
   state.projects = next;
   callbacks.render();
+  callbacks.projectsChanged?.();
 }
 
 /**
@@ -326,4 +327,16 @@ export function handlePaneRenamed(state, payload, callbacks) {
   callbacks.updatePaneTitle(pane);
   callbacks.renderTabs();
   callbacks.renderStatus();
+}
+
+/**
+ * Handle a `project-notes-changed` event (docs/design/shared-context-notes.md):
+ * the daemon names the project and file and sends the hash, never the
+ * contents, so the client re-reads that project's listing.
+ */
+export function handleProjectNotesChanged(state, payload, callbacks) {
+  const project = payload?.project;
+  if (typeof project !== "string" || !project) return;
+  if (!state.projects?.has(project)) return;
+  callbacks.refreshProjectNotes?.(project);
 }

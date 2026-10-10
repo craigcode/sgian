@@ -13,7 +13,12 @@ import {
   usageText,
   formatReset,
   groupLimitText,
+  normalizeProjectNotes,
+  projectNotesEqual,
+  noteLine,
+  notesSummaryText,
 } from "../ui/src/projects.js";
+import { handleProjectNotesChanged, handleProjectsChanged } from "../ui/src/events.js";
 
 describe("usage from the status line", () => {
   it("normalizes a daemon usage entry and renders the shared summary line", () => {
@@ -169,5 +174,78 @@ describe("projects", () => {
     );
     expect(rollupText(projectRollup([{ id: "p9" }], { paneStates: new Map() }))).toBe("1 pane");
     expect(projectRollup([], {}).holders).toEqual([]);
+  });
+});
+
+describe("shared context notes on the board", () => {
+  const listing = {
+    format: "sgian.notes.v1",
+    project: "feature",
+    notes: [
+      {
+        file: "2026-10-09-flaky-auth-test.md",
+        title: "Flaky auth test",
+        evidence: "daemon",
+        holder: "craig@mac",
+        pane: "pane-1",
+        written_at_ms: Date.UTC(2026, 9, 9, 12),
+        hash: "aa",
+        body: "never shown",
+        tricks: { invisible: 1 },
+      },
+      { file: "2020-01-01-raw.md", title: "2020-01-01-raw", evidence: "file", hash: "bb", body: "x" },
+      { file: "", title: "dropped" },
+      "junk",
+    ],
+  };
+
+  it("normalizes a listing, keeps order, and never keeps the body", () => {
+    const notes = normalizeProjectNotes(listing);
+    expect(notes.map((note) => note.file)).toEqual([
+      "2026-10-09-flaky-auth-test.md",
+      "2020-01-01-raw.md",
+    ]);
+    expect(notes[0]).toMatchObject({ holder: "craig@mac", evidence: "daemon", guarded: true });
+    expect(notes[1]).toMatchObject({ holder: null, evidence: "file", guarded: false });
+    expect(notes[0].body).toBeUndefined();
+    expect(normalizeProjectNotes(null)).toEqual([]);
+  });
+
+  it("renders one line per note and a summary with the guard count", () => {
+    const notes = normalizeProjectNotes(listing);
+    expect(noteLine(notes[0])).toBe("Flaky auth test — craig@mac · 2026-10-09 ⚠");
+    expect(noteLine(notes[1])).toBe("2020-01-01-raw — file · –");
+    expect(notesSummaryText(notes)).toBe("2 notes · 1 hid text");
+    expect(notesSummaryText([notes[1]])).toBe("1 note");
+    expect(notesSummaryText([])).toBeNull();
+  });
+
+  it("compares listings by file, hash and guard state", () => {
+    const a = normalizeProjectNotes(listing);
+    const b = normalizeProjectNotes(listing);
+    expect(projectNotesEqual(a, b)).toBe(true);
+    b[0] = { ...b[0], hash: "changed" };
+    expect(projectNotesEqual(a, b)).toBe(false);
+    expect(projectNotesEqual(a, a.slice(1))).toBe(false);
+  });
+
+  it("re-reads a project's notes on the event and only for known projects", () => {
+    const refreshed = [];
+    const state = { projects: new Map([["feature", { name: "feature", panes: [] }]]) };
+    const callbacks = { refreshProjectNotes: (name) => refreshed.push(name), render() {} };
+    handleProjectNotesChanged(state, { project: "feature", file: "a.md", hash: "aa" }, callbacks);
+    handleProjectNotesChanged(state, { project: "other", file: "a.md" }, callbacks);
+    handleProjectNotesChanged(state, {}, callbacks);
+    expect(refreshed).toEqual(["feature"]);
+  });
+
+  it("asks the controller to follow the project table when it changes", () => {
+    let synced = 0;
+    const state = { projects: new Map() };
+    const callbacks = { render() {}, projectsChanged: () => synced++ };
+    handleProjectsChanged(state, { projects: { feature: { name: "feature", panes: [] } } }, callbacks);
+    expect(synced).toBe(1);
+    handleProjectsChanged(state, { projects: { feature: { name: "feature", panes: [] } } }, callbacks);
+    expect(synced).toBe(1);
   });
 });
