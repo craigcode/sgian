@@ -52,6 +52,25 @@ fn note_names_front_matter_and_dates_are_pure() {
         "a block without holder and timestamp is not ours"
     );
 
+    assert_eq!(
+        note_change_from_path(Path::new(
+            "/repo/.sgian/projects/feature/notes/2026-10-09-flaky.md"
+        )),
+        Some(("feature".to_string(), "2026-10-09-flaky.md".to_string()))
+    );
+    assert_eq!(
+        note_change_from_path(Path::new("/repo/.sgian/projects/feature/README.md")),
+        None
+    );
+    assert_eq!(
+        note_change_from_path(Path::new("/repo/.sgian/projects/feature/notes/.swp.md")),
+        None
+    );
+    assert_eq!(
+        note_change_from_path(Path::new("/repo/.sgian/projects/feature/notes")),
+        None
+    );
+
     assert!(validate_note_file("2026-10-09-flaky.md").is_ok());
     assert!(validate_note_file("../escape.md").is_err());
     assert!(validate_note_file(".hidden.md").is_err());
@@ -498,6 +517,88 @@ fn project_notes_root_is_confined_and_capped() {
     .expect("big");
     let refused: Result<Value, String> = client.request(note("here", "Over", &"z".repeat(200)));
     assert!(refused.unwrap_err().contains("would exceed"));
+
+    daemon.shutdown();
+}
+
+/// Writes announce: the daemon's own at once with the hash, outside edits
+/// through the file watch, removals with no hash, and nothing twice.
+#[cfg(unix)]
+#[test]
+fn project_notes_changes_are_announced_once() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::create_dir(repo.path().join(".git")).expect("mark the repo");
+    let daemon = TestDaemon::spawn(Config::default());
+    let client = daemon.client();
+    let _: Project = client
+        .request(DaemonRequest::ProjectCreate {
+            name: "feature".into(),
+            goal: None,
+            repo: Some(repo.path().display().to_string()),
+        })
+        .expect("create project");
+    let mut events = subscribe_events(&client);
+    let next_change = |events: &mut DaemonConnection| {
+        read_event_until(events, |event| match event {
+            DaemonEvent::ProjectNotesChanged {
+                project,
+                file,
+                hash,
+            } => Some((project.clone(), file.clone(), hash.clone())),
+            _ => None,
+        })
+    };
+
+    let added: Value = client
+        .request(DaemonRequest::ProjectNoteAdd {
+            name: "feature".into(),
+            title: "Announced".into(),
+            body: "body".into(),
+            holder: "craig@mac".into(),
+            pane_id: None,
+        })
+        .expect("add note");
+    let file = added["file"].as_str().expect("file").to_string();
+    let (project, changed, hash) = next_change(&mut events);
+    assert_eq!(
+        (project.as_str(), changed.as_str()),
+        ("feature", file.as_str())
+    );
+    assert_eq!(hash.as_deref(), added["hash"].as_str());
+
+    // An edit outside the daemon reaches subscribers through the watch.
+    let notes_dir = repo.path().join(".sgian/projects/feature/notes");
+    let raw = "written by an editor\n";
+    fs::write(notes_dir.join("2020-01-01-outside.md"), raw).expect("outside write");
+    let (project, changed, hash) = next_change(&mut events);
+    assert_eq!(
+        (project.as_str(), changed.as_str()),
+        ("feature", "2020-01-01-outside.md")
+    );
+    assert_eq!(hash.as_deref(), Some(note_hash(raw.as_bytes()).as_str()));
+
+    // Removal through the daemon: announced once, with no hash.
+    let _: Value = client
+        .request(DaemonRequest::ProjectNoteRemove {
+            name: "feature".into(),
+            file: file.clone(),
+            holder: "craig@mac".into(),
+        })
+        .expect("remove");
+    let (_, changed, hash) = next_change(&mut events);
+    assert_eq!(changed, file);
+    assert_eq!(hash, None);
+
+    // Removal outside the daemon: announced through the watch.
+    fs::remove_file(notes_dir.join("2020-01-01-outside.md")).expect("outside remove");
+    let (_, changed, hash) = next_change(&mut events);
+    assert_eq!(changed, "2020-01-01-outside.md");
+    assert_eq!(hash, None);
+
+    // Nothing was announced twice: a probe write is the very next event.
+    fs::write(notes_dir.join("2020-01-02-probe.md"), "probe\n").expect("probe write");
+    let (_, changed, _) = next_change(&mut events);
+    assert_eq!(changed, "2020-01-02-probe.md");
 
     daemon.shutdown();
 }

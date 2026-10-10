@@ -43,7 +43,11 @@ follow SemVer once the first public tag exists.
   any write-scoped client can set and notes are the first thing the
   daemon writes under it. An unreadable notes directory no longer fails
   the whole dossier, and `ctl project note add --file` stops reading at
-  the cap.
+  the cap. Subscribers receive `project_notes_changed {project, file,
+  hash?}` when a note is written, changed or removed, from the daemon's own
+  writes at once and from a file watch over each root's `.sgian/projects`
+  tree for edits made outside it; the event carries the hash, never the
+  contents.
 - Agent panes get the output guard. No emulator stands between an agent
   and the person in a chat pane, so the daemon now scrubs every string in a
   normalized agent event before it is logged or shown: terminal escape

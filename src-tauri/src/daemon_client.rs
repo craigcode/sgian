@@ -812,6 +812,14 @@ pub(crate) fn frontend_event(event: DaemonEvent) -> Option<(&'static str, Value)
             ("agent-usage", json!({ "pane_id": pane_id, "usage": usage }))
         }
         // The whole project table after a change; the overview groups by it.
+        DaemonEvent::ProjectNotesChanged {
+            project,
+            file,
+            hash,
+        } => (
+            "project-notes-changed",
+            json!({ "project": project, "file": file, "hash": hash }),
+        ),
         DaemonEvent::ProjectsChanged { projects } => {
             ("projects-changed", json!({ "projects": projects }))
         }

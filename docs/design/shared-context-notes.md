@@ -1,13 +1,14 @@
 # Shared context notes for a project
 
-**Status: step 1 built; steps 2 to 4 not.** The daemon writes, lists and
+**Status: steps 1 and 2 built; 3 and 4 not.** The daemon writes, lists and
 removes notes (`project_note_add`, `project_notes`, `project_note_remove`;
 `ctl project notes`, `ctl project note add|rm`), ledgers every write with a
-content hash, caps the sizes, and scrubs bodies on read. The file watch is
-deferred to step 2 with the event: a file written outside the daemon is
-recognised on read by its missing front matter and listed with evidence
-`file`. Written before code because the hard questions are about ownership
-and trust, not plumbing.
+content hash, caps the sizes, and scrubs bodies on read. Subscribers get
+`project_notes_changed {project, file, hash?}`: the daemon's own writes
+announce at once, and a file watch over each root's `.sgian/projects` tree
+covers edits made outside it, which are also listed with evidence `file`.
+Written before code because the hard questions are about ownership and
+trust, not plumbing.
 
 ## What it is for
 
@@ -124,7 +125,7 @@ directory an injection surface, and the design treats it as one:
    records, `file` evidence for notes written outside the daemon, the size
    caps, and the scrub on read. Tests at the request level. **Built.**
 2. `ctl project notes` and the `project_notes_changed` event, with a line
-   in `native-ipc.md`.
+   in `native-ipc.md`. **Built.**
 3. Clients: a notes list beside the project in the overview, with author
    and badge. The macOS sidebar first, since it already groups by project.
 4. The opt-in prompt line, last and off by default.

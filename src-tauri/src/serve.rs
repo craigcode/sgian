@@ -555,6 +555,8 @@ pub(crate) fn run_daemon_with_config_and_warnings(
         data_dir.clone(),
         config,
     )?);
+    // Watch the notes roots of the projects restored from disk.
+    server.refresh_notes_watch();
 
     // Activate structured logging for the daemon's main thread. The guard lives
     // for the entire run so all tracing calls in the accept loop are captured.
@@ -809,6 +811,8 @@ pub(crate) fn run_daemon_with_config_and_warnings(
                     while config_notify_rx.try_recv().is_ok() {}
                     server.reload_config();
                 }
+                // Shared context notes edited outside the daemon.
+                server.drain_notes_changes();
 
                 // Prune old closed-pane suppression entries (L13).
                 if last_closed_sweep.elapsed() >= CLOSED_SWEEP_INTERVAL {
