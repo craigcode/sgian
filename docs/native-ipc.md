@@ -121,7 +121,9 @@ project above the list and names each pane's project in its subtitle.
 {name}` and `project_note_remove {name, file, holder}` manage a project's
 shared context notes (`docs/design/shared-context-notes.md`): Markdown files
 under `<repo>/.sgian/projects/<name>/notes/` (the workspace directory when
-the project names no repo). `project_notes` returns `{format:
+the project names no repo; a relative `repo` is taken from the workspace, and
+the root must exist and be the workspace or a git repository, since `repo` is
+free text any write-scoped client can set). `project_notes` returns `{format:
 "sgian.notes.v1", project, dir, total, bytes, tricks?, notes: [{file, title,
 evidence, holder?, pane?, written_at_ms?, bytes, hash, body, tricks?}]}`,
 newest first, with bodies scrubbed as agent output is and the hidden-text

@@ -2854,7 +2854,12 @@ impl DaemonServer {
         } else {
             json!({ "verified": true, "records": 0, "head": "" })
         };
-        let notes = self.handle_project_notes(name)?;
+        // The notes directory lives in the repo, outside the daemon's own
+        // files: an unreadable one must not take the roll-up, the ledgers
+        // and the scrollback down with it.
+        let notes = self
+            .handle_project_notes(name)
+            .unwrap_or_else(|error| json!({ "error": error }));
         Ok(json!({
             "format": PROJECT_DOSSIER_FORMAT,
             "generated_at_ms": now_millis(),
@@ -2872,18 +2877,41 @@ impl DaemonServer {
     // ----- Shared context notes (docs/design/shared-context-notes.md) -----
 
     /// Where a project's notes live: under its `repo` when it names one,
-    /// the workspace directory otherwise.
+    /// the workspace directory otherwise. A relative `repo` is taken from
+    /// the workspace. The root must exist and be either the workspace or a
+    /// git repository (it has a `.git` entry): `repo` is free text any
+    /// write-scoped client can set, and notes are the first thing the daemon
+    /// WRITES under it, so it must not become a way to create files in an
+    /// arbitrary directory.
     fn project_notes_dir(&self, name: &str) -> Result<PathBuf, String> {
         let project = self
             .projects_snapshot()
             .get(name)
             .cloned()
             .ok_or_else(|| format!("unknown project '{name}'"))?;
-        let root = project
-            .repo
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.cwd.clone());
+        let root = match project.repo.as_deref() {
+            Some(repo) => {
+                let candidate = self.cwd.join(repo);
+                let root = candidate
+                    .canonicalize()
+                    .map_err(|error| format!("project repo {}: {error}", candidate.display()))?;
+                if !root.is_dir() {
+                    return Err(format!(
+                        "project repo {} is not a directory",
+                        root.display()
+                    ));
+                }
+                let workspace = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+                if root != workspace && !root.join(".git").exists() {
+                    return Err(format!(
+                        "project repo {} is not a git repository; notes live in one",
+                        root.display()
+                    ));
+                }
+                root
+            }
+            None => self.cwd.clone(),
+        };
         Ok(notes::notes_dir(&root, name))
     }
 
@@ -2912,29 +2940,19 @@ impl DaemonServer {
             written_at_ms: now_millis(),
         };
         let written = notes::add_note(&dir, &meta, &body)?;
-        let _ = self.ledger_record(
-            &project_ledger_key(name),
-            "note.added",
-            json!({
-                "project": name,
-                "file": written.file,
-                "title": title,
-                "holder": holder,
-                "pane_id": pane_id,
-                "hash": written.hash,
-                "bytes": written.bytes,
-            }),
-        );
-        Ok(json!({
+        // One receipt: what the ledger records is what the client is told.
+        let mut receipt = json!({
             "project": name,
             "file": written.file,
-            "path": written.path.display().to_string(),
             "title": title,
             "holder": holder,
             "pane_id": pane_id,
             "hash": written.hash,
             "bytes": written.bytes,
-        }))
+        });
+        let _ = self.ledger_record(&project_ledger_key(name), "note.added", receipt.clone());
+        receipt["path"] = json!(written.path.display().to_string());
+        Ok(receipt)
     }
 
     fn handle_project_notes(&self, name: &str) -> Result<Value, String> {

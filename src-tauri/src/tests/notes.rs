@@ -118,6 +118,7 @@ fn project_note_args_parse() {
 #[test]
 fn project_notes_are_written_listed_scrubbed_and_ledgered() {
     let repo = tempfile::tempdir().expect("tempdir");
+    fs::create_dir(repo.path().join(".git")).expect("mark the repo");
     let daemon = TestDaemon::spawn(Config::default());
     let client = daemon.client();
     let _: Project = client
@@ -301,6 +302,7 @@ fn project_notes_are_written_listed_scrubbed_and_ledgered() {
 #[test]
 fn project_notes_honour_client_credentials() {
     let repo = tempfile::tempdir().expect("tempdir");
+    fs::create_dir(repo.path().join(".git")).expect("mark the repo");
     let daemon = TestDaemon::spawn(Config::default());
     let client = daemon.client();
     let _: Project = client
@@ -390,6 +392,112 @@ fn project_notes_honour_client_credentials() {
     assert!(String::from_utf8(out)
         .expect("utf8")
         .contains("\tkranz-run-7\t"));
+
+    daemon.shutdown();
+}
+
+/// The notes root is confined: a relative `repo` is taken from the
+/// workspace, a `repo` that is neither the workspace nor a git repository is
+/// refused, and the per-project count and byte caps hold.
+#[test]
+fn project_notes_root_is_confined_and_capped() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let daemon = TestDaemon::spawn_with_cwd(Config::default(), workspace.path().to_path_buf());
+    let client = daemon.client();
+    let note = |name: &str, title: &str, body: &str| DaemonRequest::ProjectNoteAdd {
+        name: name.into(),
+        title: title.into(),
+        body: body.into(),
+        holder: "craig@mac".into(),
+        pane_id: None,
+    };
+
+    // No repo: notes live under the workspace.
+    let _: Project = client
+        .request(DaemonRequest::ProjectCreate {
+            name: "here".into(),
+            goal: None,
+            repo: None,
+        })
+        .expect("create");
+    let added: Value = client.request(note("here", "Local", "body")).expect("add");
+    assert!(added["path"]
+        .as_str()
+        .expect("path")
+        .starts_with(&workspace.path().join(".sgian").display().to_string()));
+
+    // A relative repo resolves from the workspace, not the process cwd.
+    fs::create_dir_all(workspace.path().join("sub").join(".git")).expect("sub repo");
+    let _: Project = client
+        .request(DaemonRequest::ProjectCreate {
+            name: "rel".into(),
+            goal: None,
+            repo: Some("sub".into()),
+        })
+        .expect("create");
+    let added: Value = client
+        .request(note("rel", "Relative", "body"))
+        .expect("add");
+    assert!(workspace
+        .path()
+        .join("sub/.sgian/projects/rel/notes")
+        .join(added["file"].as_str().expect("file"))
+        .is_file());
+
+    // A directory that is not a git repository is refused; nothing is created.
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let _: Project = client
+        .request(DaemonRequest::ProjectCreate {
+            name: "loose".into(),
+            goal: None,
+            repo: Some(elsewhere.path().display().to_string()),
+        })
+        .expect("create");
+    let refused: Result<Value, String> = client.request(note("loose", "Nope", "body"));
+    assert!(refused.unwrap_err().contains("not a git repository"));
+    assert!(!elsewhere.path().join(".sgian").exists());
+    let listing: Result<Value, String> = client.request(DaemonRequest::ProjectNotes {
+        name: "loose".into(),
+    });
+    assert!(listing.is_err(), "listing uses the same root rule");
+    let missing: Result<Value, String> = client.request(note("here", "x", "y"));
+    assert!(missing.is_ok());
+    let _: Project = client
+        .request(DaemonRequest::ProjectCreate {
+            name: "gone".into(),
+            goal: None,
+            repo: Some(workspace.path().join("absent").display().to_string()),
+        })
+        .expect("create");
+    let refused: Result<Value, String> = client.request(note("gone", "Nope", "body"));
+    assert!(refused.is_err(), "a missing repo is refused, not created");
+    assert!(!workspace.path().join("absent").exists());
+    // The dossier still comes back, with the notes error inside it.
+    let dossier: Value = client
+        .request(DaemonRequest::ProjectDossier {
+            name: "gone".into(),
+            lines: 0,
+        })
+        .expect("dossier survives an unusable notes root");
+    assert!(dossier["notes"]["error"].is_string());
+
+    // Caps: the count, then the bytes.
+    let dir = workspace.path().join(".sgian/projects/here/notes");
+    for i in 0..(NOTES_MAX_COUNT - 2) {
+        fs::write(dir.join(format!("2000-01-01-filler-{i}.md")), "x\n").expect("filler");
+    }
+    let refused: Result<Value, String> = client.request(note("here", "Full", "body"));
+    assert!(refused.unwrap_err().contains("notes already"));
+    for i in 0..(NOTES_MAX_COUNT - 2) {
+        fs::remove_file(dir.join(format!("2000-01-01-filler-{i}.md"))).expect("rm filler");
+    }
+    fs::write(
+        dir.join("2000-01-01-big.md"),
+        "y".repeat(NOTES_DIR_MAX_BYTES - 100),
+    )
+    .expect("big");
+    let refused: Result<Value, String> = client.request(note("here", "Over", &"z".repeat(200)));
+    assert!(refused.unwrap_err().contains("would exceed"));
 
     daemon.shutdown();
 }
