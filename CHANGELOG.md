@@ -37,7 +37,13 @@ follow SemVer once the first public tag exists.
   the notes themselves. Bodies are scrubbed on read as agent output is, and
   a note that hid text is marked; a file written outside the daemon is
   listed with evidence `file`. One note is at most 16 KiB, a project's
-  notes at most 1 MiB and 256 files.
+  notes at most 1 MiB and 256 files. The notes root is confined: a
+  relative `repo` is taken from the workspace, and a `repo` that is not
+  the workspace and has no `.git` is refused, since `repo` is free text
+  any write-scoped client can set and notes are the first thing the
+  daemon writes under it. An unreadable notes directory no longer fails
+  the whole dossier, and `ctl project note add --file` stops reading at
+  the cap.
 - Agent panes get the output guard. No emulator stands between an agent
   and the person in a chat pane, so the daemon now scrubs every string in a
   normalized agent event before it is logged or shown: terminal escape

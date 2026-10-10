@@ -2445,8 +2445,23 @@ pub(crate) fn control_project(
         ProjectVerb::NoteAdd => {
             let body = match (parsed.body, parsed.body_file) {
                 (Some(body), _) => body,
-                (None, Some(path)) => fs::read_to_string(&path)
-                    .map_err(|error| format!("failed to read {path}: {error}"))?,
+                (None, Some(path)) => {
+                    // The daemon caps a body at NOTE_MAX_BYTES; do not read a
+                    // multi-gigabyte file to learn that.
+                    let file = fs::File::open(&path)
+                        .map_err(|error| format!("failed to read {path}: {error}"))?;
+                    let mut raw = String::new();
+                    file.take(crate::notes::NOTE_MAX_BYTES as u64 + 1)
+                        .read_to_string(&mut raw)
+                        .map_err(|error| format!("failed to read {path}: {error}"))?;
+                    if raw.len() > crate::notes::NOTE_MAX_BYTES {
+                        return Err(format!(
+                            "{path} is longer than {} bytes",
+                            crate::notes::NOTE_MAX_BYTES
+                        ));
+                    }
+                    raw
+                }
                 (None, None) => {
                     let mut raw = String::new();
                     std::io::stdin()

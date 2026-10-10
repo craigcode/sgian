@@ -39,7 +39,10 @@ changed what and when; the daemon tells each pane when something changed.
 - Front matter names the author (`holder`, exactly as the lease and ledger
   name people and runs) and the pane it came from; the body is Markdown.
 - The directory is committed to the repository the project names (`repo`
-  on the project, the workspace otherwise). It is part of the project's
+  on the project, the workspace otherwise). The daemon refuses to write
+  notes under a `repo` that is not the workspace and has no `.git`: `repo`
+  is free text any write-scoped client can set, and notes are the first
+  thing the daemon writes under it. It is part of the project's
   history, reviewable in a pull request like anything else.
 - A hard cap on size per note and per directory (for instance 16 KiB and
   1 MiB) keeps the agent-facing payload bounded.
