@@ -24,7 +24,7 @@ describe("web bridge", () => {
   it("posts invokes to /api/invoke and unwraps the daemon's answer", async () => {
     const calls = [];
     const fetchImpl = vi.fn(async (url, init) => {
-      calls.push({ url, body: JSON.parse(init.body) });
+      calls.push({ url, headers: init.headers, body: JSON.parse(init.body) });
       const { command } = JSON.parse(init.body);
       if (command === "boom") return { ok: true, json: async () => ({ ok: false, error: "read-only view: boom" }) };
       if (command === "http") return { ok: false, status: 500, json: async () => ({}) };
@@ -32,7 +32,11 @@ describe("web bridge", () => {
     });
     const bridge = createWebBridge({ fetchImpl, EventSourceImpl: FakeEventSource, base: "http://x" });
     expect(await bridge.nativeInvoke("bootstrap_workspace")).toEqual({ command: "bootstrap_workspace" });
-    expect(calls[0]).toEqual({ url: "http://x/api/invoke", body: { command: "bootstrap_workspace", args: {} } });
+    expect(calls[0]).toEqual({
+      url: "http://x/api/invoke",
+      headers: { "Content-Type": "application/json", "X-Sgian-Invoke": "1" },
+      body: { command: "bootstrap_workspace", args: {} },
+    });
     await expect(bridge.nativeInvoke("boom", { paneId: "p" })).rejects.toThrow("read-only view: boom");
     await expect(bridge.nativeInvoke("http")).rejects.toThrow("HTTP 500");
     expect(calls[1].body.args).toEqual({ paneId: "p" });

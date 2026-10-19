@@ -2,8 +2,9 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-module_cache="${TMPDIR:-/tmp}/sgian-swift-module-cache"
+module_cache="$repo_root/apps/macos/.build/module-cache"
 cargo_target_dir="$repo_root/src-tauri/target"
+mkdir -p "$module_cache"
 
 export CLANG_MODULE_CACHE_PATH="$module_cache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$module_cache"

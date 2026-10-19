@@ -53,11 +53,15 @@ impl KillOnCloseJob {
         // SAFETY: OpenProcess validates the pid; no handle inheritance is requested.
         let raw = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
         if raw.is_null() {
+            tracing::warn!(pid, "failed to open process to attach kill-on-close job");
             return None;
         }
         // SAFETY: OpenProcess returned a new owned handle.
         let process = unsafe { OwnedHandle::from_raw_handle(raw) };
-        job.assign(process.as_raw_handle()).ok()?;
+        if let Err(error) = job.assign(process.as_raw_handle()) {
+            tracing::warn!(pid, %error, "failed to assign process to kill-on-close job");
+            return None;
+        }
         Some(job)
     }
 
@@ -93,8 +97,10 @@ impl KillOnCloseJob {
 }
 
 /// Stable Rust does not expose Child's primary thread handle. A newly created
-/// suspended process has one thread; find that thread without resuming any
-/// unrelated process. The Child handle keeps its process identity alive.
+/// suspended process has one primary suspended thread; find that thread without
+/// resuming any unrelated process (and skip any unsuspended helper thread that
+/// EDR/AV software may have injected before the snapshot). The Child handle
+/// keeps its process identity alive.
 fn resume_suspended_child(child: &std::process::Child) -> std::io::Result<()> {
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
@@ -137,13 +143,16 @@ fn resume_suspended_child(child: &std::process::Child) -> std::io::Result<()> {
             if count == u32::MAX {
                 return Err(std::io::Error::last_os_error());
             }
-            return if count == 1 {
-                Ok(())
-            } else {
-                Err(std::io::Error::other(
+            if count == 1 {
+                return Ok(());
+            }
+            if count > 1 {
+                return Err(std::io::Error::other(
                     "unexpected agent thread suspend count",
-                ))
-            };
+                ));
+            }
+            // count == 0: an unsuspended helper thread (e.g. injected by AV/EDR);
+            // keep scanning for the suspended primary thread.
         }
         entry.dwSize = std::mem::size_of_val(&entry) as u32;
         // SAFETY: snapshot and output structure remain valid.

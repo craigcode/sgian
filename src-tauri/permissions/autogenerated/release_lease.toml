@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-release-lease"
+description = "Enables the release_lease command without any pre-configured scope."
+commands.allow = ["release_lease"]
+
+[[permission]]
+identifier = "deny-release-lease"
+description = "Denies the release_lease command without any pre-configured scope."
+commands.deny = ["release_lease"]

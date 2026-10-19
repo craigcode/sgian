@@ -248,7 +248,61 @@ pub(crate) fn parse_note(text: &str) -> (Option<NoteMeta>, &str) {
     }
 }
 
+/// Maximum size of a single note file on disk (front matter + body).
+pub(crate) const NOTE_FILE_MAX_BYTES: u64 = (NOTE_MAX_BYTES as u64) * 2;
+
+/// Reject symlinks along `<root>/.sgian/projects/<project>/notes` so notes
+/// operations never traverse outside the repository via a symlinked directory.
+pub(crate) fn reject_symlinks_in_notes_dir(dir: &Path) -> Result<(), String> {
+    let mut current = Some(dir);
+    for _ in 0..4 {
+        let Some(path) = current else {
+            break;
+        };
+        if let Ok(meta) = fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing to follow symlink in notes path {}",
+                    path.display()
+                ));
+            }
+        }
+        current = path.parent();
+    }
+    Ok(())
+}
+
+/// Read a regular note file up to [`NOTE_FILE_MAX_BYTES`], refusing symlinks
+/// and oversized files before allocating.
+pub(crate) fn read_note_file_bounded(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "note path is not a regular file",
+        ));
+    }
+    if meta.len() > NOTE_FILE_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "note file exceeds maximum size",
+        ));
+    }
+    let file = fs::File::open(path)?;
+    let mut raw = Vec::with_capacity(meta.len() as usize);
+    std::io::Read::take(file, NOTE_FILE_MAX_BYTES + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > NOTE_FILE_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "note file exceeds maximum size",
+        ));
+    }
+    Ok(raw)
+}
+
 fn note_files(dir: &Path) -> Result<Vec<(String, u64)>, String> {
+    reject_symlinks_in_notes_dir(dir)?;
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -259,6 +313,12 @@ fn note_files(dir: &Path) -> Result<Vec<(String, u64)>, String> {
         let entry = entry.map_err(|error| format!("failed to read {}: {error}", dir.display()))?;
         let name = entry.file_name().to_string_lossy().to_string();
         if validate_note_file(&name).is_err() {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("failed to stat {name}: {error}"))?;
+        if file_type.is_symlink() || !file_type.is_file() {
             continue;
         }
         let metadata = entry
@@ -280,9 +340,21 @@ pub(crate) fn list_notes(dir: &Path, project: &str) -> Result<NotesListing, Stri
     let mut notes = Vec::new();
     let mut bytes = 0usize;
     let mut tricks = OutputTricks::default();
-    for (file, _) in note_files(dir)? {
+    let mut candidates = note_files(dir)?;
+    // Deterministic order before applying directory caps so oversized external
+    // dumps truncate predictably by filename descending.
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    for (file, len) in candidates {
+        if notes.len() >= NOTES_MAX_COUNT || len > NOTE_FILE_MAX_BYTES {
+            continue;
+        }
         let path = dir.join(&file);
-        let raw = fs::read(&path).map_err(|error| format!("failed to read {file}: {error}"))?;
+        let Ok(raw) = read_note_file_bounded(&path) else {
+            continue;
+        };
+        if bytes + raw.len() > NOTES_DIR_MAX_BYTES {
+            continue;
+        }
         bytes += raw.len();
         let hash = note_hash(&raw);
         let text = String::from_utf8_lossy(&raw);
@@ -346,7 +418,7 @@ pub(crate) fn add_note(dir: &Path, meta: &NoteMeta, body: &str) -> Result<Writte
     }
     let text = render_note(meta, body);
     let used: u64 = existing.iter().map(|(_, len)| len).sum();
-    if used as usize + text.len() > NOTES_DIR_MAX_BYTES {
+    if used.saturating_add(text.len() as u64) > NOTES_DIR_MAX_BYTES as u64 {
         return Err(format!(
             "project notes would exceed {NOTES_DIR_MAX_BYTES} bytes; remove some first"
         ));
@@ -355,6 +427,7 @@ pub(crate) fn add_note(dir: &Path, meta: &NoteMeta, body: &str) -> Result<Writte
     let file = note_file_name(meta.written_at_ms, &meta.title, &taken);
     fs::create_dir_all(dir)
         .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
+    reject_symlinks_in_notes_dir(dir)?;
     let path = dir.join(&file);
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -374,9 +447,10 @@ pub(crate) fn add_note(dir: &Path, meta: &NoteMeta, body: &str) -> Result<Writte
 /// Remove one note by file name; returns the hash of what was removed so
 /// the ledger can say exactly which content went.
 pub(crate) fn remove_note(dir: &Path, file: &str) -> Result<(String, usize), String> {
+    reject_symlinks_in_notes_dir(dir)?;
     let file = validate_note_file(file)?;
     let path = dir.join(&file);
-    let raw = fs::read(&path).map_err(|error| match error.kind() {
+    let raw = read_note_file_bounded(&path).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => format!("no note '{file}'"),
         _ => format!("failed to read {file}: {error}"),
     })?;

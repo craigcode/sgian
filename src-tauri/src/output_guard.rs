@@ -405,6 +405,11 @@ pub(crate) struct TextScan {
     pub(crate) pending: String,
 }
 
+/// Maximum bytes held in `pending` across streaming chunks for an unclosed
+/// escape sequence before treating it as malformed/runaway so a stray `ESC ]`
+/// cannot black out the remainder of an assistant message or grow unboundedly.
+const MAX_ESCAPE_CARRY_BYTES: usize = 4096;
+
 /// The one walker both the shell-pane scan and the agent-pane scrub use, so
 /// what is counted and what is stripped can never disagree. `keep` says
 /// whether to build the cleaned text (the shell path only counts).
@@ -435,12 +440,25 @@ fn walk_text(text: &str, keep: bool) -> TextScan {
                     '[' => {
                         let mut params = String::new();
                         let mut final_byte = None;
-                        for (_, next) in chars.by_ref() {
+                        let mut aborted = false;
+                        while let Some(&(_, next)) = chars.peek() {
                             if ('\u{40}'..='\u{7e}').contains(&next) {
+                                chars.next();
                                 final_byte = Some(next);
                                 break;
                             }
-                            params.push(next);
+                            if ('\u{20}'..='\u{3f}').contains(&next)
+                                && params.len() < MAX_ESCAPE_CARRY_BYTES
+                            {
+                                chars.next();
+                                params.push(next);
+                            } else {
+                                aborted = true;
+                                break;
+                            }
+                        }
+                        if aborted {
+                            continue;
                         }
                         let Some(final_byte) = final_byte else {
                             pending = text[start..].to_string();
@@ -484,7 +502,7 @@ fn walk_text(text: &str, keep: bool) -> TextScan {
                                 body.push(next);
                             }
                         }
-                        if !terminated {
+                        if !terminated && text.len() - start <= MAX_ESCAPE_CARRY_BYTES {
                             pending = text[start..].to_string();
                             break;
                         }
@@ -493,19 +511,16 @@ fn walk_text(text: &str, keep: bool) -> TextScan {
                                 tricks.clipboard += 1;
                             } else if let Some(rest) = body.strip_prefix("8;") {
                                 let target = rest.split_once(';').map(|(_, t)| t).unwrap_or("");
-                                if target.is_empty() {
-                                    // Closing the link: compare what was shown with where it went.
-                                    if let (Some(host), Some(shown)) =
-                                        (link_host.take(), url_host(&link_text))
-                                    {
-                                        if shown != host {
-                                            tricks.hyperlink_mismatch += 1;
-                                        }
+                                if let (Some(host), Some(shown)) =
+                                    (link_host.take(), url_host(&link_text))
+                                {
+                                    if shown != host {
+                                        tricks.hyperlink_mismatch += 1;
                                     }
-                                    link_text.clear();
-                                } else {
+                                }
+                                link_text.clear();
+                                if !target.is_empty() {
                                     link_host = url_host(target);
-                                    link_text.clear();
                                 }
                             }
                         } else if !is_terminal_capability_traffic(kind, &body) {
@@ -539,6 +554,11 @@ fn walk_text(text: &str, keep: bool) -> TextScan {
                     link_text.push(c);
                 }
             }
+        }
+    }
+    if let (Some(host), Some(shown)) = (link_host.take(), url_host(&link_text)) {
+        if shown != host {
+            tricks.hyperlink_mismatch += 1;
         }
     }
     TextScan {

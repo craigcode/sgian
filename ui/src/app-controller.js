@@ -603,7 +603,7 @@ export function createAppController({
       state.projects = snapshotProjects;
       changed = true;
     }
-    void syncProjectNotes();
+    void syncProjectNotes({ force: !initial });
 
     const snapshotAgentSpecs = snapshot.agent_specs || {};
     for (const paneId of snapshotIds) {
@@ -1268,7 +1268,7 @@ export function createAppController({
     state.appearance = { ...state.appearance, screenReader: enabled };
     writeScreenReaderPreference(enabled);
     terminals.applyAppearance(state.appearance);
-    render();
+    notify();
     return enabled;
   }
 
@@ -1534,7 +1534,7 @@ export function createAppController({
     notify();
   }
 
-  function syncProjectNotes() {
+  function syncProjectNotes({ force = false } = {}) {
     let changed = false;
     for (const name of [...state.notes.keys()]) {
       if (!state.projects.has(name)) {
@@ -1543,7 +1543,7 @@ export function createAppController({
       }
     }
     for (const name of state.projects.keys()) {
-      if (!state.notes.has(name)) void refreshProjectNotes(name);
+      if (force || !state.notes.has(name)) void refreshProjectNotes(name);
     }
     if (changed) notify();
   }

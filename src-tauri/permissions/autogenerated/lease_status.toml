@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lease-status"
+description = "Enables the lease_status command without any pre-configured scope."
+commands.allow = ["lease_status"]
+
+[[permission]]
+identifier = "deny-lease-status"
+description = "Denies the lease_status command without any pre-configured scope."
+commands.deny = ["lease_status"]

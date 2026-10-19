@@ -390,3 +390,56 @@ pub(crate) fn reconcile_probe_rounds(
     });
     clear
 }
+
+/// Run an external probe/helper command with bounded stdout/stderr and a
+/// strict wall-clock timeout so a wedged `kranz` or `claude agents` binary
+/// cannot pin a daemon thread forever.
+pub(crate) fn run_subprocess_bounded(
+    command: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe {
+            let _ = pipe.take(1024 * 1024).read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe {
+            let _ = pipe.take(64 * 1024).read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "subprocess timed out",
+                ));
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}

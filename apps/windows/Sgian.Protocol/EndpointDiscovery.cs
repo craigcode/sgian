@@ -154,8 +154,10 @@ public static class EndpointDiscovery
             configured,
             Environment.GetEnvironmentVariable("SGIAN_BACKEND_BINARY"),
             Path.Combine(AppContext.BaseDirectory, "Helpers", "sgian.exe"),
+#if DEBUG
             Path.Combine(Environment.CurrentDirectory, "src-tauri", "target", "release", "sgian.exe"),
             Path.Combine(Environment.CurrentDirectory, "src-tauri", "target", "debug", "sgian.exe"),
+#endif
         };
         var path = Environment.GetEnvironmentVariable("PATH") ?? "";
         candidates.AddRange(path.Split(Path.PathSeparator).Select(folder => Path.Combine(folder, "sgian.exe")));

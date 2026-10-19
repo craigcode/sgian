@@ -517,6 +517,55 @@ fn project_notes_root_is_confined_and_capped() {
     .expect("big");
     let refused: Result<Value, String> = client.request(note("here", "Over", &"z".repeat(200)));
     assert!(refused.unwrap_err().contains("would exceed"));
+    fs::remove_file(dir.join("2000-01-01-big.md")).expect("rm big");
+
+    // M-02: Symlinked note files are ignored on list, rejected on remove without
+    // unlinking the target, and symlinked notes directories are refused.
+    #[cfg(unix)]
+    {
+        let secret_target = workspace.path().join("secret.txt");
+        fs::write(&secret_target, "top secret").expect("write secret");
+        let symlink_note = dir.join("2099-10-18-evil.md");
+        std::os::unix::fs::symlink(&secret_target, &symlink_note).expect("symlink");
+        let listing: Value = client
+            .request(DaemonRequest::ProjectNotes {
+                name: "here".into(),
+            })
+            .expect("list ignores symlinked note file");
+        assert!(
+            !listing["notes"]
+                .as_array()
+                .expect("notes array")
+                .iter()
+                .any(|n| n["file"] == "2099-10-18-evil.md" || n["body"] == "top secret"),
+            "symlinked note file must not be read"
+        );
+        let refused_rm: Result<Value, String> = client.request(DaemonRequest::ProjectNoteRemove {
+            name: "here".into(),
+            file: "2099-10-18-evil.md".into(),
+            holder: "craig@mac".into(),
+        });
+        assert!(refused_rm.unwrap_err().contains("not a regular file"));
+        assert!(secret_target.exists(), "target file must not be unlinked");
+        fs::remove_file(&symlink_note).expect("cleanup symlink");
+
+        let backup_dir = workspace.path().join("notes-backup");
+        fs::rename(&dir, &backup_dir).expect("move notes dir aside");
+        std::os::unix::fs::symlink(&backup_dir, &dir).expect("symlink notes dir");
+        let refused_dir_list: Result<Value, String> = client.request(DaemonRequest::ProjectNotes {
+            name: "here".into(),
+        });
+        assert!(refused_dir_list
+            .unwrap_err()
+            .contains("refusing to follow symlink"));
+        let refused_dir_add: Result<Value, String> =
+            client.request(note("here", "AfterSymlink", "x"));
+        assert!(refused_dir_add
+            .unwrap_err()
+            .contains("refusing to follow symlink"));
+        fs::remove_file(&dir).expect("remove notes dir symlink");
+        fs::rename(&backup_dir, &dir).expect("restore notes dir");
+    }
 
     daemon.shutdown();
 }

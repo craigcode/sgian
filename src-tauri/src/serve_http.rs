@@ -323,6 +323,113 @@ pub(crate) fn host_is_loopback(host: Option<&str>) -> bool {
     matches!(bare, "localhost" | "127.0.0.1" | "[::1]")
 }
 
+fn host_port(host: &str) -> Option<&str> {
+    match host.rsplit_once(':') {
+        Some((_, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            Some(port)
+        }
+        _ => None,
+    }
+}
+
+/// Block cross-origin and cross-port browser requests (`SameSite=Strict`
+/// cookies are shared across all ports on `127.0.0.1` / `localhost`, so
+/// another local web server on a different port could otherwise POST to
+/// `/api/invoke` using a `no-cors` simple request). Non-browser clients
+/// (curl, raw socket tests) that omit `Origin` and `Sec-Fetch-Site` continue
+/// to authenticate via the session key.
+pub(crate) fn origin_and_fetch_site_allowed(head: &str, host: Option<&str>) -> bool {
+    let is_post_invoke = head.starts_with("POST /api/invoke ");
+    let mut has_custom_header = false;
+    let mut has_simple_content_type = false;
+    for line in head.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("x-sgian-invoke") || name.eq_ignore_ascii_case("x-sgian-key") {
+            has_custom_header = true;
+        }
+        if name.eq_ignore_ascii_case("content-type") {
+            let media = value.split(';').next().unwrap_or(value).trim();
+            if media.eq_ignore_ascii_case("text/plain")
+                || media.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+                || media.eq_ignore_ascii_case("multipart/form-data")
+            {
+                has_simple_content_type = true;
+            }
+        }
+        if name.eq_ignore_ascii_case("sec-fetch-site")
+            && !value.eq_ignore_ascii_case("same-origin")
+            && !value.eq_ignore_ascii_case("none")
+        {
+            return false;
+        }
+        if name.eq_ignore_ascii_case("origin") {
+            let origin_host = value
+                .strip_prefix("http://")
+                .or_else(|| value.strip_prefix("https://"));
+            let Some(origin_host) = origin_host else {
+                return false;
+            };
+            let origin_host = origin_host.split('/').next().unwrap_or(origin_host);
+            if !host_is_loopback(Some(origin_host)) {
+                return false;
+            }
+            if let Some(req_host) = host {
+                if host_port(req_host) != host_port(origin_host) {
+                    return false;
+                }
+            }
+        }
+    }
+    if is_post_invoke && has_simple_content_type && !has_custom_header {
+        return false;
+    }
+    true
+}
+
+/// Redact secret `env` values from `get_config` before returning over HTTP so
+/// a served browser view never receives plaintext environment secrets (H-01).
+fn redact_served_config(value: &mut Value) {
+    if let Some(obj) = value.as_object_mut() {
+        if obj.contains_key("env") {
+            obj.insert("env".to_string(), json!({}));
+        }
+        if let Some(profiles) = obj.get_mut("profiles").and_then(Value::as_array_mut) {
+            for profile in profiles {
+                if let Some(p_obj) = profile.as_object_mut() {
+                    if p_obj.contains_key("env") {
+                        p_obj.insert("env".to_string(), json!({}));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn check_served_agent_lease(
+    client: &DaemonClient,
+    pane_id: &str,
+    holder: &str,
+) -> Result<(), String> {
+    let info: LeaseInfo = client.request(DaemonRequest::LeaseStatus {
+        pane_id: pane_id.to_string(),
+    })?;
+    if let Some(current_holder) = info.holder.as_deref() {
+        if current_holder != holder {
+            return Err(format!(
+                "pane keyboard is leased by {current_holder} ({pane_id})"
+            ));
+        }
+    } else if info.policy == LeasePolicy::Required.as_str() {
+        return Err(format!(
+            "lease policy is 'required': take a lease before writing ({pane_id})"
+        ));
+    }
+    Ok(())
+}
+
 fn write_response(
     stream: &mut std::net::TcpStream,
     status: u16,
@@ -534,6 +641,14 @@ fn handle_connection(mut stream: std::net::TcpStream, session: &ServeSession) {
         );
         return;
     }
+    if !origin_and_fetch_site_allowed(&head, request.host.as_deref()) {
+        let _ = write_json(
+            &mut stream,
+            403,
+            &json!({ "ok": false, "error": "cross-origin requests are not allowed" }),
+        );
+        return;
+    }
     if request.content_length > SERVE_BODY_MAX {
         let _ = write_json(
             &mut stream,
@@ -624,7 +739,25 @@ fn handle_connection(mut stream: std::net::TcpStream, session: &ServeSession) {
                         // or shutdown from a served page (S5 of the review).
                         Err(format!("{command} is not available from a served view"))
                     } else {
-                        client.request::<Value>(daemon_request)
+                        if let DaemonRequest::SendAgentMessage { pane_id, .. }
+                        | DaemonRequest::AgentApproval { pane_id, .. }
+                        | DaemonRequest::InterruptAgent { pane_id } = &daemon_request
+                        {
+                            if let Err(err) = check_served_agent_lease(client, pane_id, holder) {
+                                let _ = write_json(
+                                    &mut stream,
+                                    200,
+                                    &json!({ "ok": false, "error": err }),
+                                );
+                                return;
+                            }
+                        }
+                        client.request::<Value>(daemon_request).map(|mut value| {
+                            if command == "get_config" {
+                                redact_served_config(&mut value);
+                            }
+                            value
+                        })
                     }
                 }
             };

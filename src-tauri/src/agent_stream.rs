@@ -1420,7 +1420,11 @@ pub(crate) fn agent_reader_main(ctx: AgentReaderCtx) {
         for event in normalize_provider_agent_event(backend, &raw) {
             match event.get("kind").and_then(Value::as_str).unwrap_or("") {
                 "session" => {
-                    if let Some(session_id) = event.get("session_id").and_then(Value::as_str) {
+                    if let Some(session_id) = event
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| is_safe_cli_token(id))
+                    {
                         let mut changed = false;
                         if let Ok(mut shared) = shared.lock() {
                             if shared.session_id.as_deref() != Some(session_id) {
@@ -1503,6 +1507,17 @@ pub(crate) fn agent_reader_main(ctx: AgentReaderCtx) {
     }
 }
 
+/// Reject CLI flag injection (`--...` or `-...`), whitespace, and control bytes
+/// in tokens passed as positional values to `--model` or `--resume` (L-01).
+pub(crate) fn is_safe_cli_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TITLE_CHARS
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '@' | '/'))
+}
+
 /// (T2) A live session's stdin queue + shared state, cloned out from under
 /// the store lock for request handlers.
 #[cfg(any(unix, windows))]
@@ -1531,7 +1546,8 @@ impl TerminalStore {
                     .ok()
                     .and_then(|shared| shared.session_id.clone())
             })
-            .or_else(|| self.agent_resume.get(pane_id).cloned());
+            .or_else(|| self.agent_resume.get(pane_id).cloned())
+            .filter(|id| is_safe_cli_token(id));
         let mut args = match spec.backend {
             AgentBackendKind::Claude => vec![
                 "-p".to_string(),
@@ -1557,9 +1573,9 @@ impl TerminalStore {
             ],
         };
         if spec.backend == AgentBackendKind::Claude {
-            if let Some(model) = &spec.model {
+            if let Some(model) = spec.model.as_deref().filter(|m| is_safe_cli_token(m)) {
                 args.push("--model".to_string());
-                args.push(model.clone());
+                args.push(model.to_string());
             }
             if let Some(session_id) = &resume_session_id {
                 args.push("--resume".to_string());

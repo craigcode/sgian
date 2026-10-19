@@ -137,6 +137,19 @@ import Testing
     #expect(chat.pendingPermission == nil)
 }
 
+@Test func agentReducerAccumulatesElidedMessageCount() {
+    var chat = AgentChatState()
+    for i in 1...505 {
+        chat.appendUserMessage("msg-\(i)", messageID: "id-\(i)")
+    }
+    #expect(chat.messages.count == 500)
+    #expect(chat.messages[0].kind == .historyElided)
+    #expect(chat.messages[0].text == "6 earlier messages are not shown")
+    chat.appendUserMessage("msg-506", messageID: "id-506")
+    #expect(chat.messages.count == 500)
+    #expect(chat.messages[0].text == "7 earlier messages are not shown")
+}
+
 @Test func agentReplayPreservesLocalPromptsAndAppliesOnlyNewEvents() {
     var chat = AgentChatState()
     chat.appendUserMessage("keep this prompt")

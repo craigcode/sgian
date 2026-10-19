@@ -30,6 +30,9 @@ use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
+const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 /// Total time a client waits for the listener to accept the currently
 /// connected pipe and create the next instance. A named-pipe server owns one
 /// listening instance at a time, so concurrent clients legitimately see
@@ -152,6 +155,7 @@ fn free_security_descriptor(sd: windows_sys::Win32::Security::PSECURITY_DESCRIPT
 fn create_pipe_instance(
     wide_name: &[u16],
     sd: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    first_instance: bool,
 ) -> HANDLE {
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     if crate::require_owner_descriptor(sd.is_null()).is_err() {
@@ -162,10 +166,14 @@ fn create_pipe_instance(
         lpSecurityDescriptor: sd,
         bInheritHandle: 0,
     };
+    let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+    if first_instance {
+        open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+    }
     unsafe {
         CreateNamedPipeW(
             wide_name.as_ptr(),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            open_mode,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             // UNLIMITED, not 1: accept hands the connected instance to the
             // returned stream (still OPEN) and only then recreates the next
@@ -421,7 +429,10 @@ impl WindowsNamedPipeStream {
                     FILE_SHARE_NONE,
                     std::ptr::null(),
                     OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                    FILE_ATTRIBUTE_NORMAL
+                        | FILE_FLAG_OVERLAPPED
+                        | SECURITY_SQOS_PRESENT
+                        | SECURITY_IDENTIFICATION,
                     std::ptr::null_mut(),
                 )
             };
@@ -708,11 +719,19 @@ impl WindowsNamedPipeListener {
         // refused at `create_pipe_instance`, but this surfaces a clear error
         // instead of a stale `last_os_error()`.
         crate::require_owner_descriptor(security_descriptor.is_null())?;
-        let handle = create_pipe_instance(&wide_name, security_descriptor);
-        if handle == INVALID_HANDLE_VALUE {
-            free_security_descriptor(security_descriptor);
-            return Err(io::Error::last_os_error());
-        }
+        let started = std::time::Instant::now();
+        let handle = loop {
+            let h = create_pipe_instance(&wide_name, security_descriptor, true);
+            if h != INVALID_HANDLE_VALUE {
+                break h;
+            }
+            let err = io::Error::last_os_error();
+            if started.elapsed() >= Duration::from_millis(500) {
+                free_security_descriptor(security_descriptor);
+                return Err(err);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
         if event.is_null() {
             unsafe {
@@ -817,7 +836,7 @@ impl WindowsNamedPipeListener {
         // closes the handle itself if stream setup fails).
         let connected = self.handle.get();
         let wide_name = wide(&self.pipe_name);
-        let new_handle = create_pipe_instance(&wide_name, self.security_descriptor);
+        let new_handle = create_pipe_instance(&wide_name, self.security_descriptor, false);
         if new_handle == INVALID_HANDLE_VALUE {
             // We still have a connected client — return it; the listener is
             // left handle-less and errors on the next accept.
@@ -962,7 +981,7 @@ mod windows_pipe_tests {
             "\\\\.\\pipe\\{}-test-null-sd",
             crate::WINDOWS_IPC_NAMESPACE
         ));
-        let handle = create_pipe_instance(&wide_name, std::ptr::null_mut());
+        let handle = create_pipe_instance(&wide_name, std::ptr::null_mut(), true);
         assert_eq!(
             handle, INVALID_HANDLE_VALUE,
             "a NULL descriptor must fail closed (no default-ACL pipe)"

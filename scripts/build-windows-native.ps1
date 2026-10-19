@@ -57,7 +57,7 @@ try {
             $publisher = $certificate.Subject
             $signFile = {
                 param($path)
-                & $signTool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /sha1 $certificate.Thumbprint $path
+                & $signTool sign /fd SHA256 /td SHA256 /tr https://timestamp.digicert.com /sha1 $certificate.Thumbprint $path
                 if ($LASTEXITCODE -ne 0) { throw "Signing failed: $path" }
             }
         } else {
@@ -74,7 +74,7 @@ try {
             $dlib = $env:SGIAN_TRUSTED_SIGNING_DLIB
             $signFile = {
                 param($path)
-                & $signTool sign /fd SHA256 /td SHA256 /tr http://timestamp.acs.microsoft.com /dlib $dlib /dmdf $trustedMetadata $path
+                & $signTool sign /fd SHA256 /td SHA256 /tr https://timestamp.acs.microsoft.com /dlib $dlib /dmdf $trustedMetadata $path
                 if ($LASTEXITCODE -ne 0) { throw "Trusted Signing failed: $path" }
             }
         }
@@ -123,7 +123,25 @@ try {
     # Under Trusted Signing the package is built unsigned and signed below.
     $signingEnabled = if ($ReleaseSigning -and $certificate) { "true" } else { "false" }
     $certificateThumbprint = if ($certificate) { $certificate.Thumbprint } else { "" }
+    if ($ReleaseSigning) {
+        & dotnet build $project `
+            -c $Configuration `
+            -r $RuntimeIdentifier `
+            -p:Platform=$platform `
+            -p:GenerateAppxPackageOnBuild=false `
+            -p:WindowsAppSDKSelfContained=true `
+            -p:SelfContained=true `
+            -p:SgianBackendPath=$backend
+        if ($LASTEXITCODE -ne 0) { throw "Native Windows pre-MSIX compile failed" }
+        $windowsDir = Join-Path $repo "apps/windows"
+        foreach ($binary in @("Sgian.Windows.exe", "Sgian.Windows.dll", "Sgian.Protocol.dll")) {
+            Get-ChildItem $windowsDir -Recurse -Filter $binary |
+                Where-Object { $_.FullName -match "[\\/](bin|obj)[\\/]" -and $_.FullName -match [regex]::Escape($RuntimeIdentifier) } |
+                ForEach-Object { & $signFile $_.FullName }
+        }
+    }
     & dotnet build $project `
+        --no-restore `
         -c $Configuration `
         -r $RuntimeIdentifier `
         -p:Platform=$platform `
@@ -131,7 +149,7 @@ try {
         -p:AppxPackageSigningEnabled=$signingEnabled `
         -p:PackageCertificateThumbprint=$certificateThumbprint `
         -p:AppxPackageSigningTimestampDigestAlgorithm=SHA256 `
-        -p:AppxPackageSigningTimestampServerUrl=http://timestamp.digicert.com `
+        -p:AppxPackageSigningTimestampServerUrl=https://timestamp.digicert.com `
         -p:WindowsAppSDKSelfContained=true `
         -p:SelfContained=true `
         -p:AppxBundle=Never `

@@ -4158,3 +4158,163 @@ fn agent_scrub_throughput() {
         started.elapsed() / rounds / (plain.len() / (1024 * 1024)) as u32
     );
 }
+
+#[test]
+fn security_audit_2026_10_18_pure_guards() {
+    // M-01: Streaming escape carry buffer is bounded at MAX_ESCAPE_CARRY_BYTES,
+    // CSI parameter bytes follow ECMA-48 (0x20..=0x3F), and unclosed or
+    // replaced OSC 8 hyperlinks are flagged as hyperlink_mismatch.
+    let mut carry = String::new();
+    let oversized_osc = format!("\u{1b}]8;;https://example.com/{}", "a".repeat(5000));
+    let (clean, tricks, _) = scrub_agent_text_streaming(&oversized_osc, &mut carry);
+    assert_eq!(clean, "");
+    assert!(
+        carry.is_empty(),
+        "an unterminated escape exceeding MAX_ESCAPE_CARRY_BYTES is dropped instead of carried"
+    );
+    assert_eq!(tricks, OutputTricks::default());
+
+    // Non-ECMA-48 byte after CSI stops CSI parsing at that byte.
+    let (clean, _, _) = scrub_agent_text("\u{1b}[31m\u{1b}[\u{202e}hidden\u{202c}ok");
+    assert_eq!(clean, "hiddenok");
+
+    // Unclosed OSC 8 link at end of text or replaced without closing first
+    // increments hyperlink_mismatch.
+    let unclosed = scan_output_tricks("\u{1b}]8;;https://evil.example\u{7}https://good.example");
+    assert_eq!(unclosed.hyperlink_mismatch, 1);
+    let replaced = scan_output_tricks(
+        "\u{1b}]8;;https://evil.example\u{7}click\u{1b}]8;;https://other.example\u{7}https://good.example\u{1b}]8;;\u{7}",
+    );
+    assert!(replaced.hyperlink_mismatch >= 1);
+
+    // L-01: CLI flag-injection guard rejects leading '-' and whitespace/controls.
+    assert!(crate::agent_stream::is_safe_cli_token("claude-sonnet-4-6"));
+    assert!(crate::agent_stream::is_safe_cli_token(
+        "sess_123-abc.456:789"
+    ));
+    assert!(!crate::agent_stream::is_safe_cli_token(""));
+    assert!(!crate::agent_stream::is_safe_cli_token(
+        "--mcp-config=/tmp/evil.json"
+    ));
+    assert!(!crate::agent_stream::is_safe_cli_token("-p"));
+    assert!(!crate::agent_stream::is_safe_cli_token("model with space"));
+
+    assert!(AgentPaneSpec::normalized(
+        Some(AgentBackendKind::Claude),
+        Some("--settings=/tmp/pwn".to_string()),
+    )
+    .is_err());
+
+    // H-04: origin_and_fetch_site_allowed blocks cross-origin, cross-port,
+    // and simple form/no-cors POSTs without custom headers.
+    assert!(origin_and_fetch_site_allowed(
+        "POST /api/invoke HTTP/1.1\r\nHost: localhost:8421\r\nOrigin: http://localhost:8421\r\nSec-Fetch-Site: same-origin\r\nX-Sgian-Invoke: 1\r\n",
+        Some("localhost:8421")
+    ));
+    assert!(!origin_and_fetch_site_allowed(
+        "POST /api/invoke HTTP/1.1\r\nHost: localhost:8421\r\nOrigin: http://localhost:3000\r\n",
+        Some("localhost:8421")
+    ));
+    assert!(!origin_and_fetch_site_allowed(
+        "POST /api/invoke HTTP/1.1\r\nHost: localhost:8421\r\nSec-Fetch-Site: same-site\r\n",
+        Some("localhost:8421")
+    ));
+    assert!(!origin_and_fetch_site_allowed(
+        "POST /api/invoke HTTP/1.1\r\nHost: localhost:8421\r\nContent-Type: text/plain\r\n",
+        Some("localhost:8421")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn security_audit_2026_10_18_ipc_and_serve_guards() {
+    let mut env = HashMap::new();
+    env.insert("ANTHROPIC_API_KEY".to_string(), "sk-ant-secret".to_string());
+    let daemon = TestDaemon::spawn(Config {
+        shell: Some("/bin/sh".to_string()),
+        env: env.clone(),
+        profiles: vec![PaneProfile {
+            name: "prod".to_string(),
+            kind: Some("shell".to_string()),
+            shell: Some("/bin/sh".to_string()),
+            shell_args: None,
+            env,
+            agent_backend: None,
+            agent_model: None,
+        }],
+        agent_probe_interval_ms: Some(0),
+        ..Default::default()
+    });
+    let client = daemon.client();
+
+    // Admin (root) sees full config env; read/write credentials get redacted env (H-01).
+    let root_cfg: Value = client
+        .request(DaemonRequest::GetConfig)
+        .expect("root config");
+    assert_eq!(root_cfg["env"]["ANTHROPIC_API_KEY"], json!("sk-ant-secret"));
+
+    let issued: Value = client
+        .request(DaemonRequest::IdentityIssue {
+            holder: "viewer@phone".to_string(),
+            scopes: vec!["read".to_string(), "write".to_string()],
+        })
+        .expect("issue credential");
+    let token = issued["token"].as_str().expect("token");
+    let mut cred_conn = connect_with_client_token(&daemon, token).expect("cred connect");
+    let cred_cfg = cred_conn
+        .request(&DaemonRequest::GetConfig)
+        .expect("cred get_config");
+    assert!(cred_cfg.ok, "{cred_cfg:?}");
+    assert_eq!(cred_cfg.result["env"], json!({}));
+    assert_eq!(cred_cfg.result["profiles"][0]["env"], json!({}));
+
+    // M-08: KranzBind rejects a repo starting with '-'.
+    let initial: WorkspaceSnapshot = client
+        .request(DaemonRequest::BootstrapWorkspace)
+        .expect("bootstrap");
+    let pane_id = initial.panes[0].id.clone();
+    let bad_repo = cred_conn
+        .request(&DaemonRequest::KranzBind {
+            pane_id: pane_id.clone(),
+            repo: Some("--help".to_string()),
+        })
+        .expect("kranz bind response");
+    assert!(!bad_repo.ok);
+    assert!(bad_repo
+        .error
+        .as_deref()
+        .unwrap_or("")
+        .contains("must not start with '-'"));
+
+    // H-01 & H-04 on `ctl serve`: get_config is redacted and cross-port Origin is 403.
+    let srv = start_serve_with(daemon.client(), 0, true).expect("serve");
+    let port = srv.addr.port();
+    let key = srv.key.clone();
+    let body = r#"{"command":"get_config","args":{}}"#;
+    let (_, _, resp_body) = http_keyed(
+        srv.addr,
+        &format!(
+            "POST /api/invoke HTTP/1.1\r\nHost: localhost:{port}\r\nX-Sgian-Invoke: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+        "",
+        &key,
+    );
+    let parsed: Value = serde_json::from_str(&resp_body).expect("json");
+    assert_eq!(parsed["ok"], json!(true), "{resp_body}");
+    assert_eq!(parsed["result"]["env"], json!({}));
+    assert_eq!(parsed["result"]["profiles"][0]["env"], json!({}));
+
+    let (status, _, _) = http(
+        srv.addr,
+        &format!(
+            "POST /api/invoke HTTP/1.1\r\nHost: localhost:{port}\r\nOrigin: http://localhost:9999\r\nCookie: {SERVE_COOKIE}={key}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+        "",
+    );
+    assert_eq!(status, 403);
+
+    srv.stop();
+    daemon.shutdown();
+}

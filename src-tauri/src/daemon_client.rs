@@ -50,6 +50,7 @@ impl DaemonConnection {
         // Best-effort: a transport that cannot set timeouts still works, it just
         // keeps the old blocking behavior.
         let _ = stream.set_read_timeout(read_timeout);
+        let _ = stream.set_write_timeout(read_timeout);
         Self::handshake(stream, token, client_token_from_env().as_deref())
     }
 
@@ -82,11 +83,11 @@ impl DaemonConnection {
         };
         write_json_line(reader.get_mut(), &hello)?;
 
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|error| format!("failed to read daemon hello: {error}"))?;
-        let response: IpcResponse = serde_json::from_str(line.trim_end())
+        let line = read_ipc_line(&mut reader)?;
+        if line.is_empty() {
+            return Err("failed to read daemon hello: unexpected EOF".to_string());
+        }
+        let response: IpcResponse = serde_json::from_str(&line)
             .map_err(|error| format!("invalid daemon hello: {error}"))?;
         if !response.ok {
             return Err(response
@@ -160,15 +161,11 @@ impl DaemonConnection {
                 None => Err("daemon closed before responding".to_string()),
             }
         } else {
-            let mut line = String::new();
-            self.reader
-                .read_line(&mut line)
-                .map_err(|error| format!("failed to read daemon response: {error}"))?;
+            let line = read_ipc_line(&mut self.reader)?;
             if line.is_empty() {
                 return Err("daemon closed before responding".to_string());
             }
-            serde_json::from_str(line.trim_end())
-                .map_err(|error| format!("invalid daemon response: {error}"))
+            serde_json::from_str(&line).map_err(|error| format!("invalid daemon response: {error}"))
         }
     }
 
@@ -180,23 +177,25 @@ impl DaemonConnection {
 
     /// Read the next event from a subscribed connection. `Ok(None)` is a clean EOF
     /// (the daemon closed the stream), letting the subscribe loops terminate
-    /// cleanly. On the newline path an un-decodable line is skipped (the historical
-    /// behavior — the daemon only ever writes well-formed events on a stream); on the
-    /// framed path a decode error is terminal (a frame stream cannot resync mid-frame).
+    /// cleanly. On the newline path an un-decodable line is skipped up to a bounded
+    /// retry count; on the framed path a decode error is terminal (a frame stream
+    /// cannot resync mid-frame).
     pub(crate) fn read_event(&mut self) -> Result<Option<DaemonEvent>, String> {
         if self.uses_framing() {
             frame::read::<_, DaemonEvent>(&mut self.reader)
         } else {
+            let mut skipped = 0usize;
             loop {
-                let mut line = String::new();
-                match self.reader.read_line(&mut line) {
-                    Ok(0) => return Ok(None),
-                    Ok(_) => {
-                        if let Ok(event) = serde_json::from_str::<DaemonEvent>(line.trim_end()) {
-                            return Ok(Some(event));
-                        }
-                    }
-                    Err(error) => return Err(format!("failed to read daemon events: {error}")),
+                let line = read_ipc_line(&mut self.reader)?;
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                if let Ok(event) = serde_json::from_str::<DaemonEvent>(&line) {
+                    return Ok(Some(event));
+                }
+                skipped += 1;
+                if skipped >= 64 {
+                    return Err("failed to read daemon events: too many invalid lines".to_string());
                 }
             }
         }
@@ -1071,7 +1070,7 @@ pub(crate) fn read_scrollback_tail(
         file.seek(SeekFrom::Start(len - limit as u64)).ok()?;
     }
     let mut data = Vec::new();
-    file.read_to_end(&mut data).ok()?;
+    (&mut file).take(limit as u64).read_to_end(&mut data).ok()?;
 
     let start = utf8_boundary_at_or_after(&data, 0);
     Some(String::from_utf8_lossy(&data[start..]).to_string())
@@ -1183,20 +1182,28 @@ pub(crate) fn cap_scrollback_file_to(
     let Ok(metadata) = fs::metadata(&path) else {
         return Ok(());
     };
-    if metadata.len() <= max_bytes {
+    let len = metadata.len();
+    if len <= max_bytes {
         return Ok(());
     }
 
     let mut file =
         File::open(&path).map_err(|error| format!("failed to open scrollback for cap: {error}"))?;
+    let target = (max_bytes / 2).max(1) as usize;
+    let seek_start = len.saturating_sub(target as u64);
+    if seek_start > 0 {
+        file.seek(SeekFrom::Start(seek_start))
+            .map_err(|error| format!("failed to seek scrollback for cap: {error}"))?;
+    }
     let mut data = Vec::new();
-    file.read_to_end(&mut data)
+    (&mut file)
+        .take((target as u64).saturating_add(4096))
+        .read_to_end(&mut data)
         .map_err(|error| format!("failed to read scrollback for cap: {error}"))?;
-    if data.len() as u64 <= max_bytes {
+    if data.is_empty() {
         return Ok(());
     }
 
-    let target = (max_bytes / 2).max(1) as usize;
     let keep_from = data.len().saturating_sub(target);
     let keep_from = utf8_boundary_at_or_after(&data, keep_from);
     // Advance to just past the next newline so the kept tail starts at a line

@@ -28,7 +28,7 @@ export function createWebBridge({
   async function nativeInvoke(command, args = {}) {
     const response = await fetchImpl(`${base}/api/invoke`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Sgian-Invoke": "1" },
       body: JSON.stringify({ command, args }),
     });
     if (!response.ok) throw new Error(`${command}: HTTP ${response.status}`);

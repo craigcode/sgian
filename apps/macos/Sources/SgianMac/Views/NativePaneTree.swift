@@ -78,6 +78,7 @@ private struct NativeSplitDivider: View {
     let horizontal: Bool
     let ratio: Double
     let resize: (Double) -> Void
+    @State private var cursorPushed = false
 
     var body: some View {
         Rectangle().fill(Color(nsColor: .separatorColor).opacity(0.5))
@@ -88,8 +89,19 @@ private struct NativeSplitDivider: View {
                 resize(ratio + (direction == .increment ? 0.05 : -0.05))
             }
             .onHover { inside in
-                if inside { (horizontal ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).push() }
-                else { NSCursor.pop() }
+                if inside && !cursorPushed {
+                    (horizontal ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).push()
+                    cursorPushed = true
+                } else if !inside && cursorPushed {
+                    NSCursor.pop()
+                    cursorPushed = false
+                }
+            }
+            .onDisappear {
+                if cursorPushed {
+                    NSCursor.pop()
+                    cursorPushed = false
+                }
             }
     }
 }

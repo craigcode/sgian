@@ -264,13 +264,15 @@ impl AgentPaneSpec {
         let model = model
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        if model
-            .as_ref()
-            .is_some_and(|value| value.len() > MAX_TITLE_CHARS)
-        {
-            return Err(format!(
-                "agent model exceeds maximum size ({MAX_TITLE_CHARS} bytes)"
-            ));
+        if let Some(ref value) = model {
+            if value.len() > MAX_TITLE_CHARS {
+                return Err(format!(
+                    "agent model exceeds maximum size ({MAX_TITLE_CHARS} bytes)"
+                ));
+            }
+            if !is_safe_cli_token(value) {
+                return Err(format!("invalid agent model '{value}'"));
+            }
         }
         Ok(Self {
             backend: backend.unwrap_or_default(),
@@ -921,6 +923,25 @@ impl Config {
             "agent_droid_bin": self.agent_droid_bin,
             "profiles": self.profiles,
         })
+    }
+
+    /// Same structure as `full_config()` (so `serde_json::from_value::<Config>`
+    /// in `ctl new-pane --profile` still works), but with `env` and
+    /// `profiles[*].env` emptied so non-admin credentials (`read` or `write`
+    /// scope) never receive plaintext environment secrets via `GetConfig` (H-01).
+    fn redacted_full_config(&self) -> Value {
+        let mut value = self.full_config();
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("env".to_string(), json!({}));
+            if let Some(profiles) = obj.get_mut("profiles").and_then(Value::as_array_mut) {
+                for profile in profiles {
+                    if let Some(p_obj) = profile.as_object_mut() {
+                        p_obj.insert("env".to_string(), json!({}));
+                    }
+                }
+            }
+        }
+        value
     }
 
     /// Effective (merged) config summary for `status --verbose`. Deliberately
@@ -2373,7 +2394,9 @@ impl DaemonServer {
                 registry.panes.iter().map(|pane| pane.id.clone()).collect();
             terminals.agent_resume = agents_v2
                 .into_iter()
-                .filter(|(pane_id, _)| registry_ids.contains(pane_id))
+                .filter(|(pane_id, session_id)| {
+                    registry_ids.contains(pane_id) && is_safe_cli_token(session_id)
+                })
                 .collect();
         }
         #[cfg(not(any(unix, windows)))]
@@ -2723,7 +2746,7 @@ impl DaemonServer {
     /// pane, broadcast as `agent_usage`. Also proof that Claude is running
     /// there: a pane with no agent mark gets one (attention untouched; the
     /// status line says nothing about that). Never an error.
-    fn handle_agent_status(&self, pid: u32, payload: &Value) -> Value {
+    fn handle_agent_status(&self, pid: u32, payload: &Value, caller_holder: Option<&str>) -> Value {
         let Some(mut usage) = AgentUsage::from_status_payload(payload) else {
             return json!({ "mapped": false, "reason": "payload carries nothing we keep" });
         };
@@ -2737,6 +2760,18 @@ impl DaemonServer {
         let Some(pane_id) = pane_for_pid(pid, &parent_of, &pane_pids) else {
             return json!({ "mapped": false, "reason": format!("no live pane owns pid {pid}") });
         };
+        if let Some(caller_holder) = caller_holder {
+            if let Ok(leases) = self.lock_leases() {
+                if let Some(held) = leases.get(&pane_id) {
+                    if held.holder != caller_holder {
+                        return json!({
+                            "mapped": false,
+                            "reason": format!("pane {pane_id} is leased by {}", held.holder)
+                        });
+                    }
+                }
+            }
+        }
         usage.updated_at_ms = now_millis();
         let changed = match self.agent_usage.lock() {
             Ok(mut table) => {
@@ -2780,6 +2815,7 @@ impl DaemonServer {
         notification_type: Option<&str>,
         message: Option<&str>,
         session_id: Option<&str>,
+        caller_holder: Option<&str>,
     ) -> Value {
         let Some(attention) = attention_from_hook(event, notification_type) else {
             return json!({ "mapped": false, "reason": format!("hook event '{event}' carries no attention") });
@@ -2794,6 +2830,18 @@ impl DaemonServer {
         let Some(pane_id) = pane_for_pid(pid, &parent_of, &pane_pids) else {
             return json!({ "mapped": false, "reason": format!("no live pane owns pid {pid}") });
         };
+        if let Some(caller_holder) = caller_holder {
+            if let Ok(leases) = self.lock_leases() {
+                if let Some(held) = leases.get(&pane_id) {
+                    if held.holder != caller_holder {
+                        return json!({
+                            "mapped": false,
+                            "reason": format!("pane {pane_id} is leased by {}", held.holder)
+                        });
+                    }
+                }
+            }
+        }
         self.router.apply_official_attention_with(
             &pane_id,
             "claude",
@@ -2997,7 +3045,7 @@ impl DaemonServer {
             let Ok(dir) = self.project_notes_dir(&project) else {
                 continue;
             };
-            let hash = fs::read(dir.join(&file))
+            let hash = notes::read_note_file_bounded(&dir.join(&file))
                 .ok()
                 .map(|raw| notes::note_hash(&raw));
             // The daemon's own write already announced exactly this state.
@@ -3093,7 +3141,13 @@ impl DaemonServer {
     fn handle_kranz_bind(&self, pane_id: &str, repo: Option<String>) -> Result<Value, String> {
         self.ensure_pane_exists(pane_id)?;
         let repo = match repo {
-            Some(repo) => validate_bounded_text(&repo, "repo", 4096)?,
+            Some(repo) => {
+                let repo = validate_bounded_text(&repo, "repo", 4096)?;
+                if repo.starts_with('-') {
+                    return Err("repo path must not start with '-'".to_string());
+                }
+                repo
+            }
             None => self
                 .lock_terminals()?
                 .pane_cwd(pane_id)
@@ -3188,12 +3242,9 @@ impl DaemonServer {
     #[cfg(unix)]
     fn probe_kranz_binding(&self, pane_id: &str, binding: &KranzBinding, ttl: Duration) {
         let bin = self.effective_config().kranz_bin_effective();
-        let output = match Command::new(&bin)
-            .args(["--repo", &binding.repo, "status", "--json"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-        {
+        let mut cmd = Command::new(&bin);
+        cmd.args(["--repo", &binding.repo, "status", "--json"]);
+        let output = match run_subprocess_bounded(&mut cmd, Duration::from_secs(5)) {
             Ok(output) if output.status.success() => output.stdout,
             Ok(output) => {
                 self.note_probe_failure(&format!(
@@ -3239,10 +3290,9 @@ impl DaemonServer {
         };
         let bin = self.effective_config().kranz_bin_effective();
         let text = format!("[sgian] {holder} handed back the keyboard: {note}");
-        let outcome = Command::new(&bin)
-            .args(["--repo", &binding.repo, "msg", &text])
-            .stdin(Stdio::null())
-            .output();
+        let mut cmd = Command::new(&bin);
+        cmd.args(["--repo", &binding.repo, "msg", &text]);
+        let outcome = run_subprocess_bounded(&mut cmd, Duration::from_secs(5));
         let (ok, error) = match outcome {
             Ok(output) if output.status.success() => (true, None),
             Ok(output) => (
@@ -3290,12 +3340,9 @@ impl DaemonServer {
         else {
             return;
         };
-        let output = match Command::new(&bin)
-            .args(["agents", "--json"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-        {
+        let mut cmd = Command::new(&bin);
+        cmd.args(["agents", "--json"]);
+        let output = match run_subprocess_bounded(&mut cmd, Duration::from_secs(5)) {
             Ok(output) if output.status.success() => output.stdout,
             Ok(output) => {
                 self.note_probe_failure(&format!("`{bin} agents --json` exited {}", output.status));
@@ -3313,11 +3360,9 @@ impl DaemonServer {
                 return;
             }
         };
-        let table = match Command::new("ps")
-            .args(["-axo", "pid=,ppid=,args="])
-            .stdin(Stdio::null())
-            .output()
-        {
+        let mut ps_cmd = Command::new("ps");
+        ps_cmd.args(["-axo", "pid=,ppid=,args="]);
+        let table = match run_subprocess_bounded(&mut ps_cmd, Duration::from_secs(5)) {
             Ok(output) => parse_process_table(&String::from_utf8_lossy(&output.stdout)),
             Err(error) => {
                 self.note_probe_failure(&format!("cannot run ps: {error}"));
@@ -3405,7 +3450,8 @@ impl DaemonServer {
                     .iter()
                     .map(|pane| pane.id.clone())
                     .collect::<Vec<_>>();
-                if self.take_spawn_on_bootstrap()? {
+                let spawned = self.take_spawn_on_bootstrap()?;
+                if spawned {
                     self.ensure_terminals(&pane_ids)?;
                 }
                 let mut snapshot = self.snapshot()?;
@@ -3415,7 +3461,9 @@ impl DaemonServer {
                     .map(|pane| pane.id.clone())
                     .collect::<Vec<_>>();
                 snapshot.scrollback = self.read_scrollback_for(&pane_ids);
-                self.persist()?;
+                if spawned || self.dirty.swap(false, Ordering::SeqCst) {
+                    self.persist()?;
+                }
                 Ok(json!(snapshot))
             }
             DaemonRequest::ListPanes => Ok(json!(self.pane_list()?)),
@@ -3639,7 +3687,7 @@ impl DaemonServer {
                 self.handle_project_note_remove(&name, &file, &holder)
             }
             DaemonRequest::AgentStatus { pid, payload } => {
-                Ok(self.handle_agent_status(pid, &payload))
+                Ok(self.handle_agent_status(pid, &payload, None))
             }
             DaemonRequest::AgentSignal {
                 pid,
@@ -3653,6 +3701,7 @@ impl DaemonServer {
                 notification_type.as_deref(),
                 message.as_deref(),
                 session_id.as_deref(),
+                None,
             )),
             DaemonRequest::ProjectLedger { name, limit } => {
                 self.handle_project_ledger(&name, limit)
@@ -5271,6 +5320,40 @@ impl DaemonServer {
             }
         }
         match request {
+            DaemonRequest::BootstrapWorkspace
+                if identity.credential.is_some() && !identity.has(ClientScope::Write) =>
+            {
+                let mut snapshot = self.snapshot()?;
+                let pane_ids = snapshot
+                    .panes
+                    .iter()
+                    .map(|pane| pane.id.clone())
+                    .collect::<Vec<_>>();
+                snapshot.scrollback = self.read_scrollback_for(&pane_ids);
+                Ok(json!(snapshot))
+            }
+            DaemonRequest::GetConfig if !identity.has(ClientScope::Admin) => {
+                Ok(self.effective_config().redacted_full_config())
+            }
+            DaemonRequest::AgentStatus { pid, payload } => Ok(self.handle_agent_status(
+                pid,
+                &payload,
+                identity.credential.as_ref().and(identity.holder.as_deref()),
+            )),
+            DaemonRequest::AgentSignal {
+                pid,
+                event,
+                notification_type,
+                message,
+                session_id,
+            } => Ok(self.handle_agent_signal(
+                pid,
+                &event,
+                notification_type.as_deref(),
+                message.as_deref(),
+                session_id.as_deref(),
+                identity.credential.as_ref().and(identity.holder.as_deref()),
+            )),
             DaemonRequest::TakeLease {
                 pane_id,
                 holder,
