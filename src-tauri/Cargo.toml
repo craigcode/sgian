@@ -34,7 +34,7 @@ dirs = "7"
 notify = "8"
 regex = "1"
 vt100 = "0.16.2"
-tauri-plugin-updater = "2.10.1"
+tauri-plugin-updater = { version = "2.10.1", default-features = false, features = ["rustls-tls"] }
 tauri-plugin-process = "2.3.1"
 # The built web client embedded for `sgian serve` (docs/design/served-view.md);
 # build.rs makes sure the directory exists so a daemon-only build without a

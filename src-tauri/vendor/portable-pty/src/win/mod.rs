@@ -25,7 +25,12 @@ pub struct WinChild {
 impl WinChild {
     fn is_complete(&mut self) -> IoResult<Option<ExitStatus>> {
         let mut status: DWORD = 0;
-        let proc = self.proc.lock().unwrap().try_clone()?;
+        let proc = self
+            .proc
+            .lock()
+            .unwrap()
+            .try_clone()
+            .map_err(IoError::other)?;
         let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
         if res != 0 {
             if status == STILL_ACTIVE {
@@ -39,7 +44,12 @@ impl WinChild {
     }
 
     fn do_kill(&mut self) -> IoResult<()> {
-        let proc = self.proc.lock().unwrap().try_clone()?;
+        let proc = self
+            .proc
+            .lock()
+            .unwrap()
+            .try_clone()
+            .map_err(IoError::other)?;
         let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
         let err = IoError::last_os_error();
         if res == 0 {
@@ -92,7 +102,12 @@ impl Child for WinChild {
         if let Ok(Some(status)) = self.try_wait() {
             return Ok(status);
         }
-        let proc = self.proc.lock().unwrap().try_clone()?;
+        let proc = self
+            .proc
+            .lock()
+            .unwrap()
+            .try_clone()
+            .map_err(IoError::other)?;
         unsafe {
             WaitForSingleObject(proc.as_raw_handle() as _, INFINITE);
         }
