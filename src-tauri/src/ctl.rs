@@ -1092,9 +1092,19 @@ pub(crate) fn control_write_config(
             serde_json::from_str::<Value>(first)
                 .map_err(|error| format!("invalid JSON config: {error}"))?
         } else {
-            // File path.
-            let content = fs::read_to_string(first)
+            // File path: bound read to 1 MiB so a device file cannot OOM the CLI (L-03).
+            const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+            let file = File::open(first)
                 .map_err(|error| format!("failed to read config file {first}: {error}"))?;
+            let mut content = String::new();
+            file.take(MAX_CONFIG_FILE_BYTES + 1)
+                .read_to_string(&mut content)
+                .map_err(|error| format!("failed to read config file {first}: {error}"))?;
+            if content.len() as u64 > MAX_CONFIG_FILE_BYTES {
+                return Err(format!(
+                    "config file {first} exceeds maximum size ({MAX_CONFIG_FILE_BYTES} bytes)"
+                ));
+            }
             serde_json::from_str::<Value>(&content)
                 .map_err(|error| format!("invalid JSON config in {first}: {error}"))?
         }
@@ -2475,11 +2485,15 @@ pub(crate) fn control_project(
                 Some(pane_ref) => Some(resolve_pane_ref(client, &pane_ref)?),
                 None => None,
             };
+            let holder = match parsed.holder {
+                Some(holder) => holder,
+                None => effective_holder(client),
+            };
             let result: Value = client.request(DaemonRequest::ProjectNoteAdd {
                 name: parsed.name.unwrap_or_default(),
                 title: parsed.title.unwrap_or_default(),
                 body,
-                holder: parsed.holder.unwrap_or_else(default_holder),
+                holder,
                 pane_id,
             })?;
             if json_output {
@@ -2495,10 +2509,14 @@ pub(crate) fn control_project(
             .map_err(|error| format!("failed to write stdout: {error}"))
         }
         ProjectVerb::NoteRm => {
+            let holder = match parsed.holder {
+                Some(holder) => holder,
+                None => effective_holder(client),
+            };
             let result: Value = client.request(DaemonRequest::ProjectNoteRemove {
                 name: parsed.name.unwrap_or_default(),
                 file: parsed.note_file.unwrap_or_default(),
-                holder: parsed.holder.unwrap_or_else(default_holder),
+                holder,
             })?;
             if json_output {
                 return write_json_stdout(&result);
@@ -2694,10 +2712,52 @@ pub(crate) fn control_send_input(client: &DaemonClient, args: &[String]) -> Resu
     }
 
     // (T2) Route by pane kind: to an AGENT pane the text is a chat message
-    // (SendAgentMessage — posted verbatim, with no Enter/CR translation and
-    // no --lf effect); to a shell pane it stays PTY input.
+    // (SendAgentMessage — posted verbatim, with no Enter/CR translation);
+    // to a shell pane it stays PTY input.
     let status = resolve_pane_status(client, &args[0])?;
     if status.pane.kind == PaneKind::Agent {
+        if literal_lf {
+            return Err(
+                "--lf applies only to shell panes; agent messages are sent verbatim".to_string(),
+            );
+        }
+        if holder.is_some() || generation.is_some() {
+            let lease: LeaseInfo = client.request(DaemonRequest::LeaseStatus {
+                pane_id: status.pane.id.clone(),
+            })?;
+            if let Some(expected_gen) = generation {
+                match lease.generation {
+                    Some(actual) if actual == expected_gen => {}
+                    Some(actual) => {
+                        return Err(format!(
+                            "lease generation mismatch: pane is on generation {actual}, expected {expected_gen} ({})",
+                            status.pane.id
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "lease generation {expected_gen} is stale: pane keyboard is not held ({})",
+                            status.pane.id
+                        ));
+                    }
+                }
+            }
+            if let Some(ref caller_holder) = holder {
+                if let Some(ref current_holder) = lease.holder {
+                    if current_holder != caller_holder {
+                        return Err(format!(
+                            "pane keyboard is leased by {current_holder} ({})",
+                            status.pane.id
+                        ));
+                    }
+                } else if lease.policy == LeasePolicy::Required.as_str() {
+                    return Err(format!(
+                        "lease policy is 'required': take a lease before writing ({})",
+                        status.pane.id
+                    ));
+                }
+            }
+        }
         let text = args[1..].join(" ");
         client.request::<CommandOk>(DaemonRequest::SendAgentMessage {
             message_id: None,
@@ -2964,12 +3024,36 @@ pub(crate) fn parse_logs_args(args: &[String]) -> Result<LogsPlan, String> {
     Ok(LogsPlan { lines, follow })
 }
 
+pub(crate) fn read_log_file_bounded(log_path: &Path) -> Option<String> {
+    const MAX_LOG_READ_BYTES: u64 = 4 * 1024 * 1024;
+    let mut file = File::open(log_path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let sought = if len > MAX_LOG_READ_BYTES {
+        file.seek(SeekFrom::Start(len - MAX_LOG_READ_BYTES)).ok()?;
+        true
+    } else {
+        false
+    };
+    let mut data = Vec::new();
+    (&mut file)
+        .take(MAX_LOG_READ_BYTES)
+        .read_to_end(&mut data)
+        .ok()?;
+    let mut start = utf8_boundary_at_or_after(&data, 0);
+    if sought {
+        if let Some(nl) = data[start..].iter().position(|&b| b == b'\n') {
+            start += nl + 1;
+        }
+    }
+    Some(String::from_utf8_lossy(&data[start..]).to_string())
+}
+
 /// Read the last `limit` lines (or all if `limit` is None) from a log file.
 /// Returns lines in chronological order (oldest to newest among the tail).
 /// Returns an empty vector if the file does not exist or is empty. Pure I/O
 /// (no daemon interaction), so it is testable in isolation.
 pub(crate) fn read_log_tail(log_path: &Path, limit: Option<usize>) -> Vec<String> {
-    let content = fs::read_to_string(log_path).unwrap_or_default();
+    let content = read_log_file_bounded(log_path).unwrap_or_default();
     let all_lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
     let start = limit
         .map(|n| all_lines.len().saturating_sub(n))
@@ -5003,7 +5087,7 @@ pub(crate) fn control_diagnostic(
 
 /// Last `max_lines` of daemon.log with obvious secret-bearing lines redacted.
 pub(crate) fn read_scrubbed_log_tail(path: &Path, max_lines: usize) -> Vec<String> {
-    let Ok(contents) = fs::read_to_string(path) else {
+    let Some(contents) = read_log_file_bounded(path) else {
         return Vec::new();
     };
     let lines: Vec<&str> = contents.lines().collect();

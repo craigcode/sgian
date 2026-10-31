@@ -8,11 +8,13 @@ pub(crate) fn process_descendants(root: u32, table: &ProcessTable) -> Vec<u32> {
         children.entry(*ppid).or_default().push(*pid);
     }
     let mut found = Vec::new();
+    let mut seen = HashSet::new();
+    seen.insert(root);
     let mut queue = vec![root];
     while let Some(pid) = queue.pop() {
         if let Some(kids) = children.get(&pid) {
             for kid in kids {
-                if *kid != root && !found.contains(kid) {
+                if seen.insert(*kid) {
                     found.push(*kid);
                     queue.push(*kid);
                 }
@@ -22,11 +24,48 @@ pub(crate) fn process_descendants(root: u32, table: &ProcessTable) -> Vec<u32> {
     found
 }
 
+/// Read a per-process start-time token from the kernel so delayed `SIGKILL`
+/// can verify the PID was not recycled during the grace window.
+#[cfg(target_os = "macos")]
+fn process_start_token(pid: u32) -> Option<u64> {
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let got = libc::proc_pidinfo(
+            pid as libc::pid_t,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        );
+        if got == size {
+            Some(
+                info.pbi_start_tvsec
+                    .wrapping_mul(1_000_000)
+                    .wrapping_add(info.pbi_start_tvusec),
+            )
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_token(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn process_start_token(_pid: u32) -> Option<u64> {
+    None
+}
+
 /// Terminate everything under a pane's child, not only the shell: an
 /// interactive shell puts each job in its own process group, so killing the
 /// shell alone orphans an agent started from it. Descendants get SIGTERM now
-/// and SIGKILL after a grace period if still alive. Best-effort; pid reuse
-/// inside the grace window is the accepted hazard.
+/// and SIGKILL after a grace period if still alive.
 /// Child → parent for every process, read from the kernel without forking:
 /// libproc on macOS, /proc on Linux. Forking here would be wrong twice over:
 /// a pane close would pay a `ps` per session, and a forked child briefly
@@ -136,16 +175,25 @@ pub(crate) fn terminate_process_tree(root: u32) {
     if targets.is_empty() {
         return;
     }
-    for pid in &targets {
+    let targets_with_start: Vec<(u32, Option<u64>)> = targets
+        .into_iter()
+        .map(|pid| (pid, process_start_token(pid)))
+        .collect();
+    for &(pid, _) in &targets_with_start {
         // SAFETY: kill(2) with a pid we just read from the process table; a
         // stale pid is an ESRCH we ignore.
         unsafe {
-            libc::kill(*pid as libc::pid_t, libc::SIGTERM);
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
     }
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(1500));
-        for pid in targets {
+        for (pid, start_token) in targets_with_start {
+            if let Some(expected) = start_token {
+                if process_start_token(pid) != Some(expected) {
+                    continue;
+                }
+            }
             // SAFETY: as above; signal 0 only probes existence.
             unsafe {
                 if libc::kill(pid as libc::pid_t, 0) == 0 {

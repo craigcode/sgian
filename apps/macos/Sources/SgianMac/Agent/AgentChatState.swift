@@ -222,9 +222,19 @@ struct AgentChatState: Equatable {
     private mutating func capMessages() {
         guard messages.count > Self.maximumMessages else { return }
         let removed = messages.count - Self.maximumMessages + 1
+        let priorElided: Int
+        if messages.first?.kind == .historyElided,
+           let firstToken = messages.first?.text.split(separator: " ").first,
+           let parsed = Int(firstToken) {
+            priorElided = parsed
+        } else {
+            priorElided = 0
+        }
+        let newlyElided = messages.first?.kind == .historyElided ? max(0, removed - 1) : removed
+        let totalElided = priorElided + newlyElided
         messages.removeFirst(removed)
         messages.insert(
-            ChatMessage(kind: .historyElided, text: "\(removed) earlier messages are not shown"),
+            ChatMessage(kind: .historyElided, text: "\(totalElided) earlier messages are not shown"),
             at: 0
         )
     }

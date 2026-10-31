@@ -26,18 +26,21 @@ fi
 "$bin" &
 pid=$!
 
+cleanup() {
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  "$bin" ctl shutdown --workspace "$ws" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
 deadline=$((SECONDS + timeout_secs))
 while [ "$SECONDS" -lt "$deadline" ]; do
   if [ -f "$marker" ]; then
     echo "UI SMOKE OK ($marker)"
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
     exit 0
   fi
   if [ -f "$err_path" ]; then
     echo "UI SMOKE FAILED: $(cat "$err_path")" >&2
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
     exit 1
   fi
   if ! kill -0 "$pid" 2>/dev/null; then
@@ -56,6 +59,4 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 echo "UI SMOKE TIMED OUT after ${timeout_secs}s" >&2
-kill "$pid" 2>/dev/null || true
-wait "$pid" 2>/dev/null || true
 exit 1

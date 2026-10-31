@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-client-holder"
+description = "Enables the client_holder command without any pre-configured scope."
+commands.allow = ["client_holder"]
+
+[[permission]]
+identifier = "deny-client-holder"
+description = "Denies the client_holder command without any pre-configured scope."
+commands.deny = ["client_holder"]

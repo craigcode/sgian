@@ -111,15 +111,15 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
 
     /// <summary>
     /// Keep the notes table aligned with the project table: drop projects that are gone, read
-    /// those not read yet.
+    /// those not read yet (or all projects when <paramref name="force"/> is true).
     /// </summary>
-    private void SyncNotes()
+    private void SyncNotes(bool force = false)
     {
         foreach (var name in _notes.Keys.Where(name => !_projects.ContainsKey(name)).ToList())
         {
             _notes.Remove(name);
         }
-        foreach (var name in _projects.Keys.Where(name => !_notes.ContainsKey(name)).ToList())
+        foreach (var name in _projects.Keys.Where(name => force || !_notes.ContainsKey(name)).ToList())
         {
             _ = RefreshNotesAsync(name);
         }
@@ -280,6 +280,15 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         _chats.Clear();
         _scrollback.Clear();
         _sizes.Clear();
+        _projects.Clear();
+        _notes.Clear();
+        _outputWarnings.Clear();
+        _agentUsage.Clear();
+        _leaseNoticeCancellation?.Cancel();
+        LeaseNotice = null;
+        _daemonSupportsLeases = true;
+        Holder = LeaseState.DefaultHolder();
+        PermissionMode = "manual";
         SelectedPane = null;
         Layout = null;
         Zoomed = false;
@@ -378,6 +387,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         {
             var item = Upsert(pane);
             item.AgentSpec = new AgentPaneSpec { Backend = backend, Model = model };
+            Zoomed = false;
             SaveLayout();
             ChatFor(pane.Id);
             await SelectAsync(item);
@@ -593,10 +603,12 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                         _dispatcher.TryEnqueue(() =>
                         {
                             if (_generation != generation) return;
+                            Holder = client.IdentityHolder ?? LeaseState.DefaultHolder();
                             Apply(snapshot, resetTerminals: true);
                             Status = "Connected";
                             attempt = 0;
                             ErrorMessage = null;
+                            _ = RefreshConfigurationAsync();
                         });
                     },
                     cancellationToken: token);
@@ -656,7 +668,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             _agentUsage.Remove(stale.Id);
         }
         _projects = new Dictionary<string, Project>(snapshot.Projects, StringComparer.Ordinal);
-        SyncNotes();
+        SyncNotes(force: resetTerminals);
         // The snapshot carries the counts only; the description of the first
         // opaque string arrives on the event, so keep the one already held.
         var previousWarnings = new Dictionary<string, OutputTricks>(_outputWarnings);

@@ -98,10 +98,14 @@ pub(crate) fn transport_bind(path: &Path) -> std::io::Result<TransportListener> 
 /// any host; the live SID lookup that feeds `sid_component` is Windows-only.
 #[cfg(any(windows, test))]
 pub(crate) fn pipe_name_with_sid(sid_component: &str, path: &Path) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    // Deterministic 64-bit FNV-1a hash (same algorithm as `workspace_key`) so
+    // a daemon and client built with different Rust toolchains always derive
+    // the exact same named-pipe path.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in path.as_os_str().as_encoded_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
     // Keep only pipe-name-safe characters; SID strings ("S-1-5-21-...") already
     // satisfy this, but guard against anything unexpected from the OS.
     let safe_sid: String = sid_component
@@ -116,8 +120,7 @@ pub(crate) fn pipe_name_with_sid(sid_component: &str, path: &Path) -> String {
         .collect();
     format!(
         "\\\\.\\pipe\\{WINDOWS_IPC_NAMESPACE}-{}-{:016x}",
-        safe_sid,
-        hasher.finish()
+        safe_sid, hash
     )
 }
 

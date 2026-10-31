@@ -265,11 +265,20 @@ public sealed class AgentChatState
             return;
         }
         var removed = Messages.Count - MaximumMessages + 1;
+        var hadBanner = Messages.Count > 0 && Messages[0].Kind == ChatMessageKind.HistoryElided;
+        var priorElided = 0;
+        if (hadBanner)
+        {
+            var firstToken = Messages[0].Text.Split(' ', 2)[0];
+            _ = int.TryParse(firstToken, out priorElided);
+        }
+        var newlyElided = hadBanner ? Math.Max(0, removed - 1) : removed;
+        var totalElided = priorElided + newlyElided;
         Messages.RemoveRange(0, removed);
         Messages.Insert(0, new ChatMessage
         {
             Kind = ChatMessageKind.HistoryElided,
-            Text = $"{removed} earlier messages are not shown",
+            Text = $"{totalElided} earlier messages are not shown",
         });
     }
 

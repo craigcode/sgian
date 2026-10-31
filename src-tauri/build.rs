@@ -24,7 +24,14 @@ fn main() {
             "send_agent_message",
             "agent_approval",
             "interrupt_agent",
+            "client_holder",
+            "take_lease",
+            "release_lease",
+            "lease_status",
+            "project_notes",
             "install_update",
+            "ui_smoke_enabled",
+            "complete_ui_smoke",
         ]),
     ))
     .expect("failed to build Sgian Tauri app");

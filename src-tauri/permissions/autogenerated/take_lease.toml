@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-take-lease"
+description = "Enables the take_lease command without any pre-configured scope."
+commands.allow = ["take_lease"]
+
+[[permission]]
+identifier = "deny-take-lease"
+description = "Denies the take_lease command without any pre-configured scope."
+commands.deny = ["take_lease"]

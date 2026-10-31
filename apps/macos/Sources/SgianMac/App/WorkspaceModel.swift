@@ -157,10 +157,18 @@ final class WorkspaceModel: ObservableObject {
         selectedPaneID = nil
         paneStates = [:]
         agentStates = [:]
+        leases = [:]
+        leaseNotice = nil
+        leaseDialog = nil
+        daemonSupportsLeases = true
+        holder = WorkspaceModel.defaultHolder()
         projects = [:]
+        notes = [:]
         outputWarnings = [:]
         agentUsage = [:]
         agentSpecs = [:]
+        profiles = []
+        permissionMode = "manual"
         terminals = [:]
         chats = [:]
         layout = nil
@@ -256,6 +264,7 @@ final class WorkspaceModel: ObservableObject {
             guard self.client === client else { return }
             self.agentSpecs[pane.id] = AgentPaneSpec(backend: backend, model: model)
             self.upsert(pane)
+            self.zoomed = false
             self.saveLayout()
             self.select(pane.id)
         }
@@ -431,12 +440,12 @@ final class WorkspaceModel: ObservableObject {
     }
 
     /// Keep the notes table aligned with the project table: drop projects
-    /// that are gone, fetch those not read yet.
-    private func syncNotes() {
+    /// that are gone, fetch those not read yet (or all when `force` is true).
+    private func syncNotes(force: Bool = false) {
         for name in notes.keys where projects[name] == nil {
             notes.removeValue(forKey: name)
         }
-        for name in projects.keys where notes[name] == nil {
+        for name in projects.keys where force || notes[name] == nil {
             refreshNotes(name)
         }
     }
@@ -601,7 +610,7 @@ final class WorkspaceModel: ObservableObject {
         agentStates = snapshot.agentStates
         leases = snapshot.leases
         projects = snapshot.projects
-        syncNotes()
+        syncNotes(force: rebuildTerminals)
         outputWarnings = snapshot.outputWarnings
         agentUsage = snapshot.agentUsage
         agentSpecs = snapshot.agentSpecs

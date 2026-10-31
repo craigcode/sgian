@@ -1052,8 +1052,8 @@ function CommandPalette({ state, controller }) {
     setSelectedIndex(0);
   }, [query]);
 
-  const runSelected = () => {
-    const command = filtered[clampedIndex];
+  const runSelected = (targetIndex = clampedIndex) => {
+    const command = filtered[targetIndex];
     if (!command) return;
     controller.closePalette();
     command.run();
@@ -1170,7 +1170,7 @@ function CommandPalette({ state, controller }) {
                     onMouseEnter={() => setSelectedIndex(index)}
                     onClick={() => {
                       setSelectedIndex(index);
-                      runSelected();
+                      runSelected(index);
                     }}
                   >
                     <span className="palette-item-label">{command.label}</span>

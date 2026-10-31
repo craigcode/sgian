@@ -20,3 +20,13 @@ the `serial` crate, unmaintained since 2017 (RUSTSEC-2017-0008). Sgian never
 opens serial ports, so the module and the dependency are removed from this
 fork. If the fork is ever dropped for upstream, the `serial` crate returns
 with it; check upstream's dependency list at that point.
+
+## Windows security & correctness fixes (2026-10-18)
+
+1. `src/win/psuedocon.rs`: removed the relative `ConPtyFuncs::open(Path::new("conpty.dll"))`
+   lookup so `LoadLibraryW` does not search the current working directory
+   (target workspace) or `PATH` for an untrusted `conpty.dll`.
+2. `src/win/mod.rs`: fixed the inverted `TerminateProcess` return-value check
+   (`res == 0` is failure, non-zero is success) and propagated `try_clone()?`
+   errors in `is_complete`, `do_kill`, and `wait`.
+

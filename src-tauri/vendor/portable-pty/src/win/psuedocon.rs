@@ -44,20 +44,13 @@ shared_library!(ConPtyFuncs,
 );
 
 fn load_conpty() -> ConPtyFuncs {
-    // If the kernel doesn't export these functions then their system is
-    // too old and we cannot run.
-    let kernel = ConPtyFuncs::open(Path::new("kernel32.dll")).expect(
+    // Load ConPTY entry points strictly from kernel32.dll (a Windows KnownDLL).
+    // Do not probe a relative `conpty.dll`: Sgian does not bundle a sideloaded
+    // conpty.dll, and `LoadLibraryW(L"conpty.dll")` searches the current
+    // working directory (the target workspace) and PATH.
+    ConPtyFuncs::open(Path::new("kernel32.dll")).expect(
         "this system does not support conpty.  Windows 10 October 2018 or newer is required",
-    );
-
-    // We prefer to use a sideloaded conpty.dll and openconsole.exe host deployed
-    // alongside the application.  We check for this after checking for kernel
-    // support so that we don't try to proceed and do something crazy.
-    if let Ok(sideloaded) = ConPtyFuncs::open(Path::new("conpty.dll")) {
-        sideloaded
-    } else {
-        kernel
-    }
+    )
 }
 
 lazy_static! {

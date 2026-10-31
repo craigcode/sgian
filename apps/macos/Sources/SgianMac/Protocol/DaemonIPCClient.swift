@@ -207,11 +207,13 @@ final class DaemonIPCClient: @unchecked Sendable {
         }
         candidates.append(Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/sgian"))
 
+        #if DEBUG
         let cwd = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
         candidates.append(cwd.appendingPathComponent("src-tauri/target/debug/sgian"))
         candidates.append(cwd.appendingPathComponent("src-tauri/target/release/sgian"))
         candidates.append(cwd.appendingPathComponent("../../src-tauri/target/debug/sgian").standardizedFileURL)
         candidates.append(cwd.appendingPathComponent("../../src-tauri/target/release/sgian").standardizedFileURL)
+        #endif
 
         for directory in (environment["PATH"] ?? "").split(separator: ":") {
             candidates.append(URL(fileURLWithPath: String(directory)).appendingPathComponent("sgian"))
