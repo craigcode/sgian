@@ -477,7 +477,9 @@ impl CommandBuilder {
         cmd.current_dir(dir);
 
         cmd.env_clear();
-        cmd.env("SHELL", shell);
+        if self.is_default_prog() {
+            cmd.env("SHELL", shell);
+        }
         cmd.envs(self.envs.values().map(
             |EnvEntry {
                  is_from_base_env: _,

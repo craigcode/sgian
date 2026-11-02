@@ -153,6 +153,20 @@ pub(crate) fn process_parent_snapshot_for_hooks() -> Option<HashMap<u32, u32>> {
 
 #[cfg(unix)]
 pub(crate) fn terminate_process_tree(root: u32) {
+    terminate_tree_impl(root, false, Duration::from_millis(1500));
+}
+
+/// Terminate `root` AND all of its descendants with `SIGTERM` immediately,
+/// escalating any survivor with the same kernel start-time token to `SIGKILL`
+/// after `grace`. Used by `grant_kill` / `grant_release` where `root` is a
+/// direct `argv` child rather than a shell being closed via `ChildKiller`.
+#[cfg(unix)]
+pub(crate) fn terminate_root_and_tree(root: u32, grace: Duration) {
+    terminate_tree_impl(root, true, grace);
+}
+
+#[cfg(unix)]
+fn terminate_tree_impl(root: u32, include_root: bool, grace: Duration) {
     let parent = match process_parent_snapshot() {
         Some(parent) => parent,
         None => {
@@ -171,7 +185,10 @@ pub(crate) fn terminate_process_tree(root: u32) {
         parent,
         args: HashMap::new(),
     };
-    let targets = process_descendants(root, &table);
+    let mut targets = process_descendants(root, &table);
+    if include_root {
+        targets.insert(0, root);
+    }
     if targets.is_empty() {
         return;
     }
@@ -187,7 +204,7 @@ pub(crate) fn terminate_process_tree(root: u32) {
         }
     }
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(1500));
+        thread::sleep(grace);
         for (pid, start_token) in targets_with_start {
             if let Some(expected) = start_token {
                 if process_start_token(pid) != Some(expected) {

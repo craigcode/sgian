@@ -3422,3 +3422,96 @@ fn agent_bin_display_mirrors_spawn_form() {
         "claude (not found)"
     );
 }
+
+#[cfg(any(unix, windows))]
+#[test]
+fn agent_backend_adapters_roundtrip_wire_protocol_seams() {
+    assert_eq!(
+        AgentBackendKind::parse("claude"),
+        Some(AgentBackendKind::Claude)
+    );
+    assert_eq!(
+        AgentBackendKind::parse("droid"),
+        Some(AgentBackendKind::Droid)
+    );
+    assert_eq!(AgentBackendKind::parse("unknown"), None);
+
+    let claude = AgentBackendKind::Claude.adapter();
+    assert_eq!(claude.kind, AgentBackendKind::Claude);
+    assert_eq!(claude.default_bin, "claude");
+    assert_eq!(claude.env_override, SGIAN_CLAUDE_BIN_ENV);
+    assert!(!claude.suppress_idle_turn_complete);
+
+    let claude_args = (claude.spawn_args)("manual", Some("sonnet"), Some("sess-1"));
+    assert!(claude_args
+        .windows(2)
+        .any(|w| w == ["--permission-mode", "manual"]));
+    assert!(claude_args.windows(2).any(|w| w == ["--model", "sonnet"]));
+    assert!(claude_args.windows(2).any(|w| w == ["--resume", "sess-1"]));
+    // Unsafe CLI tokens (`--evil`) are filtered out by the adapter seam.
+    let claude_unsafe = (claude.spawn_args)("manual", Some("--evil"), Some("--bad"));
+    assert!(!claude_unsafe
+        .iter()
+        .any(|a| a == "--model" || a == "--resume"));
+    assert!((claude.initial_stdin)("pane-1", Path::new("/tmp"), Some("sonnet"), None).is_none());
+
+    let claude_msg = (claude.encode_user_message)(7, "hello");
+    assert_eq!(claude_msg["type"], json!("user"));
+    assert_eq!(claude_msg["message"]["content"][0]["text"], json!("hello"));
+
+    let claude_allow_with_input =
+        (claude.encode_approval_response)("req-1", Some(json!({"cmd": "ls"})), true, None);
+    assert_eq!(
+        claude_allow_with_input["response"]["response"]["behavior"],
+        json!("allow")
+    );
+    assert_eq!(
+        claude_allow_with_input["response"]["response"]["updatedInput"],
+        json!({"cmd": "ls"})
+    );
+    let claude_allow_no_input = (claude.encode_approval_response)("req-2", None, true, None);
+    assert!(claude_allow_no_input["response"]["response"]
+        .get("updatedInput")
+        .is_none());
+    let claude_deny =
+        (claude.encode_approval_response)("req-3", None, false, Some("stop".to_string()));
+    assert_eq!(
+        claude_deny["response"]["response"],
+        json!({"behavior": "deny", "message": "stop"})
+    );
+
+    let claude_int = (claude.encode_interrupt_request)(9);
+    assert_eq!(claude_int["request_id"], json!("sgian-interrupt-9"));
+    assert_eq!(claude_int["request"]["subtype"], json!("interrupt"));
+    assert!((claude.immediate_reply)(&json!({"method": "droid.ask_user", "id": "r1"})).is_none());
+
+    let droid = AgentBackendKind::Droid.adapter();
+    assert_eq!(droid.kind, AgentBackendKind::Droid);
+    assert_eq!(droid.default_bin, "droid");
+    assert_eq!(droid.env_override, SGIAN_DROID_BIN_ENV);
+    assert!(droid.suppress_idle_turn_complete);
+
+    let droid_msg = (droid.encode_user_message)(11, "ship it");
+    assert_eq!(droid_msg["id"], json!("sgian-message-11"));
+    assert_eq!(droid_msg["method"], json!("droid.add_user_message"));
+    assert_eq!(droid_msg["params"]["text"], json!("ship it"));
+
+    let droid_allow = (droid.encode_approval_response)("rpc-1", Some(json!({"x": 1})), true, None);
+    assert_eq!(droid_allow["id"], json!("rpc-1"));
+    assert_eq!(
+        droid_allow["result"]["selectedOption"],
+        json!("proceed_once")
+    );
+    let droid_deny = (droid.encode_approval_response)("rpc-2", None, false, Some("no".to_string()));
+    assert_eq!(droid_deny["result"]["selectedOption"], json!("cancel"));
+    assert_eq!(droid_deny["result"]["comment"], json!("no"));
+
+    let droid_int = (droid.encode_interrupt_request)(12);
+    assert_eq!(droid_int["id"], json!("sgian-interrupt-12"));
+    assert_eq!(droid_int["method"], json!("droid.interrupt_session"));
+
+    let ask_reply = (droid.immediate_reply)(&json!({"method": "droid.ask_user", "id": "ask-7"}))
+        .expect("droid.ask_user triggers immediate cancellation reply");
+    assert_eq!(ask_reply["id"], json!("ask-7"));
+    assert_eq!(ask_reply["result"]["cancelled"], json!(true));
+}

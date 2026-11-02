@@ -108,12 +108,15 @@ take the lease and use `send_input_as`. See
 `docs/design/keyboard-lease-and-ledger.md`.
 
 The bootstrap snapshot may carry `projects` (name → `{ name, goal?, repo?,
-panes, created_at_ms }`), additive; the `project_*` requests (`project_create`,
-`project_delete`, `project_assign`, `project_unassign`, `project_list`,
-`project_show`, `project_ledger`, `project_dossier`) manage them. Subscribers
-may receive `projects_changed` with the whole `projects` map after any change
-(create, delete, assign, unassign, a member pane closing); replace, do not
-diff. The Tauri client groups its session overview by project with a per-
+notify_notes?, panes, created_at_ms }`), additive; the `project_*` requests
+(`project_create`, `project_update`, `project_delete`, `project_assign`,
+`project_unassign`, `project_list`, `project_show`, `project_ledger`,
+`project_dossier`) manage them. `project_create` accepts optional `notify_notes`
+(default `false`), and `project_update {name, goal?, repo?, notify_notes?}`
+updates mutable project fields (an explicit empty `goal` or `repo` clears it).
+Subscribers may receive `projects_changed` with the whole `projects` map after
+any change (create, update, delete, assign, unassign, a member pane closing);
+replace, do not diff. The Tauri client groups its session overview by project with a per-
 project roll-up; the macOS sidebar groups its sections by project with the
 roll-up in each header, and the Windows sidebar shows one roll-up line per
 project above the list and names each pane's project in its subtitle.
@@ -145,7 +148,22 @@ and exposes `project_notes {name}` as a frontend command. All three clients
 show a project's notes beside it on the board: a summary ("2 notes · 1 hid
 text") and the newest few as one line each (title, writer or `file`, date,
 ⚠ when the guard removed hidden text), re-read on the event; bodies never
-reach the board.
+reach the board. When `notify_notes` is `true` on the project, the daemon also
+delivers `[sgian] project notes changed: <file>` to live unleased member panes
+other than the authoring pane, deduplicated by content hash across repeated
+filesystem notifications, and records `note.notified {by: "sgian", project,
+file, hash?, bytes?}` in each notified pane's ledger.
+
+Kranz execution grants (`docs/design/execution-grants.md`) add five additive
+`write`-scoped requests: `grant_exec {grant, signature, pane?}` (verifies the
+HMAC-SHA256 signature against `<repo>/.kranz/serve.grant.key`, spawns verbatim
+`argv` in a fresh or named PTY pane held under a `kranz:<run>` lease, ledgers
+`grant.exec` on the pane or `grant.refused` in `ledger/grants.jsonl`, and
+returns `{terminal_id, pane_id}`), `grant_output {terminal_id}`, `grant_wait
+{terminal_id, timeout_ms?}`, `grant_kill {terminal_id}`, and `grant_release
+{terminal_id}`. `kranz_bind` registers the bound repository root with the grant
+store and includes additive `grant_key: bool` in its response and `kranz.bound`
+ledger record.
 The bootstrap snapshot may carry `output_warnings` (pane_id → per-kind
 counts of output that hides content: `conceal`, `clipboard`,
 `hyperlink_mismatch`, `string_controls`, `c1_controls`, and `invisible` for

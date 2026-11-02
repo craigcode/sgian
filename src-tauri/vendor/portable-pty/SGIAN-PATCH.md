@@ -30,3 +30,12 @@ with it; check upstream's dependency list at that point.
    (`res == 0` is failure, non-zero is success) and propagated `try_clone()?`
    errors in `is_complete`, `do_kill`, and `wait`.
 
+## Unix `env_clear` `SHELL` leak fix (2026-10-31)
+
+`src/cmdbuilder.rs` (`CommandBuilder::as_command` on Unix): gated
+`cmd.env("SHELL", shell)` behind `if self.is_default_prog()` so explicit
+`CommandBuilder::new(prog)` + `env_clear()` (used by execution grants'
+`env_allow` filter) and `scrub_env: ["SHELL"]` do not unconditionally re-inject
+`SHELL` into the child environment.
+
+

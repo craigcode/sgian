@@ -225,26 +225,31 @@ Shipped (2026-09-16):
 - **Two pre-launch reviews closed.** The trust-surface review
   (`docs/trust-surface-review-2026-09-19.md`) and the full-repo review
   (`docs/review-2026-09-20.md`, fourteen findings) are recorded with the
-  PR that closed each finding.
+  PR that closed each finding, followed by the 23-finding full-stack security
+  hardening sweep (#101).
+- **Per-project shared context notes under git**
+  (`docs/design/shared-context-notes.md`, steps 1–4). The daemon writes, lists
+  and removes notes under `<repo>/.sgian/projects/<name>/notes/`, ledgers each
+  write with its hash, caps sizes and scrubs on read (`ctl project notes`,
+  `ctl project note add|rm`), broadcasts `project_notes_changed` from its own
+  writes and a file watch over each root, renders each project's notes summary
+  on the board across all three clients, and supports the opt-in per-project
+  prompt line (`notify_notes` via `ctl project set <name> --notify-notes`,
+  skipping authoring and leased panes and ledgering `note.notified`). Agent
+  pane output-guard stripping shipped alongside (`invisible` bidi/zero-width
+  counter and escape stripping before log or broadcast).
+- **Execution grants — Sgian half** (`docs/design/execution-grants.md`,
+  `src-tauri/src/grants.rs`). `grant_exec`, `grant_output`, `grant_wait`,
+  `grant_kill`, and `grant_release` (plus `ctl grant`) verify HMAC-SHA256
+  grants against `<repo>/.kranz/serve.grant.key` (`0600`), confine canonical
+  `cwd` inside the bound repo, spawn verbatim `argv` in a PTY with strict
+  `env_allow` filtering under a `kranz:<run>` held lease, reject replays, and
+  record durable `grant.exec` / `grant.refused` ledger receipts.
 
 Open, in order:
 
-- **Execution grants** (`docs/design/execution-grants.md`): the Sgian half
-  once `kranz-acp` and Kranz's `TerminalProvider` seam exist.
-- **Per-project shared context notes under git**: designed in
-  `docs/design/shared-context-notes.md`; step 1 built (the daemon writes,
-  lists and removes notes under `<repo>/.sgian/projects/<name>/notes/`,
-  ledgers each write with its hash, caps sizes and scrubs on read;
-  `ctl project notes` and `ctl project note add|rm`) and step 2 (the
-  `project_notes_changed` event, from the daemon's own writes and a file
-  watch over each root) and step 3 (each client shows a project's notes
-  beside it on the board, re-read on the event). The opt-in prompt line is
-  not built. The output-guard
-  stripping for agent panes shipped: the daemon scrubs every string in a
-  normalized agent event before it is logged or shown, dropping escape
-  sequences and controls, and counting SGR 8, OSC 52, mismatched links,
-  opaque strings and the bidi and zero-width characters that reorder or
-  hide text (`invisible`), against the pane like a shell pane's output.
+- **Execution grants — Kranz `TerminalProvider` consumer**: wiring `kranz-acp`
+  to Sgian's `grant_*` endpoints on the Kranz side.
 - **M5 SSM / ECS Exec target**: needs an AWS host to test against.
 - **Hands-on acceptance on a phone**: the served view over `ssh -L` from a
   real device (the phone-width layout was checked in a desktop browser at
@@ -303,20 +308,29 @@ Source: the historical [Warp CLI engineering notes](REVIEW-2026-08-04-warp.md).
 These candidates record implementation scope; later shipped-status entries
 above and the current acceptance work determine what remains to build.
 
-- **Document scripting.** Show `ctl --json`, exact exit codes and bounded
-  runs in a short, reproducible scripting example.
-- **Document local operation.** Explain daemon persistence, local storage,
-  provider connections and optional remote access separately. Do not imply
-  that an agent CLI's provider traffic stays local.
-- **Permission visibility.** Badge every pane running under `auto`,
-  `dontAsk` or `bypassPermissions`. Audit configuration composition and
-  `scrub_env`/`env` precedence against the documented behavior.
-- **Machine-readable agent-state stream.** Expose working, needs-input and
-  idle transitions through the existing event subscription so scripts and
-  mission coordinators can react without polling.
-- **Additional agent backends.** Qualify Codex and Gemini CLI adapters behind
-  the normalized event stream, with explicit permission and lifecycle proof.
-  Sequence this behind the platform acceptance work in §1.
+- **Document scripting.** Shipped in
+  `docs/scripting-and-local-operation.md` (§1): `ctl --json`, exact exit codes
+  (`0`, `1..=255` on `ctl process`/`ctl run`, `1` on timeouts/refusals),
+  bounded runs, and generation-fenced lease automation.
+- **Document local operation.** Shipped in
+  `docs/scripting-and-local-operation.md` (§2) and `SECURITY.md`: separates
+  local daemon persistence/storage, `scrub_env`/`env` composition, outbound
+  provider connections made directly by child agent CLIs, and loopback-only
+  `ssh -L` remote access.
+- **Permission visibility.** Shipped: panes running under `auto`, `bypass`,
+  `dontAsk` or `bypassPermissions` are badged `unattended` across all clients,
+  `ctl agent`, and `mode.changed` ledger records; configuration layer
+  composition and `scrub_env`/`env` precedence are audited and documented.
+- **Machine-readable agent-state stream.** Shipped: `ctl agent --watch --json`
+  streams `agent_state` (working / needs_input / idle / mode / unattended),
+  `lease_state`, `pane_ended`, `output_warning`, and `project_notes_changed`
+  transitions over the event subscription without polling.
+- **Additional agent backends.** `AgentBackendAdapter`
+  (`src-tauri/src/agent_stream.rs`, documented in
+  `docs/scripting-and-local-operation.md` §3) consolidates the provider wire
+  seams for `Claude` and `Droid`. Qualifying Codex and Gemini CLI adapters
+  behind the normalized event stream remains sequenced behind the platform
+  acceptance work in §1.
 
 ## Prioritization note
 

@@ -1,6 +1,6 @@
 # Shared context notes for a project
 
-**Status: steps 1 to 3 built; 4 not.** The daemon writes, lists and
+**Status: built (steps 1 to 4).** The daemon writes, lists and
 removes notes (`project_note_add`, `project_notes`, `project_note_remove`;
 `ctl project notes`, `ctl project note add|rm`), ledgers every write with a
 content hash, caps the sizes, and scrubs bodies on read. Subscribers get
@@ -9,8 +9,13 @@ announce at once, and a file watch over each root's `.sgian/projects` tree
 covers edits made outside it, which are also listed with evidence `file`.
 The macOS sidebar, the Windows sidebar and the web overview show each
 project's notes beside it (summary, then the newest few as one line each;
-never the bodies). Written before code because the hard questions are about
-ownership and trust, not plumbing.
+never the bodies). When a project opts in (`notify_notes: true` via
+`project_create`, `project_update`, or `ctl project set <name> --notify-notes`),
+the daemon delivers `[sgian] project notes changed: <file>` to live unleased
+member panes other than the authoring pane, deduplicated by content hash across
+repeated filesystem notifications and ledgered on each notified pane as
+`note.notified` (`"by": "sgian"`). Written before code because the hard
+questions are about ownership and trust, not plumbing.
 
 ## What it is for
 
@@ -131,7 +136,10 @@ directory an injection surface, and the design treats it as one:
 3. Clients: a notes list beside the project in the overview, with author
    and badge. The macOS sidebar first, since it already groups by project.
    **Built**, in all three clients.
-4. The opt-in prompt line, last and off by default.
+4. The opt-in prompt line, last and off by default (`notify_notes` on the
+   project; `ctl project new --notify-notes` and `ctl project set <name>
+   --notify-notes|--no-notify-notes`; `note.notified` in each notified pane's
+   ledger). **Built.**
 
 Each step is useful on its own; the first alone gives agents a shared,
 attributed place to write that git keeps.

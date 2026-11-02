@@ -29,11 +29,27 @@ bug reports. `ctl diagnostic` produces a reduced support bundle, which should
 still be reviewed before sharing.
 
 Agent permissions default to manual approval. More permissive modes are an
-explicit operator choice. `scrub_env` removes inherited environment variables
+explicit operator choice and are badged `unattended` across clients, `ctl
+agent`, and the ledger. `scrub_env` removes inherited environment variables
 from shell panes, agent panes, and `ctl process`; explicit `env` values take
 precedence. This is environment hygiene, not protection against a process that
-can read the user's files or credentials. Invalid configuration prevents daemon
-startup, and a failed live reload preserves the last valid policy.
+can read the user's files or credentials. Kranz execution grants (`ctl grant`,
+[docs/design/execution-grants.md](docs/design/execution-grants.md)) verify an
+HMAC-SHA256 capability against `<repo>/.kranz/serve.grant.key` (`0600`),
+confine canonical `cwd` inside the served repository, execute `argv` verbatim
+without a shell, clear the environment to `env_allow` names only, reject
+replays, hold a `kranz:<run>` keyboard lease by default, and record durable
+`grant.exec` / `grant.refused` ledger receipts. Invalid configuration prevents
+daemon startup, and a failed live reload preserves the last valid policy.
+
+Sgian itself sends no telemetry and proxies no model calls, **but child agent
+CLIs (`claude`, `droid`, or tools run inside shells) connect directly over the
+network to their configured model providers** with prompts, tool inputs, and
+repository context. Do not assume that Sgian's local IPC boundary keeps a child
+agent CLI's provider traffic on the machine; see
+[docs/scripting-and-local-operation.md](docs/scripting-and-local-operation.md)
+for the separation between local daemon storage, provider traffic, and
+loopback-only SSH remote access.
 
 The web UI renders agent output as text and a restricted Markdown subset.
 The native Windows terminal only accepts bridge messages from its bundled

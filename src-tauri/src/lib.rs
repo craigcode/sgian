@@ -238,11 +238,24 @@ pub enum AgentBackendKind {
 }
 
 impl AgentBackendKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Droid => "droid",
         }
+    }
+
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name {
+            "claude" => Some(Self::Claude),
+            "droid" => Some(Self::Droid),
+            _ => None,
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(crate) fn adapter(self) -> &'static AgentBackendAdapter {
+        agent_backend_adapter(self)
     }
 }
 
@@ -1202,6 +1215,17 @@ enum DaemonRequest {
         goal: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        notify_notes: bool,
+    },
+    ProjectUpdate {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notify_notes: Option<bool>,
     },
     ProjectDelete {
         name: String,
@@ -1441,6 +1465,29 @@ enum DaemonRequest {
         cwd: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
+    },
+    /// Execution grants (docs/design/execution-grants.md): verify a Kranz-signed
+    /// capability over canonical JSON, spawn `argv` verbatim in a PTY pane, and
+    /// return `{ terminal_id, pane_id }`.
+    GrantExec {
+        grant: Value,
+        signature: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<String>,
+    },
+    GrantOutput {
+        terminal_id: String,
+    },
+    GrantWait {
+        terminal_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+    GrantKill {
+        terminal_id: String,
+    },
+    GrantRelease {
+        terminal_id: String,
     },
     Subscribe,
     Shutdown,
@@ -2147,6 +2194,8 @@ mod router;
 use router::*;
 mod terminals;
 use terminals::*;
+mod grants;
+use grants::*;
 struct DaemonServer {
     registry: Mutex<PaneRegistry>,
     terminals: Mutex<TerminalStore>,
@@ -2173,6 +2222,10 @@ struct DaemonServer {
     /// Notes the daemon itself just wrote or removed, by (project, file) →
     /// resulting hash, so the watch does not announce them a second time.
     notes_own_writes: Mutex<HashMap<(String, String), Option<String>>>,
+    /// Last announced content hash per `(project, file)` so duplicate FSEvent /
+    /// inotify metadata ticks for the same write never emit duplicate events or
+    /// duplicate opt-in prompt lines.
+    notes_last_hash: Mutex<HashMap<(String, String), Option<String>>>,
     log_dispatch: tracing::dispatcher::Dispatch,
     /// Keeps the non-blocking log writer alive (flushes on drop). Must be held for
     /// the lifetime of the server so log entries are not lost.
@@ -2215,6 +2268,10 @@ struct DaemonServer {
     probe_mapped: Mutex<HashMap<String, u8>>,
     /// (M4) Panes bound to a Kranz mission. Leaf lock.
     kranz_bindings: Mutex<HashMap<String, KranzBinding>>,
+    /// Execution-grant verifier, replay table, and active PTY terminal handles
+    /// (docs/design/execution-grants.md). Shared with `TerminalStore` for exit
+    /// wakeup; leaf lock.
+    grants: Arc<GrantStore>,
     /// Named pane groups (name → project). Leaf lock; persist() takes it after
     /// registry → terminals → leases.
     projects: Mutex<HashMap<String, Project>>,
@@ -2413,6 +2470,8 @@ impl DaemonServer {
             .map(|(pane_id, _)| pane_id.clone())
             .collect();
         terminals.seed_ended_panes(&ended_pane_ids);
+        let grants = Arc::new(GrantStore::new(&cwd_for_notes));
+        terminals.set_grant_store(Arc::clone(&grants));
 
         // Determine whether panes should be auto-spawned on the first BootstrapWorkspace
         // call. A fresh workspace always spawns (to seed the initial live pane). A
@@ -2451,6 +2510,7 @@ impl DaemonServer {
             notes_watch: Mutex::new(notes_watch),
             notes_changes: Mutex::new(notes_rx),
             notes_own_writes: Mutex::new(HashMap::new()),
+            notes_last_hash: Mutex::new(HashMap::new()),
             log_dispatch,
             _log_guard: log_guard,
             token,
@@ -2467,6 +2527,7 @@ impl DaemonServer {
             probe_warned: AtomicBool::new(false),
             probe_mapped: Mutex::new(HashMap::new()),
             kranz_bindings: Mutex::new(HashMap::new()),
+            grants,
             agent_usage: Mutex::new(HashMap::new()),
             clients: Mutex::new(clients),
             clients_path,
@@ -2505,6 +2566,7 @@ impl DaemonServer {
         name: &str,
         goal: Option<String>,
         repo: Option<String>,
+        notify_notes: bool,
     ) -> Result<Value, String> {
         let name = validate_project_name(name)?;
         let goal = match goal {
@@ -2519,6 +2581,7 @@ impl DaemonServer {
             name: name.clone(),
             goal,
             repo,
+            notify_notes,
             panes: Vec::new(),
             created_at_ms: now_millis(),
         };
@@ -2540,6 +2603,51 @@ impl DaemonServer {
         }
         self.broadcast_projects();
         Ok(json!(project))
+    }
+
+    fn handle_project_update(
+        &self,
+        name: &str,
+        goal: Option<String>,
+        repo: Option<String>,
+        notify_notes: Option<bool>,
+    ) -> Result<Value, String> {
+        let name = validate_project_name(name)?;
+        let goal = match goal {
+            Some(raw) if raw.trim().is_empty() => Some(None),
+            Some(raw) => Some(Some(validate_bounded_text(&raw, "goal", 4096)?)),
+            None => None,
+        };
+        let repo = match repo {
+            Some(raw) if raw.trim().is_empty() => Some(None),
+            Some(raw) => Some(Some(validate_bounded_text(&raw, "repo", 4096)?)),
+            None => None,
+        };
+        let (previous, updated) = {
+            let mut projects = self.lock_projects()?;
+            let project = projects
+                .get_mut(&name)
+                .ok_or_else(|| format!("unknown project '{name}'"))?;
+            let previous = project.clone();
+            if let Some(goal) = goal {
+                project.goal = goal;
+            }
+            if let Some(repo) = repo {
+                project.repo = repo;
+            }
+            if let Some(notify_notes) = notify_notes {
+                project.notify_notes = notify_notes;
+            }
+            (previous, project.clone())
+        };
+        if let Err(error) = self.persist() {
+            let _ = self
+                .lock_projects()
+                .map(|mut projects| projects.insert(name, previous));
+            return Err(error);
+        }
+        self.broadcast_projects();
+        Ok(json!(updated))
     }
 
     fn handle_project_delete(&self, name: &str) -> Result<Value, String> {
@@ -3014,18 +3122,30 @@ impl DaemonServer {
         }
     }
 
-    /// Announce a note the daemon itself wrote or removed, and remember it
-    /// so the file watch's echo of the same change is dropped.
-    fn announce_own_note(&self, project: &str, file: &str, hash: Option<String>) {
+    /// Announce a note the daemon itself wrote or removed, remember it so the
+    /// file watch's echo of the same change is dropped, and deliver the
+    /// opt-in prompt line when enabled on the project.
+    fn announce_own_note(
+        &self,
+        project: &str,
+        file: &str,
+        hash: Option<String>,
+        origin_pane: Option<&str>,
+    ) {
+        let key = (project.to_string(), file.to_string());
         if let Ok(mut own) = self.notes_own_writes.lock() {
-            own.insert((project.to_string(), file.to_string()), hash.clone());
+            own.insert(key.clone(), hash.clone());
+        }
+        if let Ok(mut seen) = self.notes_last_hash.lock() {
+            seen.insert(key, hash.clone());
         }
         self.router.broadcast(&DaemonEvent::ProjectNotesChanged {
             project: project.to_string(),
             file: file.to_string(),
-            hash,
+            hash: hash.clone(),
         });
         self.refresh_notes_watch();
+        self.deliver_project_note_prompt(project, file, hash.as_deref(), origin_pane);
     }
 
     /// Turn the watch's pending paths into `project_notes_changed` events:
@@ -3048,20 +3168,115 @@ impl DaemonServer {
             let hash = notes::read_note_file_bounded(&dir.join(&file))
                 .ok()
                 .map(|raw| notes::note_hash(&raw));
+            let key = (project.clone(), file.clone());
             // The daemon's own write already announced exactly this state.
             let own = self
                 .notes_own_writes
                 .lock()
                 .ok()
-                .and_then(|mut own| own.remove(&(project.clone(), file.clone())));
+                .and_then(|mut own| own.remove(&key));
             if own.as_ref() == Some(&hash) {
                 continue;
             }
+            // Drop duplicate FSEvents / metadata ticks whose content hash (or
+            // absence) matches the last state already announced.
+            if let Ok(mut seen) = self.notes_last_hash.lock() {
+                let prev = seen.get(&key);
+                if prev == Some(&hash) || (prev.is_none() && hash.is_none()) {
+                    continue;
+                }
+                seen.insert(key, hash.clone());
+            }
             self.router.broadcast(&DaemonEvent::ProjectNotesChanged {
-                project,
-                file,
-                hash,
+                project: project.clone(),
+                file: file.clone(),
+                hash: hash.clone(),
             });
+            self.deliver_project_note_prompt(&project, &file, hash.as_deref(), None);
+        }
+    }
+
+    /// Shared context notes step 4 (docs/design/shared-context-notes.md §"Who
+    /// reads"): when `project.notify_notes` is enabled, send one opt-in line
+    /// `[sgian] project notes changed: <file>` to each live member pane that
+    /// is neither the authoring pane nor currently held under a keyboard lease.
+    /// Never carries note contents — only the validated file name — and records
+    /// `note.notified` in the target pane's ledger as a write by `sgian`.
+    fn deliver_project_note_prompt(
+        &self,
+        project_name: &str,
+        file: &str,
+        hash: Option<&str>,
+        origin_pane: Option<&str>,
+    ) {
+        if notes::validate_note_file(file).is_err() {
+            return;
+        }
+        let Some(project) = self.projects_snapshot().remove(project_name) else {
+            return;
+        };
+        if !project.notify_notes || project.panes.is_empty() {
+            return;
+        }
+        let pane_kinds: HashMap<String, PaneKind> = self
+            .lock_registry()
+            .map(|registry| {
+                registry
+                    .panes
+                    .iter()
+                    .map(|pane| (pane.id.clone(), pane.kind))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let held_panes: HashSet<String> = self
+            .lock_leases()
+            .map(|leases| leases.keys().cloned().collect())
+            .unwrap_or_default();
+        let prompt_line = format!("[sgian] project notes changed: {file}");
+        let shell_input = format!("{prompt_line}\r");
+        for pane_id in &project.panes {
+            if origin_pane == Some(pane_id.as_str()) || held_panes.contains(pane_id) {
+                continue;
+            }
+            let delivered_bytes = match pane_kinds.get(pane_id).copied() {
+                Some(PaneKind::Shell) => {
+                    let wrote = self.lock_terminals().is_ok_and(|terminals| {
+                        terminals.is_live(pane_id)
+                            && terminals.write_to_pane(pane_id, &shell_input).is_ok()
+                    });
+                    wrote.then_some(shell_input.len())
+                }
+                Some(PaneKind::Agent) => {
+                    // Never wake/spawn an ended or restore_on_demand agent pane
+                    // on a note notification; only post to an already-live idle one.
+                    let is_live = self
+                        .lock_terminals()
+                        .is_ok_and(|terminals| terminals.is_live(pane_id));
+                    if is_live
+                        && self
+                            .handle_send_agent_message(pane_id, &prompt_line, None)
+                            .is_ok()
+                    {
+                        Some(prompt_line.len())
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+            if let Some(bytes) = delivered_bytes {
+                let _ = self.ledger_record(
+                    pane_id,
+                    "note.notified",
+                    json!({
+                        "by": "sgian",
+                        "project": project_name,
+                        "file": file,
+                        "hash": hash,
+                        "bytes": bytes,
+                    }),
+                );
+            }
         }
     }
 
@@ -3101,7 +3316,7 @@ impl DaemonServer {
             "bytes": written.bytes,
         });
         let _ = self.ledger_record(&project_ledger_key(name), "note.added", receipt.clone());
-        self.announce_own_note(name, &written.file, Some(written.hash.clone()));
+        self.announce_own_note(name, &written.file, Some(written.hash.clone()), pane_id);
         receipt["path"] = json!(written.path.display().to_string());
         Ok(receipt)
     }
@@ -3126,7 +3341,7 @@ impl DaemonServer {
             "note.removed",
             json!({ "project": name, "file": file, "holder": holder, "hash": hash, "bytes": bytes }),
         );
-        self.announce_own_note(name, file, None);
+        self.announce_own_note(name, file, None, None);
         Ok(json!({ "project": name, "file": file, "holder": holder, "hash": hash, "bytes": bytes }))
     }
 
@@ -3154,14 +3369,15 @@ impl DaemonServer {
                 .ok_or_else(|| format!("pane {pane_id} has no recorded cwd; pass --repo PATH"))?,
         };
         let binding = KranzBinding { repo, manual: true };
+        let grant_key = self.grants.register_repo_path(&self.cwd, &binding.repo);
         self.lock_kranz()?
             .insert(pane_id.to_string(), binding.clone());
         let _ = self.ledger_record(
             pane_id,
             "kranz.bound",
-            json!({ "repo": binding.repo, "manual": true }),
+            json!({ "repo": binding.repo, "manual": true, "grant_key": grant_key }),
         );
-        Ok(json!({ "pane_id": pane_id, "binding": binding }))
+        Ok(json!({ "pane_id": pane_id, "binding": binding, "grant_key": grant_key }))
     }
 
     fn handle_kranz_unbind(&self, pane_id: &str) -> Result<Value, String> {
@@ -3221,17 +3437,19 @@ impl DaemonServer {
             .collect();
         drop(bindings);
         for (pane_id, repo) in newly {
+            let grant_key = self.grants.register_repo_path(&self.cwd, &repo);
             tracing::info!(
                 workspace_key = %self.workspace_key,
                 pane_id = %pane_id,
                 repo = %repo,
+                grant_key = grant_key,
                 event = "kranz_bound",
                 "Kranz worker found under pane; mission state now drives its badge"
             );
             let _ = self.ledger_record(
                 &pane_id,
                 "kranz.bound",
-                json!({ "repo": repo, "manual": false }),
+                json!({ "repo": repo, "manual": false, "grant_key": grant_key }),
             );
         }
         current
@@ -3662,9 +3880,18 @@ impl DaemonServer {
             DaemonRequest::KranzBind { pane_id, repo } => self.handle_kranz_bind(&pane_id, repo),
             DaemonRequest::KranzUnbind { pane_id } => self.handle_kranz_unbind(&pane_id),
             DaemonRequest::KranzBindings => Ok(json!(self.kranz_bindings_snapshot())),
-            DaemonRequest::ProjectCreate { name, goal, repo } => {
-                self.handle_project_create(&name, goal, repo)
-            }
+            DaemonRequest::ProjectCreate {
+                name,
+                goal,
+                repo,
+                notify_notes,
+            } => self.handle_project_create(&name, goal, repo, notify_notes),
+            DaemonRequest::ProjectUpdate {
+                name,
+                goal,
+                repo,
+                notify_notes,
+            } => self.handle_project_update(&name, goal, repo, notify_notes),
             DaemonRequest::ProjectDelete { name } => self.handle_project_delete(&name),
             DaemonRequest::ProjectAssign { name, pane_id } => {
                 self.handle_project_assign(&name, &pane_id)
@@ -3915,6 +4142,18 @@ impl DaemonServer {
                 cwd,
                 timeout_ms,
             } => self.handle_run_process(argv, cwd, timeout_ms),
+            DaemonRequest::GrantExec {
+                grant,
+                signature,
+                pane,
+            } => self.handle_grant_exec(grant, &signature, pane.as_deref()),
+            DaemonRequest::GrantOutput { terminal_id } => self.handle_grant_output(&terminal_id),
+            DaemonRequest::GrantWait {
+                terminal_id,
+                timeout_ms,
+            } => self.handle_grant_wait(&terminal_id, timeout_ms, peer),
+            DaemonRequest::GrantKill { terminal_id } => self.handle_grant_kill(&terminal_id),
+            DaemonRequest::GrantRelease { terminal_id } => self.handle_grant_release(&terminal_id),
             DaemonRequest::Shutdown => {
                 self.shutdown.store(true, Ordering::SeqCst);
                 Ok(json!(CommandOk { ok: true }))
@@ -5456,7 +5695,7 @@ impl DaemonServer {
             kill_and_reap_child(prepared.child);
             return Ok(());
         }
-        terminals.commit_spawn(pane_id, plan.size, prepared);
+        let _ = terminals.commit_spawn(pane_id, plan.size, prepared);
         Ok(())
     }
 
@@ -5502,7 +5741,7 @@ impl DaemonServer {
             kill_and_reap_child(prepared.child);
             return Ok(());
         }
-        terminals.commit_spawn(pane_id, plan.size, prepared);
+        let _ = terminals.commit_spawn(pane_id, plan.size, prepared);
         Ok(())
     }
 
@@ -5743,20 +5982,7 @@ impl DaemonServer {
             ));
         }
         let seq = AGENT_INTERRUPT_SEQ.fetch_add(1, Ordering::SeqCst);
-        let payload = match backend {
-            AgentBackendKind::Claude => json!({
-                "type": "user",
-                "message": {"role": "user", "content": [{"type": "text", "text": text}]},
-            }),
-            AgentBackendKind::Droid => json!({
-                "jsonrpc": "2.0",
-                "factoryApiVersion": "1.0.0",
-                "type": "request",
-                "id": format!("sgian-message-{seq}"),
-                "method": "droid.add_user_message",
-                "params": {"text": text},
-            }),
-        };
+        let payload = (backend.adapter().encode_user_message)(seq, text);
         let line = serde_json::to_string(&payload)
             .map_err(|error| format!("failed to encode agent message: {error}"))?;
         // Hold the event lock across enqueue + append so even a fast CLI
@@ -5865,21 +6091,7 @@ impl DaemonServer {
                 .ok_or_else(|| format!("agent session not found: {pane_id}"))?
         };
         let seq = AGENT_INTERRUPT_SEQ.fetch_add(1, Ordering::SeqCst);
-        let payload = match backend {
-            AgentBackendKind::Claude => json!({
-                "type": "control_request",
-                "request_id": format!("sgian-interrupt-{seq}"),
-                "request": {"subtype": "interrupt"},
-            }),
-            AgentBackendKind::Droid => json!({
-                "jsonrpc": "2.0",
-                "factoryApiVersion": "1.0.0",
-                "type": "request",
-                "id": format!("sgian-interrupt-{seq}"),
-                "method": "droid.interrupt_session",
-                "params": {},
-            }),
-        };
+        let payload = (backend.adapter().encode_interrupt_request)(seq);
         let line = serde_json::to_string(&payload)
             .map_err(|error| format!("failed to encode interrupt request: {error}"))?;
         queue_agent_stdin(&input, pane_id, &line)?;
