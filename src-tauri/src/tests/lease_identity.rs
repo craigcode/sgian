@@ -869,7 +869,8 @@ fn identity_scopes_and_holder_binding_are_pure() {
         request_scope(&DaemonRequest::ProjectCreate {
             name: "f".into(),
             goal: None,
-            repo: None
+            repo: None,
+            notify_notes: false,
         }),
         ClientScope::Write
     );
@@ -2567,6 +2568,7 @@ fn project_names_and_rollup() {
         name: "p".to_string(),
         goal: None,
         repo: None,
+        notify_notes: false,
         panes: vec!["a".to_string(), "b".to_string(), "c".to_string()],
         created_at_ms: 1,
     };
@@ -2665,6 +2667,7 @@ fn project_dossier_bundles_state_ledger_and_scrollback() {
             name: "feat".to_string(),
             goal: Some("prove the dossier".to_string()),
             repo: None,
+            notify_notes: false,
         })
         .expect("create");
     client
@@ -2806,6 +2809,7 @@ fn projects_changed_is_broadcast_on_every_mutation() {
             name: "feat".to_string(),
             goal: None,
             repo: None,
+            notify_notes: false,
         })
         .expect("create");
     client
@@ -2896,6 +2900,7 @@ fn projects_round_trip_over_ipc_and_persist() {
             name: "feat".to_string(),
             goal: Some("ship the thing".to_string()),
             repo: None,
+            notify_notes: false,
         })
         .expect("create");
     assert_eq!(project.name, "feat");
@@ -2904,6 +2909,7 @@ fn projects_round_trip_over_ipc_and_persist() {
             name: "feat".to_string(),
             goal: None,
             repo: None,
+            notify_notes: false,
         })
         .expect_err("duplicate refused");
     assert!(dup.contains("already exists"), "{dup}");
@@ -2912,6 +2918,7 @@ fn projects_round_trip_over_ipc_and_persist() {
             name: "bad name".to_string(),
             goal: None,
             repo: None,
+            notify_notes: false,
         })
         .is_err());
 
@@ -2949,6 +2956,7 @@ fn projects_round_trip_over_ipc_and_persist() {
             name: "other".to_string(),
             goal: None,
             repo: None,
+            notify_notes: false,
         })
         .expect("other");
     let moved: Value = client

@@ -46,6 +46,9 @@ pub(crate) struct TerminalStore {
     /// persist cadence instead of only at shutdown.
     #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
     pub(crate) agent_dirty: Arc<AtomicBool>,
+    /// Execution-grant handle store notified when a PTY generation exits or is
+    /// superseded by close/restart, waking `grant_wait` without polling locks.
+    pub(crate) grant_store: Option<Arc<GrantStore>>,
 }
 
 pub(crate) fn default_pty_size() -> PtySize {
@@ -250,7 +253,12 @@ impl TerminalStore {
             agent_config,
             agents_dir,
             agent_dirty,
+            grant_store: None,
         }
+    }
+
+    pub(crate) fn set_grant_store(&mut self, store: Arc<GrantStore>) {
+        self.grant_store = Some(store);
     }
 
     #[cfg(test)]
@@ -353,7 +361,7 @@ impl TerminalStore {
     pub(crate) fn spawn_pane(&mut self, pane_id: &str) -> Result<(), String> {
         let plan = self.plan_spawn(pane_id);
         let prepared = execute_spawn(&plan)?;
-        self.commit_spawn(pane_id, plan.size, prepared);
+        let _ = self.commit_spawn(pane_id, plan.size, prepared);
         Ok(())
     }
 
@@ -362,7 +370,12 @@ impl TerminalStore {
     /// is the only part of a spawn that mutates the store — the expensive
     /// fork/exec in `execute_spawn` runs without the lock, so a slow spawn no
     /// longer stalls input/resize/liveness for every other pane.
-    pub(crate) fn commit_spawn(&mut self, pane_id: &str, size: PtySize, prepared: PreparedSpawn) {
+    pub(crate) fn commit_spawn(
+        &mut self,
+        pane_id: &str,
+        size: PtySize,
+        prepared: PreparedSpawn,
+    ) -> u64 {
         let PreparedSpawn {
             master,
             child,
@@ -398,6 +411,7 @@ impl TerminalStore {
         let output_pane_id = pane_id.to_string();
         let output_router = self.router.clone();
         let liveness = Arc::clone(&self.liveness);
+        let grant_store = self.grant_store.clone();
         thread::spawn(move || {
             // Take ownership of the child so this reader can reap it (`child.wait()`)
             // at EOF to capture the authoritative exit status.
@@ -491,6 +505,9 @@ impl TerminalStore {
                 // mark itself stays; the signature is on the final screen).
                 output_router.clear_agent_attention(&output_pane_id);
                 output_router.emit_pane_ended(&output_pane_id, exit_code);
+                if let Some(grants) = &grant_store {
+                    grants.notify_pane_exit(&output_pane_id, generation, exit_code);
+                }
             }
         });
 
@@ -506,6 +523,7 @@ impl TerminalStore {
             },
         );
         self.sizes.insert(pane_id.to_string(), size);
+        generation
     }
 
     pub(crate) fn close_pane(&mut self, pane_id: &str) {
@@ -524,11 +542,80 @@ impl TerminalStore {
         if let Ok(mut liveness) = self.liveness.lock() {
             liveness.remove(pane_id);
         }
+        if let Some(grants) = &self.grant_store {
+            grants.notify_pane_superseded(pane_id);
+        }
         // (T1) M2: same attention clear as the reader-EOF path — a restart
         // kills the process without a claimed EOF, and a dead agent must not
         // keep its badge. On ClosePane the tracker entry is already gone
         // (remove_agent runs first), so this is a no-op there.
         self.router.clear_agent_attention(pane_id);
+    }
+
+    /// Kill the live PTY child for `(pane_id, generation)` without closing the
+    /// pane or dropping its scrollback/model (`grant_kill` / `grant_release`).
+    /// Returns `true` if a live matching generation was signalled, `false` if
+    /// it had already exited or been superseded.
+    pub(crate) fn kill_session_generation(&mut self, pane_id: &str, generation: u64) -> bool {
+        let is_current_live = self
+            .liveness
+            .lock()
+            .ok()
+            .and_then(|liveness| {
+                liveness
+                    .get(pane_id)
+                    .map(|entry| entry.generation == generation && !entry.ended)
+            })
+            .unwrap_or(false);
+        if !is_current_live {
+            return false;
+        }
+        let Some(session) = self.sessions.get_mut(pane_id) else {
+            return false;
+        };
+        #[cfg(unix)]
+        {
+            if let Some(pid) = session.pid {
+                terminate_root_and_tree(pid, GRANT_KILL_GRACE);
+            } else {
+                let _ = session.killer.kill();
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Some(job) = session._job.as_ref() {
+                job.terminate();
+            }
+            let _ = session.killer.kill();
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = session.killer.kill();
+        }
+        true
+    }
+
+    /// Snapshot `(ended, exit_code)` for `(pane_id, generation)` if that
+    /// generation is still the pane's current liveness entry, or `(true, None)`
+    /// if superseded/absent.
+    pub(crate) fn generation_exit_snapshot(
+        &self,
+        pane_id: &str,
+        generation: u64,
+    ) -> (bool, Option<i32>) {
+        self.liveness
+            .lock()
+            .ok()
+            .and_then(|liveness| {
+                liveness.get(pane_id).map(|entry| {
+                    if entry.generation == generation {
+                        (entry.ended, entry.exit_code)
+                    } else {
+                        (true, None)
+                    }
+                })
+            })
+            .unwrap_or((true, None))
     }
 
     /// Kill every live session's child directly. Daemon shutdown must not rely

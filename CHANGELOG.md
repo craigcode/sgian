@@ -5,7 +5,37 @@ follow SemVer once the first public tag exists.
 
 ## Unreleased
 
+### Security
+
+- Full-stack security hardening across the daemon, loopback HTTP server, CLI,
+  native desktop clients, and CI workflows (#101):
+  - Loopback HTTP (`ctl serve`) and IPC: constant-time session-key and token
+    comparisons, strict `Origin`/`Host`/`Sec-Fetch-Site` CSRF checks on state
+    routes, bounded header/body reads and SSE subscriber limits, pre-`hello`
+    peer-UID verification on Unix sockets, and per-request credential
+    revocation enforcement.
+  - Process, PTY, and CLI isolation: `is_safe_cli_token` rejects `-`/`--` flag
+    injection in agent `--model` and `--resume` tokens; vendored `portable-pty`
+    no longer leaks `SHELL` after `env_clear()` on explicit commands; bare
+    grant binaries resolve strictly against Sgian's `PATH` rather than an
+    untrusted workspace's `cwd`; and Unix process-tree termination checks
+    per-PID start tokens against PID reuse.
+  - Filesystem, notes, and ledger confinement: `O_NOFOLLOW`/non-symlink checks
+    on token, ledger, scrollback, note, and grant-key files; canonical
+    repository confinement on project notes and execution grants; and bounded
+    reads on `--file` inputs.
+  - Native clients and CI: macOS Keychain ACL tightening and HTTP(S)-only
+    terminal link handling; Windows WebView2 navigation/bridge lockdown and
+    HTTPS-only `.appinstaller` validation; full commit-SHA pinning on third-party
+    GitHub Actions (`azure/login`, Dependabot groups).
+
 ### Project
+
+- `docs/scripting-and-local-operation.md`: reproducible `ctl --json` scripting
+  and exit-code reference (`0`, `1..=255`, `1`), generation-fenced lease
+  automation, explicit separation between local daemon persistence and outbound
+  provider traffic from child agent CLIs, and the `AgentBackendAdapter`
+  qualification checklist.
 
 - The README shows the macOS client and the served phone view, captured
   from a real session with two Claude Code agents.
@@ -47,7 +77,23 @@ follow SemVer once the first public tag exists.
   hash?}` when a note is written, changed or removed, from the daemon's own
   writes at once and from a file watch over each root's `.sgian/projects`
   tree for edits made outside it; the event carries the hash, never the
-  contents.
+  contents. Step 4 adds the opt-in per-project prompt line (`notify_notes`,
+  off by default, toggled via `ctl project new --notify-notes` or
+  `ctl project set NAME --notify-notes|--no-notify-notes`): when a note's
+  content hash changes, live unleased member panes other than the authoring
+  pane receive `[sgian] project notes changed: <file>` (never note contents)
+  and record `note.notified` (`"by": "sgian"`) in their ledger.
+- Execution grants (`docs/design/execution-grants.md`, `src-tauri/src/grants.rs`):
+  `grant_exec`, `grant_output`, `grant_wait`, `grant_kill`, and `grant_release`
+  (plus `ctl grant exec|output|wait|kill|release`) verify RFC 2104 HMAC-SHA256
+  grants against `<repo>/.kranz/serve.grant.key` (`0600`), confine canonical
+  `cwd` inside the bound repository, execute `argv` verbatim in a PTY with
+  strict `env_allow` filtering under a `kranz:<run>` keyboard lease, reject
+  replays in an expiry-pruned set, and record durable `grant.exec` /
+  `grant.refused` ledger receipts.
+- Provider wire dispatch for chat-native agent panes (`Claude` stream-json and
+  `Droid` stream-jsonrpc) is consolidated behind `AgentBackendAdapter` in
+  `src-tauri/src/agent_stream.rs`.
 - Agent panes get the output guard. No emulator stands between an agent
   and the person in a chat pane, so the daemon now scrubs every string in a
   normalized agent event before it is logged or shown: terminal escape

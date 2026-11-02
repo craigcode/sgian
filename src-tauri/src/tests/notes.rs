@@ -132,6 +132,43 @@ fn project_note_args_parse() {
         }),
         ClientScope::Write
     );
+    assert_eq!(
+        request_scope(&DaemonRequest::ProjectUpdate {
+            name: "f".into(),
+            goal: None,
+            repo: None,
+            notify_notes: Some(true),
+        }),
+        ClientScope::Write
+    );
+
+    let set_on = parse_project_args(&args("set feature --notify-notes")).expect("set on");
+    assert_eq!(set_on.verb, ProjectVerb::Set);
+    assert_eq!(set_on.name.as_deref(), Some("feature"));
+    assert_eq!(set_on.notify_notes, Some(true));
+
+    let set_off =
+        parse_project_args(&args("update feature --no-notify-notes --goal done")).expect("set off");
+    assert_eq!(set_off.verb, ProjectVerb::Set);
+    assert_eq!(set_off.notify_notes, Some(false));
+    assert_eq!(set_off.goal.as_deref(), Some("done"));
+
+    let new_on = parse_project_args(&args("new feature --notify-notes")).expect("new on");
+    assert_eq!(new_on.verb, ProjectVerb::New);
+    assert_eq!(new_on.notify_notes, Some(true));
+
+    assert!(
+        parse_project_args(&args("set feature --notify-notes --no-notify-notes")).is_err(),
+        "conflicting flags rejected"
+    );
+    assert!(
+        parse_project_args(&args("set feature")).is_err(),
+        "project set requires at least one mutation flag"
+    );
+    assert!(
+        parse_project_args(&args("show feature --notify-notes")).is_err(),
+        "--notify-notes refused outside new/set"
+    );
 }
 
 #[test]
@@ -145,6 +182,7 @@ fn project_notes_are_written_listed_scrubbed_and_ledgered() {
             name: "feature".into(),
             goal: Some("ship it".into()),
             repo: Some(repo.path().display().to_string()),
+            notify_notes: false,
         })
         .expect("create project");
 
@@ -329,6 +367,7 @@ fn project_notes_honour_client_credentials() {
             name: "feature".into(),
             goal: None,
             repo: Some(repo.path().display().to_string()),
+            notify_notes: false,
         })
         .expect("create project");
 
@@ -437,6 +476,7 @@ fn project_notes_root_is_confined_and_capped() {
             name: "here".into(),
             goal: None,
             repo: None,
+            notify_notes: false,
         })
         .expect("create");
     let added: Value = client.request(note("here", "Local", "body")).expect("add");
@@ -452,6 +492,7 @@ fn project_notes_root_is_confined_and_capped() {
             name: "rel".into(),
             goal: None,
             repo: Some("sub".into()),
+            notify_notes: false,
         })
         .expect("create");
     let added: Value = client
@@ -470,6 +511,7 @@ fn project_notes_root_is_confined_and_capped() {
             name: "loose".into(),
             goal: None,
             repo: Some(elsewhere.path().display().to_string()),
+            notify_notes: false,
         })
         .expect("create");
     let refused: Result<Value, String> = client.request(note("loose", "Nope", "body"));
@@ -486,6 +528,7 @@ fn project_notes_root_is_confined_and_capped() {
             name: "gone".into(),
             goal: None,
             repo: Some(workspace.path().join("absent").display().to_string()),
+            notify_notes: false,
         })
         .expect("create");
     let refused: Result<Value, String> = client.request(note("gone", "Nope", "body"));
@@ -584,6 +627,7 @@ fn project_notes_changes_are_announced_once() {
             name: "feature".into(),
             goal: None,
             repo: Some(repo.path().display().to_string()),
+            notify_notes: false,
         })
         .expect("create project");
     let mut events = subscribe_events(&client);
@@ -648,6 +692,266 @@ fn project_notes_changes_are_announced_once() {
     fs::write(notes_dir.join("2020-01-02-probe.md"), "probe\n").expect("probe write");
     let (_, changed, _) = next_change(&mut events);
     assert_eq!(changed, "2020-01-02-probe.md");
+
+    daemon.shutdown();
+}
+
+/// Step 4 (docs/design/shared-context-notes.md §"Who reads"): the opt-in
+/// prompt line is off by default, enabled per project, carries ONLY the file
+/// name (never note contents), skips the authoring pane and panes whose
+/// keyboard lease is held, covers external file-watch edits, and is ledgered
+/// on each notified pane as a write by `sgian`.
+#[cfg(unix)]
+#[test]
+fn project_note_prompt_line_is_opt_in_skips_origin_and_leased_and_ledgers() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::create_dir(repo.path().join(".git")).expect("mark the repo");
+    // Spawn shells sitting in `cat` so every delivered prompt line echoes
+    // cleanly into scrollback without shell-command errors.
+    let config = Config {
+        shell: Some("/bin/cat".into()),
+        shell_args: Some(vec![]),
+        ..Config::default()
+    };
+    let daemon = TestDaemon::spawn(config);
+    let client = daemon.client();
+    let initial: WorkspaceSnapshot = client
+        .request(DaemonRequest::BootstrapWorkspace)
+        .expect("bootstrap");
+    let pane_author = initial.panes[0].id.clone();
+    let pane_peer: Pane = client
+        .request(DaemonRequest::CreatePane {
+            title: Some("peer".into()),
+            profile: None,
+        })
+        .expect("peer pane");
+    let pane_leased: Pane = client
+        .request(DaemonRequest::CreatePane {
+            title: Some("leased".into()),
+            profile: None,
+        })
+        .expect("leased pane");
+
+    let created: Project = client
+        .request(DaemonRequest::ProjectCreate {
+            name: "feature".into(),
+            goal: Some("step 4".into()),
+            repo: Some(repo.path().display().to_string()),
+            notify_notes: false,
+        })
+        .expect("create project");
+    assert!(!created.notify_notes, "off by default");
+
+    for id in [&pane_author, &pane_peer.id, &pane_leased.id] {
+        let _: Value = client
+            .request(DaemonRequest::ProjectAssign {
+                name: "feature".into(),
+                pane_id: id.clone(),
+            })
+            .expect("assign");
+    }
+    let _: LeaseInfo = client
+        .request(DaemonRequest::TakeLease {
+            pane_id: pane_leased.id.clone(),
+            holder: "alice".into(),
+            force: false,
+            why: None,
+        })
+        .expect("lease third pane");
+
+    // 1. Default off: adding a note sends NOTHING to any pane.
+    let secret_body = "NEVER_INJECT_THIS_BODY_SECRET_TOKEN";
+    let first: Value = client
+        .request(DaemonRequest::ProjectNoteAdd {
+            name: "feature".into(),
+            title: "Quiet note".into(),
+            body: secret_body.into(),
+            holder: "craig@mac".into(),
+            pane_id: Some(pane_author.clone()),
+        })
+        .expect("add quiet note");
+    thread::sleep(Duration::from_millis(80));
+    let peer_scroll: Value = client
+        .request(DaemonRequest::GetScrollback {
+            pane_id: pane_peer.id.clone(),
+        })
+        .expect("peer scrollback");
+    assert_eq!(
+        peer_scroll["scrollback"].as_str().unwrap_or(""),
+        "",
+        "default-off project must never send unasked prompt lines"
+    );
+    let first_file = first["file"].as_str().expect("first file");
+    assert!(!first_file.is_empty());
+
+    // 2. Enable per project via ProjectUpdate (`ctl project set --notify-notes`).
+    let updated: Project = client
+        .request(DaemonRequest::ProjectUpdate {
+            name: "feature".into(),
+            goal: None,
+            repo: None,
+            notify_notes: Some(true),
+        })
+        .expect("enable notify_notes");
+    assert!(updated.notify_notes);
+    assert_eq!(updated.goal.as_deref(), Some("step 4"));
+
+    // 3. Add a note attributed to `pane_author`:
+    //    - `pane_peer` receives `[sgian] project notes changed: <file>` (never body!)
+    //    - `pane_author` (origin) is skipped
+    //    - `pane_leased` (held by alice) is skipped
+    let second: Value = client
+        .request(DaemonRequest::ProjectNoteAdd {
+            name: "feature".into(),
+            title: "Loud note".into(),
+            body: secret_body.into(),
+            holder: "craig@mac".into(),
+            pane_id: Some(pane_author.clone()),
+        })
+        .expect("add loud note");
+    let second_file = second["file"].as_str().expect("second file").to_string();
+    let expected_line = format!("[sgian] project notes changed: {second_file}");
+
+    let wait_res: Value = client
+        .request(DaemonRequest::Wait {
+            pane_id: pane_peer.id.clone(),
+            condition: WaitCondition::Text(expected_line.clone()),
+            timeout_ms: Some(3_000),
+        })
+        .expect("wait for prompt line on peer");
+    assert_eq!(wait_res["matched"], json!(true), "{wait_res}");
+
+    let peer_scroll: Value = client
+        .request(DaemonRequest::GetScrollback {
+            pane_id: pane_peer.id.clone(),
+        })
+        .expect("peer scrollback after notify");
+    let peer_text = peer_scroll["scrollback"].as_str().unwrap_or("");
+    assert!(peer_text.contains(&expected_line), "{peer_text}");
+    assert!(
+        !peer_text.contains(secret_body),
+        "prompt line must NEVER carry note contents"
+    );
+
+    let author_scroll: Value = client
+        .request(DaemonRequest::GetScrollback {
+            pane_id: pane_author.clone(),
+        })
+        .expect("author scrollback");
+    assert!(
+        !author_scroll["scrollback"]
+            .as_str()
+            .unwrap_or("")
+            .contains("[sgian] project notes changed:"),
+        "authoring pane must not be notified of its own note write"
+    );
+
+    let leased_scroll: Value = client
+        .request(DaemonRequest::GetScrollback {
+            pane_id: pane_leased.id.clone(),
+        })
+        .expect("leased scrollback");
+    assert!(
+        !leased_scroll["scrollback"]
+            .as_str()
+            .unwrap_or("")
+            .contains("[sgian] project notes changed:"),
+        "leased pane must not receive unasked input"
+    );
+
+    // 4. External file-watch edit also triggers the prompt line (including on
+    //    `pane_author`, since nobody declared an origin pane), and duplicate
+    //    watch ticks with the same content hash do not double-deliver.
+    let notes_dir = repo.path().join(".sgian/projects/feature/notes");
+    fs::write(
+        notes_dir.join("2026-10-31-outside.md"),
+        format!("external body {secret_body}\n"),
+    )
+    .expect("external note write");
+    let outside_line = "[sgian] project notes changed: 2026-10-31-outside.md";
+    for target in [&pane_author, &pane_peer.id] {
+        let wait_res: Value = client
+            .request(DaemonRequest::Wait {
+                pane_id: target.clone(),
+                condition: WaitCondition::Text(outside_line.to_string()),
+                timeout_ms: Some(4_000),
+            })
+            .expect("wait for external watch prompt line");
+        assert_eq!(
+            wait_res["matched"],
+            json!(true),
+            "pane {target}: {wait_res}"
+        );
+    }
+
+    // 5. Turning it back off stops delivery immediately.
+    let disabled: Project = client
+        .request(DaemonRequest::ProjectUpdate {
+            name: "feature".into(),
+            goal: None,
+            repo: None,
+            notify_notes: Some(false),
+        })
+        .expect("disable notify_notes");
+    assert!(!disabled.notify_notes);
+    let third: Value = client
+        .request(DaemonRequest::ProjectNoteAdd {
+            name: "feature".into(),
+            title: "Muted again".into(),
+            body: "quiet".into(),
+            holder: "craig@mac".into(),
+            pane_id: None,
+        })
+        .expect("add third note");
+    let third_file = third["file"].as_str().expect("third file");
+    thread::sleep(Duration::from_millis(80));
+    let peer_scroll: Value = client
+        .request(DaemonRequest::GetScrollback {
+            pane_id: pane_peer.id.clone(),
+        })
+        .expect("peer scrollback after disable");
+    assert!(
+        !peer_scroll["scrollback"]
+            .as_str()
+            .unwrap_or("")
+            .contains(third_file),
+        "disabled notify_notes must stop delivery"
+    );
+
+    // 6. Durable ledger records `note.notified` with `"by": "sgian"` and
+    //    verified hash chains on the dossier.
+    let dossier: Value = client
+        .request(DaemonRequest::ProjectDossier {
+            name: "feature".into(),
+            lines: 0,
+        })
+        .expect("dossier");
+    let panes = dossier["panes"].as_array().expect("panes");
+    let peer_dossier = panes
+        .iter()
+        .find(|p| p["id"] == json!(pane_peer.id))
+        .expect("peer in dossier");
+    assert_eq!(peer_dossier["ledger"]["chain"]["verified"], json!(true));
+    let notified: Vec<&Value> = peer_dossier["ledger"]["records"]
+        .as_array()
+        .expect("peer ledger records")
+        .iter()
+        .filter(|r| r["type"] == json!("note.notified"))
+        .collect();
+    assert_eq!(
+        notified.len(),
+        2,
+        "two notifications delivered to peer: {notified:?}"
+    );
+    assert_eq!(notified[0]["payload"]["by"], json!("sgian"));
+    assert_eq!(notified[0]["payload"]["project"], json!("feature"));
+    assert_eq!(notified[0]["payload"]["file"], json!(second_file));
+    assert_eq!(notified[0]["payload"]["hash"], second["hash"]);
+    assert_eq!(notified[1]["payload"]["by"], json!("sgian"));
+    assert_eq!(
+        notified[1]["payload"]["file"],
+        json!("2026-10-31-outside.md")
+    );
 
     daemon.shutdown();
 }

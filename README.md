@@ -272,13 +272,16 @@ A single binary runs in three modes:
 
   The key becomes a cookie on first load; without it the page and the API
   answer 401, so another account on the desk machine cannot use the port.
-- `ctl project new|list|show|add|rm|delete|ledger|dossier` for projects: a
-  named group of panes serving one goal, persisted with the workspace, with an
-  attention roll-up (needs input / working / idle / unattended / keyboard
-  holders), the member panes' ledgers merged in time order, and a dossier: one
-  JSON document with every pane's state, verified ledger and scrollback tail
-  for a reviewer or a Kranz gate. `ctl new --project NAME` creates a pane
-  straight into one.
+- `ctl project new|set|list|show|add|rm|delete|notes|note|ledger|dossier` for
+  projects: a named group of panes serving one goal, persisted with the
+  workspace, with an attention roll-up (needs input / working / idle /
+  unattended / keyboard holders), shared context notes under
+  `<repo>/.sgian/projects/<name>/notes/` (`ctl project note add|rm`, `ctl
+  project notes`, and opt-in `[sgian] project notes changed: <file>` prompts
+  via `ctl project set <name> --notify-notes`), the member panes' ledgers
+  merged in time order, and a dossier: one JSON document with every pane's
+  state, verified ledger, notes and scrollback tail for a reviewer or a Kranz
+  gate. `ctl new --project NAME` creates a pane straight into one.
 - Output guard: every pane's output is scanned for the tricks an agent can
   use to hide things from the person watching (SGR 8 conceal, OSC 52
   clipboard writes, OSC 8 hyperlinks whose visible text is a URL on another
@@ -296,12 +299,22 @@ A single binary runs in three modes:
   run issues itself a `write` credential as `kranz:<run-id>` when it starts
   and revokes it when it ends, so its panes, leases and ledger records name
   the run rather than the operator.
+- `ctl grant exec|output|wait|kill|release` for Kranz-authorized PTY execution
+  grants (`docs/design/execution-grants.md`): verifies an HMAC-SHA256-signed
+  grant against `<repo>/.kranz/serve.grant.key` (`0600`), confines `cwd` inside
+  the bound repository, spawns verbatim `argv` with strict `env_allow`
+  filtering under a `kranz:<run>` keyboard lease, and chains `grant.exec` /
+  `grant.refused` receipts into the ledger.
 - `ctl logs` to tail daemon logs.
 - `ctl status --verbose` for detailed daemon state.
 - `ctl write-config` to persist config changes.
 - `ctl restart` to revive ended panes under `restore_on_demand`.
 - `ctl ipc-endpoint --json` to start/locate a daemon and return non-secret
   native-client transport and token-file metadata.
+
+See [docs/scripting-and-local-operation.md](docs/scripting-and-local-operation.md)
+for reproducible `ctl --json` scripting, exact exit codes, local daemon storage
+versus child-CLI provider network traffic, and agent backend qualification.
 
 ### Cross-Platform
 

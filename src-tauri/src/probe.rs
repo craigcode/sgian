@@ -166,6 +166,11 @@ pub struct Project {
     pub goal: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// Opt-in prompt line (`[sgian] project notes changed: <file>`) sent to
+    /// live unheld member panes when a note changes (shared-context-notes §4).
+    /// Off by default: unasked input is never sent unless enabled per project.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notify_notes: bool,
     #[serde(default)]
     pub panes: Vec<String>,
     pub created_at_ms: u64,

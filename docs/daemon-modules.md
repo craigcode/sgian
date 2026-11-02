@@ -16,16 +16,17 @@ API: the wire contract is the JSON in `docs/native-ipc.md`.
 | `windows_job.rs` | — | Windows job ownership, suspended agent launch and process-tree regression tests. |
 | `process_tree.rs` | 157 | Fork-free parent snapshots (libproc / procfs), descendant walks, tree termination. |
 | `router.rs` | 1,421 | Agent screen classification, `AgentTracker`, `OutputRouter`: scrollback append, output-guard hook, attention and usage state, subscriber fan-out. |
-| `terminals.rs` | 700 | `TerminalStore`: PTY spawn, liveness, input queues, kill. |
-| `agent_stream.rs` | 2,121 | Chat-native agent panes: spawn planning, sessions and approvals, stream-json normalization, the conversation log, the reader thread. |
+| `terminals.rs` | 780 | `TerminalStore`: PTY spawn, liveness, generation-scoped grant hooks, input queues, kill. |
+| `grants.rs` | 1,150 | Kranz execution grants (`docs/design/execution-grants.md`): RFC 2104 HMAC-SHA256 verification, `.kranz/serve.grant.key` (`0600`) loader, canonical `cwd` confinement, `PATH`-only bare binary resolution, strict `env_allow` PTY spawn, `GrantStore`, and `grant_exec`/`grant_output`/`grant_wait`/`grant_kill`/`grant_release`. |
+| `agent_stream.rs` | 2,360 | Chat-native agent panes: `AgentBackendAdapter` (`Claude`, `Droid`), spawn planning, sessions and approvals, stream-json/JSON-RPC normalization, the conversation log, the reader thread. |
 | `output_guard.rs` | 319 | `OutputTricks` and the scanner for output that hides something from a person. |
 | `ledger.rs` | 469 | Keyboard leases (`LeasePolicy`, `HeldLease`, predicates), the hash-chained ledger writer and verifier, `AgentUsage` from the status line. |
 | `probe.rs` | 386 | `claude agents --json` mapping, process-table and Kranz-worker parsing, projects and roll-ups, hook-to-attention, pid placement. |
 | `serve.rs` | 1,453 | `run_daemon`, the accept loop (peer-uid check), the hello gate, subscriptions, the framed request loop. |
 | `daemon_client.rs` | 1,418 | `DaemonConnection` and the ctl-side `DaemonClient`, token and data-dir helpers. |
-| `ctl.rs` | 5,370 | `sgian ctl`: option parsing, every command, its argument parser and printer, the help text. |
+| `ctl.rs` | 6,070 | `sgian ctl`: option parsing, every command, its argument parser and printer, the help text. |
 | `serve_http.rs` | ~450 | `sgian ctl serve`: the loopback HTTP host for the web client (embedded assets, `/api/invoke`, `/api/events` as SSE, read-only gate, Host check). |
-| `tests/` | 19,704 | The unit and in-process integration suite: `mod.rs` (shared transport helpers), `harness.rs` (`TestDaemon`), and one file per area (terminal, env_scrub, ctl_parsers, ctl_run, observability, lifecycle, config, agents, lease_identity). |
+| `tests/` | ~21,000 | The unit and in-process integration suite: `mod.rs` (shared transport helpers), `harness.rs` (`TestDaemon`), and one file per area (terminal, env_scrub, ctl_parsers, ctl_run, observability, lifecycle, config, agents, lease_identity, notes, grants). |
 
 Where to start for a change: a new request is a variant in `lib.rs`, a
 scope in `identity.rs::request_scope`, a handler on `DaemonServer`, a ctl

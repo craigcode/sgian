@@ -801,6 +801,18 @@ pub(crate) fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             };
             control_kranz(&client, parsed, options.json)
         }
+        "grant" => {
+            if has_help_flag(&options.args[1..]) {
+                return print_control_help();
+            }
+            let parsed = parse_grant_args(&options.args[1..])?;
+            let client = if matches!(parsed, GrantArgs::Exec { .. }) {
+                DaemonClient::connect_or_spawn(options.workspace)?
+            } else {
+                DaemonClient::connect_existing(options.workspace)?
+            };
+            control_grant(&client, parsed, options.json)
+        }
         "search" => {
             if has_help_flag(&options.args[1..]) {
                 return print_control_help();
@@ -1285,15 +1297,9 @@ pub(crate) fn parse_new_pane_args_with_spec(args: &[String]) -> Result<ParsedNew
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "--backend requires claude or droid".to_string())?;
-                backend = Some(match value.as_str() {
-                    "claude" => AgentBackendKind::Claude,
-                    "droid" => AgentBackendKind::Droid,
-                    other => {
-                        return Err(format!(
-                            "unknown agent backend '{other}': expected claude or droid"
-                        ))
-                    }
-                });
+                backend = Some(AgentBackendKind::parse(value).ok_or_else(|| {
+                    format!("unknown agent backend '{value}': expected claude or droid")
+                })?);
                 agent = true;
                 index += 2;
             }
@@ -1354,11 +1360,10 @@ pub(crate) fn control_new_pane(
         if profile.is_agent_profile() {
             parsed.agent = true;
             if parsed.backend.is_none() {
-                parsed.backend = match profile.agent_backend.as_deref() {
-                    Some("claude") => Some(AgentBackendKind::Claude),
-                    Some("droid") => Some(AgentBackendKind::Droid),
-                    _ => None,
-                };
+                parsed.backend = profile
+                    .agent_backend
+                    .as_deref()
+                    .and_then(AgentBackendKind::parse);
             }
             if parsed.model.is_none() {
                 parsed.model = profile.agent_model.clone();
@@ -2050,6 +2055,7 @@ pub(crate) enum ProjectVerb {
     List,
     Show,
     New,
+    Set,
     Add,
     Rm,
     Delete,
@@ -2070,6 +2076,7 @@ pub(crate) struct ProjectArgs {
     pub(crate) panes: Vec<String>,
     pub(crate) goal: Option<String>,
     pub(crate) repo: Option<String>,
+    pub(crate) notify_notes: Option<bool>,
     pub(crate) limit: usize,
     pub(crate) lines: usize,
     pub(crate) out: Option<String>,
@@ -2081,7 +2088,8 @@ pub(crate) struct ProjectArgs {
     pub(crate) holder: Option<String>,
 }
 
-/// `project list | show NAME | new NAME [--goal TEXT] [--repo PATH] |
+/// `project list | show NAME | new NAME [--goal TEXT] [--repo PATH] [--notify-notes|--no-notify-notes] |
+/// set NAME [--goal TEXT] [--repo PATH] [--notify-notes|--no-notify-notes] |
 /// add NAME PANE... | rm PANE... | delete NAME | ledger NAME [-n N] |
 /// dossier NAME [--lines N] [--out FILE] | notes NAME |
 /// note add NAME --title T [--body TEXT | --file PATH] [--pane PANE] [--as HOLDER] |
@@ -2092,6 +2100,7 @@ pub(crate) fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String>
         None | Some("list") => ProjectVerb::List,
         Some("show") => ProjectVerb::Show,
         Some("new") | Some("create") => ProjectVerb::New,
+        Some("set") | Some("update") => ProjectVerb::Set,
         Some("add") | Some("assign") => ProjectVerb::Add,
         Some("rm") | Some("remove") | Some("unassign") => ProjectVerb::Rm,
         Some("delete") => ProjectVerb::Delete,
@@ -2115,6 +2124,7 @@ pub(crate) fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String>
         panes: Vec::new(),
         goal: None,
         repo: None,
+        notify_notes: None,
         limit: 0,
         lines: 0,
         out: None,
@@ -2143,6 +2153,18 @@ pub(crate) fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String>
                         .ok_or_else(|| "--repo requires PATH".to_string())?,
                 );
                 index += 1;
+            }
+            "--notify-notes" => {
+                if parsed.notify_notes == Some(false) {
+                    return Err("--notify-notes and --no-notify-notes are alternatives".to_string());
+                }
+                parsed.notify_notes = Some(true);
+            }
+            "--no-notify-notes" => {
+                if parsed.notify_notes == Some(true) {
+                    return Err("--notify-notes and --no-notify-notes are alternatives".to_string());
+                }
+                parsed.notify_notes = Some(false);
             }
             "-n" | "--limit" => {
                 let value = args
@@ -2228,6 +2250,7 @@ pub(crate) fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String>
         ProjectVerb::Show
         | ProjectVerb::Delete
         | ProjectVerb::New
+        | ProjectVerb::Set
         | ProjectVerb::Ledger
         | ProjectVerb::Dossier
         | ProjectVerb::Notes => {
@@ -2269,8 +2292,19 @@ pub(crate) fn parse_project_args(args: &[String]) -> Result<ProjectArgs, String>
             parsed.panes = positionals;
         }
     }
-    if verb != ProjectVerb::New && (parsed.goal.is_some() || parsed.repo.is_some()) {
-        return Err("--goal/--repo apply to `project new`".to_string());
+    if !matches!(verb, ProjectVerb::New | ProjectVerb::Set)
+        && (parsed.goal.is_some() || parsed.repo.is_some() || parsed.notify_notes.is_some())
+    {
+        return Err("--goal/--repo/--notify-notes apply to `project new|set`".to_string());
+    }
+    if verb == ProjectVerb::Set
+        && parsed.goal.is_none()
+        && parsed.repo.is_none()
+        && parsed.notify_notes.is_none()
+    {
+        return Err(
+            "project set needs --goal, --repo, --notify-notes or --no-notify-notes".to_string(),
+        );
     }
     if verb != ProjectVerb::Ledger && parsed.limit != 0 {
         return Err("-n applies to `project ledger`".to_string());
@@ -2333,11 +2367,20 @@ pub(crate) fn control_project(
                 return write_json_stdout(&detail);
             }
             let summary = &detail["summary"];
+            let notify_tag = if summary["project"]["notify_notes"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                "\tnotify_notes=on"
+            } else {
+                ""
+            };
             writeln!(
                 stdout,
-                "{}\t{}",
+                "{}\t{}{}",
                 summary["project"]["name"].as_str().unwrap_or("-"),
-                summary["project"]["goal"].as_str().unwrap_or("")
+                summary["project"]["goal"].as_str().unwrap_or(""),
+                notify_tag,
             )
             .map_err(|error| format!("failed to write stdout: {error}"))?;
             for pane in detail["panes"].as_array().into_iter().flatten() {
@@ -2366,6 +2409,20 @@ pub(crate) fn control_project(
                 name: parsed.name.unwrap_or_default(),
                 goal: parsed.goal,
                 repo: parsed.repo,
+                notify_notes: parsed.notify_notes.unwrap_or(false),
+            })?;
+            if json_output {
+                return write_json_stdout(&project);
+            }
+            writeln!(stdout, "{}", project.name)
+                .map_err(|error| format!("failed to write stdout: {error}"))
+        }
+        ProjectVerb::Set => {
+            let project: Project = client.request(DaemonRequest::ProjectUpdate {
+                name: parsed.name.unwrap_or_default(),
+                goal: parsed.goal,
+                repo: parsed.repo,
+                notify_notes: parsed.notify_notes,
             })?;
             if json_output {
                 return write_json_stdout(&project);
@@ -2692,6 +2749,306 @@ pub(crate) fn control_kranz(
             result["binding"]["repo"].as_str().unwrap_or("-")
         )
         .map_err(|error| format!("failed to write stdout: {error}")),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GrantArgs {
+    Exec {
+        grant_json: Option<String>,
+        grant_file: Option<String>,
+        signature: String,
+        pane_ref: Option<String>,
+    },
+    Output {
+        terminal_id: String,
+    },
+    Wait {
+        terminal_id: String,
+        timeout_ms: Option<u64>,
+    },
+    Kill {
+        terminal_id: String,
+    },
+    Release {
+        terminal_id: String,
+    },
+}
+
+/// `grant exec (--grant JSON | --file PATH) --signature HEX [--pane PANE] |
+/// output TERMINAL_ID | wait TERMINAL_ID [--timeout MS] | kill TERMINAL_ID |
+/// release TERMINAL_ID`.
+pub(crate) fn parse_grant_args(args: &[String]) -> Result<GrantArgs, String> {
+    let Some(verb) = args.first().map(String::as_str) else {
+        return Err("grant requires a subcommand: exec, output, wait, kill or release".to_string());
+    };
+    let rest = &args[1..];
+    match verb {
+        "exec" => {
+            let mut grant_json = None;
+            let mut grant_file = None;
+            let mut signature = None;
+            let mut pane_ref = None;
+            let mut index = 0;
+            while index < rest.len() {
+                match rest[index].as_str() {
+                    "--grant" => {
+                        grant_json = Some(
+                            rest.get(index + 1)
+                                .cloned()
+                                .ok_or_else(|| "--grant requires JSON".to_string())?,
+                        );
+                        index += 1;
+                    }
+                    "--file" => {
+                        grant_file = Some(
+                            rest.get(index + 1)
+                                .cloned()
+                                .ok_or_else(|| "--file requires a PATH".to_string())?,
+                        );
+                        index += 1;
+                    }
+                    "--signature" | "--sig" => {
+                        signature = Some(
+                            rest.get(index + 1)
+                                .cloned()
+                                .ok_or_else(|| "--signature requires a hex HMAC".to_string())?,
+                        );
+                        index += 1;
+                    }
+                    "--pane" => {
+                        pane_ref = Some(
+                            rest.get(index + 1)
+                                .cloned()
+                                .ok_or_else(|| "--pane requires a PANE".to_string())?,
+                        );
+                        index += 1;
+                    }
+                    other => {
+                        return Err(format!("unexpected argument for grant exec: {other}"));
+                    }
+                }
+                index += 1;
+            }
+            if grant_json.is_some() == grant_file.is_some() {
+                return Err(
+                    "grant exec requires exactly one of --grant JSON or --file PATH".to_string(),
+                );
+            }
+            let signature =
+                signature.ok_or_else(|| "grant exec requires --signature HEX".to_string())?;
+            Ok(GrantArgs::Exec {
+                grant_json,
+                grant_file,
+                signature,
+                pane_ref,
+            })
+        }
+        "output" => {
+            let [terminal_id] = rest else {
+                return Err("grant output requires exactly one TERMINAL_ID".to_string());
+            };
+            if terminal_id.starts_with('-') {
+                return Err(format!(
+                    "unexpected argument for grant output: {terminal_id}"
+                ));
+            }
+            Ok(GrantArgs::Output {
+                terminal_id: terminal_id.clone(),
+            })
+        }
+        "wait" => {
+            let mut terminal_id = None;
+            let mut timeout_ms = None;
+            let mut index = 0;
+            while index < rest.len() {
+                match rest[index].as_str() {
+                    "--timeout" => {
+                        let raw = rest
+                            .get(index + 1)
+                            .ok_or_else(|| "--timeout requires milliseconds".to_string())?;
+                        let ms: u64 = raw
+                            .parse()
+                            .map_err(|_| format!("invalid --timeout '{raw}'"))?;
+                        timeout_ms = Some(ms);
+                        index += 1;
+                    }
+                    other if other.starts_with('-') => {
+                        return Err(format!("unexpected argument for grant wait: {other}"));
+                    }
+                    other => {
+                        if terminal_id.is_some() {
+                            return Err(format!("unexpected argument for grant wait: {other}"));
+                        }
+                        terminal_id = Some(other.to_string());
+                    }
+                }
+                index += 1;
+            }
+            let terminal_id =
+                terminal_id.ok_or_else(|| "grant wait requires a TERMINAL_ID".to_string())?;
+            Ok(GrantArgs::Wait {
+                terminal_id,
+                timeout_ms,
+            })
+        }
+        "kill" => {
+            let [terminal_id] = rest else {
+                return Err("grant kill requires exactly one TERMINAL_ID".to_string());
+            };
+            if terminal_id.starts_with('-') {
+                return Err(format!("unexpected argument for grant kill: {terminal_id}"));
+            }
+            Ok(GrantArgs::Kill {
+                terminal_id: terminal_id.clone(),
+            })
+        }
+        "release" => {
+            let [terminal_id] = rest else {
+                return Err("grant release requires exactly one TERMINAL_ID".to_string());
+            };
+            if terminal_id.starts_with('-') {
+                return Err(format!(
+                    "unexpected argument for grant release: {terminal_id}"
+                ));
+            }
+            Ok(GrantArgs::Release {
+                terminal_id: terminal_id.clone(),
+            })
+        }
+        other => Err(format!("unknown grant command: {other}")),
+    }
+}
+
+pub(crate) fn control_grant(
+    client: &DaemonClient,
+    parsed: GrantArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let mut stdout = std::io::stdout();
+    match parsed {
+        GrantArgs::Exec {
+            grant_json,
+            grant_file,
+            signature,
+            pane_ref,
+        } => {
+            let raw = match (grant_json, grant_file) {
+                (Some(inline), _) => inline,
+                (None, Some(path)) => {
+                    const GRANT_FILE_MAX: u64 = 64 * 1024;
+                    let file = fs::File::open(&path)
+                        .map_err(|error| format!("failed to read {path}: {error}"))?;
+                    let mut buf = String::new();
+                    file.take(GRANT_FILE_MAX + 1)
+                        .read_to_string(&mut buf)
+                        .map_err(|error| format!("failed to read {path}: {error}"))?;
+                    if buf.len() as u64 > GRANT_FILE_MAX {
+                        return Err(format!("{path} exceeds {GRANT_FILE_MAX} bytes"));
+                    }
+                    buf
+                }
+                (None, None) => return Err("grant exec requires --grant or --file".to_string()),
+            };
+            let grant: Value = serde_json::from_str(&raw)
+                .map_err(|error| format!("invalid grant JSON: {error}"))?;
+            let pane = match pane_ref {
+                Some(reference) => Some(resolve_pane_ref(client, &reference)?),
+                None => None,
+            };
+            let result: Value = client.request(DaemonRequest::GrantExec {
+                grant,
+                signature,
+                pane,
+            })?;
+            if json_output {
+                return write_json_stdout(&result);
+            }
+            writeln!(
+                stdout,
+                "{}\t{}",
+                result["terminal_id"].as_str().unwrap_or("-"),
+                result["pane_id"].as_str().unwrap_or("-")
+            )
+            .map_err(|error| format!("failed to write stdout: {error}"))
+        }
+        GrantArgs::Output { terminal_id } => {
+            let result: Value = client.request(DaemonRequest::GrantOutput { terminal_id })?;
+            if json_output {
+                return write_json_stdout(&result);
+            }
+            stdout
+                .write_all(result["output"].as_str().unwrap_or("").as_bytes())
+                .map_err(|error| format!("failed to write stdout: {error}"))
+        }
+        GrantArgs::Wait {
+            terminal_id,
+            timeout_ms,
+        } => {
+            let mut conn = client.connect()?;
+            conn.set_read_timeout(
+                timeout_ms.map(|ms| Duration::from_millis(ms) + CLIENT_READ_TIMEOUT),
+            );
+            let response = conn.request(&DaemonRequest::GrantWait {
+                terminal_id,
+                timeout_ms,
+            })?;
+            if !response.ok {
+                return Err(response
+                    .error
+                    .unwrap_or_else(|| "daemon request failed".to_string()));
+            }
+            let outcome = response.result;
+            let timed_out = outcome["timed_out"].as_bool().unwrap_or(false);
+            if json_output {
+                write_json_stdout(&outcome)?;
+            } else if !timed_out {
+                let code = outcome["exit"]["exit_code"]
+                    .as_i64()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                writeln!(
+                    stdout,
+                    "{}\t{code}",
+                    outcome["terminal_id"].as_str().unwrap_or("-")
+                )
+                .map_err(|error| format!("failed to write stdout: {error}"))?;
+            }
+            if timed_out {
+                let elapsed = outcome["elapsed_ms"].as_u64().unwrap_or(0);
+                return Err(format!("grant wait timed out after {elapsed}ms"));
+            }
+            Ok(())
+        }
+        GrantArgs::Kill { terminal_id } => {
+            let result: Value = client.request(DaemonRequest::GrantKill { terminal_id })?;
+            if json_output {
+                return write_json_stdout(&result);
+            }
+            let label = if result["already_exited"].as_bool().unwrap_or(false) {
+                "already_exited"
+            } else {
+                "killed"
+            };
+            writeln!(
+                stdout,
+                "{}\t{label}",
+                result["terminal_id"].as_str().unwrap_or("-")
+            )
+            .map_err(|error| format!("failed to write stdout: {error}"))
+        }
+        GrantArgs::Release { terminal_id } => {
+            let result: Value = client.request(DaemonRequest::GrantRelease { terminal_id })?;
+            if json_output {
+                return write_json_stdout(&result);
+            }
+            writeln!(
+                stdout,
+                "{}\treleased",
+                result["terminal_id"].as_str().unwrap_or("-")
+            )
+            .map_err(|error| format!("failed to write stdout: {error}"))
+        }
     }
 }
 
@@ -5537,9 +5894,13 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   (panes, live, needs input, working, idle,
                                   unattended, keyboard holders)
   project show <NAME>           One project with every member pane's state
-  project new <NAME> [--goal TEXT] [--repo PATH]
+  project new <NAME> [--goal TEXT] [--repo PATH] [--notify-notes]
                                 Create a project (a named group of panes
                                   serving one goal; persists with the workspace)
+  project set <NAME> [--goal TEXT] [--repo PATH] [--notify-notes|--no-notify-notes]
+                                Update a project's goal, repo or opt-in note
+                                  prompt line (`[sgian] project notes changed:
+                                  <file>`, off by default; ledgered as `sgian`)
   project add <NAME> <PANE>...  Put panes in a project (a pane is in at most one)
   project rm <PANE>...          Take panes out of their project
   project delete <NAME>         Delete a project (its panes stay open)
@@ -5567,6 +5928,17 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                   its inbox with `kranz msg`; `kranz status`
                                   drives the pane's badge.
   kranz unbind [PANE]           Remove a binding
+  grant exec (--grant JSON | --file PATH) --signature HEX [--pane PANE]
+                                Verify a Kranz-signed execution grant against
+                                  .kranz/serve.grant.key, spawn argv verbatim in
+                                  a PTY pane leased by kranz:<run>, and print
+                                  `<terminal_id>\t<pane_id>`
+  grant output <TERMINAL_ID>    Bounded PTY output so far (controls intact) and
+                                  exit status once finished
+  grant wait <TERMINAL_ID> [--timeout MS]
+                                Block until the grant process exits or times out
+  grant kill <TERMINAL_ID>      SIGTERM then SIGKILL after grace (pane stays)
+  grant release <TERMINAL_ID>   Drop the grant handle; pane and ledger stay
   search <PANE> [-i] [-n N] [--] <NEEDLE...>
                                 Substring search over a pane's whole scrollback
                                   (control sequences stripped): `line<TAB>text`.

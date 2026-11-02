@@ -76,6 +76,7 @@ pub(crate) const AGENT_PERMISSION_MODES: [&str; 6] = [
 /// (operator escape hatch; `agent_claude_bin` config wins when both are set).
 #[cfg(any(unix, windows))]
 pub(crate) const SGIAN_CLAUDE_BIN_ENV: &str = "SGIAN_CLAUDE_BIN";
+#[cfg(any(unix, windows))]
 pub(crate) const SGIAN_DROID_BIN_ENV: &str = "SGIAN_DROID_BIN";
 /// Per-pane conversation log lives at `<data_dir>/agents/<pane-id>.jsonl`.
 pub(crate) const AGENT_LOG_DIR: &str = "agents";
@@ -245,20 +246,325 @@ pub(crate) fn agent_command_argv(
     }
 }
 
+/// Provider protocol adapter seam for chat-native agent panes (`ENHANCEMENTS.md` §6).
+///
+/// Consolidates every provider-specific wire decision — binary resolution, CLI
+/// argv and initial stdin handshake, user-message/approval/interrupt request
+/// framing, immediate non-blocking protocol replies, and stdout event
+/// normalization — into one self-contained table per backend.
+#[cfg(any(unix, windows))]
+pub(crate) struct AgentBackendAdapter {
+    pub(crate) kind: AgentBackendKind,
+    pub(crate) default_bin: &'static str,
+    pub(crate) env_override: &'static str,
+    /// True when the CLI emits an initial idle notification before any user
+    /// turn is sent (Droid JSON-RPC), which must not surface an empty
+    /// `turn_complete` event.
+    pub(crate) suppress_idle_turn_complete: bool,
+    pub(crate) configured_bin: fn(&AgentSpawnConfig) -> Option<&str>,
+    pub(crate) spawn_args: fn(
+        permission_mode: &str,
+        model: Option<&str>,
+        resume_session_id: Option<&str>,
+    ) -> Vec<String>,
+    pub(crate) initial_stdin: fn(
+        pane_id: &str,
+        cwd: &Path,
+        model: Option<&str>,
+        resume_session_id: Option<&str>,
+    ) -> Option<String>,
+    pub(crate) encode_user_message: fn(seq: u64, text: &str) -> Value,
+    pub(crate) encode_approval_response: fn(
+        request_id: &str,
+        tool_input: Option<Value>,
+        allow: bool,
+        message: Option<String>,
+    ) -> Value,
+    pub(crate) encode_interrupt_request: fn(seq: u64) -> Value,
+    pub(crate) immediate_reply: fn(raw: &Value) -> Option<Value>,
+    pub(crate) normalize_event: fn(raw: &Value) -> Vec<Value>,
+}
+
+#[cfg(any(unix, windows))]
+fn claude_configured_bin(config: &AgentSpawnConfig) -> Option<&str> {
+    config.claude_bin.as_deref()
+}
+
+#[cfg(any(unix, windows))]
+fn claude_spawn_args(
+    permission_mode: &str,
+    model: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_string(),
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--permission-mode".to_string(),
+        permission_mode.to_string(),
+        // Without a prompt tool, manual mode auto-DENIES approval-needing tools
+        // instead of prompting.
+        "--permission-prompt-tool".to_string(),
+        "stdio".to_string(),
+        "--include-partial-messages".to_string(),
+    ];
+    if let Some(model) = model.filter(|m| is_safe_cli_token(m)) {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if let Some(session_id) = resume_session_id.filter(|id| is_safe_cli_token(id)) {
+        args.push("--resume".to_string());
+        args.push(session_id.to_string());
+    }
+    args
+}
+
+#[cfg(any(unix, windows))]
+fn claude_initial_stdin(
+    _pane_id: &str,
+    _cwd: &Path,
+    _model: Option<&str>,
+    _resume_session_id: Option<&str>,
+) -> Option<String> {
+    None
+}
+
+#[cfg(any(unix, windows))]
+fn claude_encode_user_message(_seq: u64, text: &str) -> Value {
+    json!({
+        "type": "user",
+        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn claude_encode_approval_response(
+    request_id: &str,
+    tool_input: Option<Value>,
+    allow: bool,
+    message: Option<String>,
+) -> Value {
+    if allow {
+        let mut behavior = json!({"behavior": "allow"});
+        if let Some(tool_input) = tool_input {
+            behavior["updatedInput"] = tool_input;
+        }
+        json!({
+            "type": "control_response",
+            "response": {
+                "request_id": request_id,
+                "subtype": "success",
+                "response": behavior,
+            },
+        })
+    } else {
+        json!({
+            "type": "control_response",
+            "response": {
+                "request_id": request_id,
+                "subtype": "success",
+                "response": {
+                    "behavior": "deny",
+                    "message": message.unwrap_or_else(|| "denied by user".to_string()),
+                },
+            },
+        })
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn claude_encode_interrupt_request(seq: u64) -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": format!("sgian-interrupt-{seq}"),
+        "request": {"subtype": "interrupt"},
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn claude_immediate_reply(_raw: &Value) -> Option<Value> {
+    None
+}
+
+#[cfg(any(unix, windows))]
+fn droid_configured_bin(config: &AgentSpawnConfig) -> Option<&str> {
+    config.droid_bin.as_deref()
+}
+
+#[cfg(any(unix, windows))]
+fn droid_spawn_args(
+    _permission_mode: &str,
+    _model: Option<&str>,
+    _resume_session_id: Option<&str>,
+) -> Vec<String> {
+    vec![
+        "exec".to_string(),
+        "--input-format".to_string(),
+        "stream-jsonrpc".to_string(),
+        "--output-format".to_string(),
+        "stream-jsonrpc".to_string(),
+    ]
+}
+
+#[cfg(any(unix, windows))]
+fn droid_initial_stdin(
+    pane_id: &str,
+    cwd: &Path,
+    model: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Option<String> {
+    let request = if let Some(session_id) = resume_session_id.filter(|id| is_safe_cli_token(id)) {
+        json!({
+            "jsonrpc": "2.0",
+            "factoryApiVersion": "1.0.0",
+            "type": "request",
+            "id": format!("sgian-load-{pane_id}"),
+            "method": "droid.load_session",
+            "params": {"sessionId": session_id},
+        })
+    } else {
+        let mut params = json!({
+            "machineId": "sgian",
+            "cwd": cwd.to_string_lossy(),
+            // Manual approval is the safe common denominator. The UI answers
+            // droid.request_permission over JSON-RPC.
+            "autonomyLevel": "off",
+        });
+        if let Some(model) = model.filter(|m| is_safe_cli_token(m)) {
+            params["modelId"] = json!(model);
+        }
+        json!({
+            "jsonrpc": "2.0",
+            "factoryApiVersion": "1.0.0",
+            "type": "request",
+            "id": format!("sgian-init-{pane_id}"),
+            "method": "droid.initialize_session",
+            "params": params,
+        })
+    };
+    serde_json::to_string(&request).ok()
+}
+
+#[cfg(any(unix, windows))]
+fn droid_encode_user_message(seq: u64, text: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "factoryApiVersion": "1.0.0",
+        "type": "request",
+        "id": format!("sgian-message-{seq}"),
+        "method": "droid.add_user_message",
+        "params": {"text": text},
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn droid_encode_approval_response(
+    request_id: &str,
+    _tool_input: Option<Value>,
+    allow: bool,
+    message: Option<String>,
+) -> Value {
+    let mut result = json!({
+        "selectedOption": if allow { "proceed_once" } else { "cancel" },
+    });
+    if let Some(message) = message {
+        result["comment"] = json!(message);
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "factoryApiVersion": "1.0.0",
+        "type": "response",
+        "id": request_id,
+        "result": result,
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn droid_encode_interrupt_request(seq: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "factoryApiVersion": "1.0.0",
+        "type": "request",
+        "id": format!("sgian-interrupt-{seq}"),
+        "method": "droid.interrupt_session",
+        "params": {},
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn droid_immediate_reply(raw: &Value) -> Option<Value> {
+    if raw.get("method").and_then(Value::as_str) != Some("droid.ask_user") {
+        return None;
+    }
+    let request_id = raw.get("id").and_then(Value::as_str)?;
+    Some(json!({
+        "jsonrpc": "2.0",
+        "factoryApiVersion": "1.0.0",
+        "type": "response",
+        "id": request_id,
+        "result": {"cancelled": true, "answers": []},
+    }))
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) static CLAUDE_BACKEND_ADAPTER: AgentBackendAdapter = AgentBackendAdapter {
+    kind: AgentBackendKind::Claude,
+    default_bin: "claude",
+    env_override: SGIAN_CLAUDE_BIN_ENV,
+    suppress_idle_turn_complete: false,
+    configured_bin: claude_configured_bin,
+    spawn_args: claude_spawn_args,
+    initial_stdin: claude_initial_stdin,
+    encode_user_message: claude_encode_user_message,
+    encode_approval_response: claude_encode_approval_response,
+    encode_interrupt_request: claude_encode_interrupt_request,
+    immediate_reply: claude_immediate_reply,
+    normalize_event: normalize_agent_event,
+};
+
+#[cfg(any(unix, windows))]
+pub(crate) static DROID_BACKEND_ADAPTER: AgentBackendAdapter = AgentBackendAdapter {
+    kind: AgentBackendKind::Droid,
+    default_bin: "droid",
+    env_override: SGIAN_DROID_BIN_ENV,
+    suppress_idle_turn_complete: true,
+    configured_bin: droid_configured_bin,
+    spawn_args: droid_spawn_args,
+    initial_stdin: droid_initial_stdin,
+    encode_user_message: droid_encode_user_message,
+    encode_approval_response: droid_encode_approval_response,
+    encode_interrupt_request: droid_encode_interrupt_request,
+    immediate_reply: droid_immediate_reply,
+    normalize_event: normalize_droid_agent_event,
+};
+
+#[cfg(any(unix, windows))]
+pub(crate) fn agent_backend_adapter(backend: AgentBackendKind) -> &'static AgentBackendAdapter {
+    match backend {
+        AgentBackendKind::Claude => &CLAUDE_BACKEND_ADAPTER,
+        AgentBackendKind::Droid => &DROID_BACKEND_ADAPTER,
+    }
+}
+
 #[cfg(any(unix, windows))]
 pub(crate) fn resolve_provider_bin(
     config: &AgentSpawnConfig,
     backend: AgentBackendKind,
 ) -> AgentBinPlan {
-    let (configured, env_name, fallback) = match backend {
-        AgentBackendKind::Claude => (&config.claude_bin, SGIAN_CLAUDE_BIN_ENV, "claude"),
-        AgentBackendKind::Droid => (&config.droid_bin, SGIAN_DROID_BIN_ENV, "droid"),
-    };
-    let candidate = configured
-        .as_ref()
+    let adapter = backend.adapter();
+    debug_assert_eq!(adapter.kind, backend);
+    let fallback = adapter.default_bin;
+    let candidate = (adapter.configured_bin)(config)
         .filter(|bin| !bin.is_empty())
-        .cloned()
-        .or_else(|| std::env::var(env_name).ok().filter(|bin| !bin.is_empty()));
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var(adapter.env_override)
+                .ok()
+                .filter(|bin| !bin.is_empty())
+        });
     #[cfg(windows)]
     let probed = std::env::var_os("PATH")
         .and_then(|path| probe_named_agent_path(&path, fallback, |p| p.is_file()));
@@ -600,15 +906,11 @@ pub(crate) fn normalize_agent_event(raw: &Value) -> Vec<Value> {
     }
 }
 
-/// Normalize a provider's wire protocol into the stable chat event contract.
-/// Claude keeps its existing stream-json path; Droid's long-lived JSON-RPC
-/// notifications are translated at this seam.
+/// Normalize a provider's wire protocol into the stable chat event contract
+/// through its `AgentBackendAdapter`.
 #[cfg(any(unix, windows))]
 pub(crate) fn normalize_provider_agent_event(backend: AgentBackendKind, raw: &Value) -> Vec<Value> {
-    match backend {
-        AgentBackendKind::Claude => normalize_agent_event(raw),
-        AgentBackendKind::Droid => normalize_droid_agent_event(raw),
-    }
+    (backend.adapter().normalize_event)(raw)
 }
 
 #[cfg(any(unix, windows))]
@@ -1267,50 +1569,12 @@ pub(crate) fn agent_handle_permission_request(
     // Reply shape pinned by probe c: allow echoes the original input back as
     // updatedInput (omitted when the request carried none — L7); deny carries
     // the operator's feedback message to the model.
-    let response = match backend {
-        AgentBackendKind::Claude if decision.allow => {
-            let mut behavior = json!({"behavior": "allow"});
-            if let Some(tool_input) = tool_input {
-                behavior["updatedInput"] = tool_input;
-            }
-            json!({
-                "type": "control_response",
-                "response": {
-                    "request_id": request_id,
-                    "subtype": "success",
-                    "response": behavior,
-                },
-            })
-        }
-        AgentBackendKind::Claude => json!({
-            "type": "control_response",
-            "response": {
-                "request_id": request_id,
-                "subtype": "success",
-                "response": {
-                    "behavior": "deny",
-                    "message": decision
-                        .message
-                        .unwrap_or_else(|| "denied by user".to_string()),
-                },
-            },
-        }),
-        AgentBackendKind::Droid => {
-            let mut result = json!({
-                "selectedOption": if decision.allow { "proceed_once" } else { "cancel" },
-            });
-            if let Some(message) = decision.message {
-                result["comment"] = json!(message);
-            }
-            json!({
-                "jsonrpc": "2.0",
-                "factoryApiVersion": "1.0.0",
-                "type": "response",
-                "id": request_id,
-                "result": result,
-            })
-        }
-    };
+    let response = (backend.adapter().encode_approval_response)(
+        &request_id,
+        tool_input,
+        decision.allow,
+        decision.message,
+    );
     if let Ok(line) = serde_json::to_string(&response) {
         // Best-effort: the process may already be gone (close/kill raced us).
         let _ = queue_agent_stdin(input, pane_id, &line);
@@ -1401,20 +1665,10 @@ pub(crate) fn agent_reader_main(ctx: AgentReaderCtx) {
                 continue;
             }
         };
-        if backend == AgentBackendKind::Droid
-            && raw.get("method").and_then(Value::as_str) == Some("droid.ask_user")
-        {
-            if let Some(request_id) = raw.get("id").and_then(Value::as_str) {
-                let response = json!({
-                    "jsonrpc": "2.0",
-                    "factoryApiVersion": "1.0.0",
-                    "type": "response",
-                    "id": request_id,
-                    "result": {"cancelled": true, "answers": []},
-                });
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = queue_agent_stdin(&input, &pane_id, &line);
-                }
+        let adapter = backend.adapter();
+        if let Some(response) = (adapter.immediate_reply)(&raw) {
+            if let Ok(line) = serde_json::to_string(&response) {
+                let _ = queue_agent_stdin(&input, &pane_id, &line);
             }
         }
         for event in normalize_provider_agent_event(backend, &raw) {
@@ -1442,12 +1696,12 @@ pub(crate) fn agent_reader_main(ctx: AgentReaderCtx) {
                     }
                 }
                 "turn_complete" => {
-                    // Droid emits an idle notification after initialization.
-                    // It is only a turn boundary when SendAgentMessage marked
-                    // a turn in flight; otherwise suppress the empty replay
-                    // event (and avoid clearing a just-queued first turn).
+                    // Providers with `suppress_idle_turn_complete` (Droid) emit
+                    // an idle notification after initialization before any turn
+                    // ran; suppress that empty replay event while preserving
+                    // real in-flight turn boundaries.
                     let was_running = agent_end_turn(&shared);
-                    if backend == AgentBackendKind::Droid && !was_running {
+                    if adapter.suppress_idle_turn_complete && !was_running {
                         continue;
                     }
                 }
@@ -1535,6 +1789,7 @@ impl TerminalStore {
     /// there is one, else the persisted `agents_v2` seed.
     pub(crate) fn plan_agent_spawn(&self, pane_id: &str) -> AgentSpawnPlan {
         let spec = self.agent_specs.get(pane_id).cloned().unwrap_or_default();
+        let adapter = spec.backend.adapter();
         let bin = resolve_provider_bin(&self.agent_config, spec.backend);
         let resume_session_id = self
             .agent_sessions
@@ -1548,75 +1803,18 @@ impl TerminalStore {
             })
             .or_else(|| self.agent_resume.get(pane_id).cloned())
             .filter(|id| is_safe_cli_token(id));
-        let mut args = match spec.backend {
-            AgentBackendKind::Claude => vec![
-                "-p".to_string(),
-                "--input-format".to_string(),
-                "stream-json".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--permission-mode".to_string(),
-                self.agent_config.permission_mode.clone(),
-                // Without a prompt tool, manual mode auto-DENIES
-                // approval-needing tools instead of prompting.
-                "--permission-prompt-tool".to_string(),
-                "stdio".to_string(),
-                "--include-partial-messages".to_string(),
-            ],
-            AgentBackendKind::Droid => vec![
-                "exec".to_string(),
-                "--input-format".to_string(),
-                "stream-jsonrpc".to_string(),
-                "--output-format".to_string(),
-                "stream-jsonrpc".to_string(),
-            ],
-        };
-        if spec.backend == AgentBackendKind::Claude {
-            if let Some(model) = spec.model.as_deref().filter(|m| is_safe_cli_token(m)) {
-                args.push("--model".to_string());
-                args.push(model.to_string());
-            }
-            if let Some(session_id) = &resume_session_id {
-                args.push("--resume".to_string());
-                args.push(session_id.clone());
-            }
-        }
+        let args = (adapter.spawn_args)(
+            &self.agent_config.permission_mode,
+            spec.model.as_deref(),
+            resume_session_id.as_deref(),
+        );
         let command_str = format!("{} {}", agent_bin_display(&bin), args.join(" "));
-        let initial_input = if spec.backend == AgentBackendKind::Droid {
-            let request = if let Some(session_id) = &resume_session_id {
-                json!({
-                    "jsonrpc": "2.0",
-                    "factoryApiVersion": "1.0.0",
-                    "type": "request",
-                    "id": format!("sgian-load-{pane_id}"),
-                    "method": "droid.load_session",
-                    "params": {"sessionId": session_id},
-                })
-            } else {
-                let mut params = json!({
-                    "machineId": "sgian",
-                    "cwd": self.cwd.to_string_lossy(),
-                    // Manual approval is the safe common denominator. The
-                    // UI answers droid.request_permission over JSON-RPC.
-                    "autonomyLevel": "off",
-                });
-                if let Some(model) = &spec.model {
-                    params["modelId"] = json!(model);
-                }
-                json!({
-                    "jsonrpc": "2.0",
-                    "factoryApiVersion": "1.0.0",
-                    "type": "request",
-                    "id": format!("sgian-init-{pane_id}"),
-                    "method": "droid.initialize_session",
-                    "params": params,
-                })
-            };
-            serde_json::to_string(&request).ok()
-        } else {
-            None
-        };
+        let initial_input = (adapter.initial_stdin)(
+            pane_id,
+            &self.cwd,
+            spec.model.as_deref(),
+            resume_session_id.as_deref(),
+        );
         AgentSpawnPlan {
             backend: spec.backend,
             bin,
