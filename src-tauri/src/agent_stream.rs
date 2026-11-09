@@ -1856,6 +1856,7 @@ impl TerminalStore {
                     command: Some(command_str),
                     cwd: Some(cwd_str),
                     exit_code: None,
+                    exit_signal: None,
                     // Agent panes report attention from their own event
                     // stream; the process-tree probe is for shell panes.
                     pid: None,
@@ -1958,6 +1959,23 @@ impl TerminalStore {
             .iter()
             .map(|(pane_id, session)| (pane_id.clone(), session.permission_mode.clone()))
             .collect()
+    }
+
+    /// Live attention classification for a `PaneKind::Agent` session (`None`
+    /// once the session has ended or before its first spawn).
+    pub(crate) fn agent_session_attention(&self, pane_id: &str) -> Option<AgentAttention> {
+        if !self.is_live(pane_id) {
+            return None;
+        }
+        let session = self.agent_sessions.get(pane_id)?;
+        let shared = session.shared.lock().ok()?;
+        if !shared.pending.is_empty() {
+            Some(AgentAttention::NeedsInput)
+        } else if shared.turn_running {
+            Some(AgentAttention::Working)
+        } else {
+            Some(AgentAttention::Idle)
+        }
     }
 
     /// (T2) The live session's stdin handle + shared state for request

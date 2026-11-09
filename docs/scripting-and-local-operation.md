@@ -20,7 +20,7 @@ JSON value (or newline-delimited JSON objects on streaming commands such as
 |---|---|---|---|
 | `ctl process [--cwd DIR] [--timeout MS] -- <ARGV...>` | Child exited `0` | Child exited non-zero (`code.clamp(1, 255)`); JSON result still printed on stdout first | Timeout (`timed_out: true`), signal death without exit code, or daemon/argument error |
 | `ctl run [--pane P] [--timeout MS] -- <CMD...>` | Command marker reported `0` | Command's own shell status (`code.clamp(1, 255)`); JSON result still printed on stdout first | Marker timeout, dead pane, or batched `--all` / `--panes` with any failing pane |
-| `ctl wait <PANE> (--text\|--regex\|--idle\|--exit) [--timeout MS]` | Condition matched before timeout | — | Timeout (`matched: false`, JSON still printed) or pane/daemon error |
+| `ctl wait <PANE> (--text\|--regex\|--idle\|--exit\|--attention) [--timeout MS]` | Condition matched before timeout | — | Timeout (`matched: false`, JSON still printed) or pane/daemon error |
 | `ctl ledger [PANE] --verify` | Hash chain verified intact | — | Tampered or truncated record, or missing ledger |
 | All other `ctl` verbs | Request accepted by daemon | — | Refused request (scope, lease conflict, invalid grant, bad arguments, unreachable daemon) |
 
@@ -74,6 +74,18 @@ exit "$run_rc"
 Passing `--generation "$gen"` on `send` and `lease release` guarantees that if a
 human force-took the pane (`ctl lease take --force --why ...`) mid-script, late
 writes from the script fail cleanly as stale instead of colliding with the human.
+
+### Agent-to-agent steering (`--attention` and `lines --last`)
+
+When an orchestrating agent drives a worker CLI in another pane, prefer
+`ctl wait <PANE> --attention needs_input,idle` over byte-quiet `--idle` waits,
+and read recent output with `ctl lines <PANE> --last N` (`-n N`) rather than
+scraping the visible viewport (`docs/design/agent-steering-and-machines.md`):
+
+```bash
+sgian ctl --json wait "$pane_id" --attention needs_input,idle --timeout 300000
+sgian ctl lines "$pane_id" --last 80
+```
 
 ### Streaming transitions without polling
 

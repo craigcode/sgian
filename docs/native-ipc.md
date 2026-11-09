@@ -161,7 +161,15 @@ HMAC-SHA256 signature against `<repo>/.kranz/serve.grant.key`, spawns verbatim
 `grant.exec` on the pane or `grant.refused` in `ledger/grants.jsonl`, and
 returns `{terminal_id, pane_id}`), `grant_output {terminal_id}`, `grant_wait
 {terminal_id, timeout_ms?}`, `grant_kill {terminal_id}`, and `grant_release
-{terminal_id}`. `kranz_bind` registers the bound repository root with the grant
+{terminal_id}`. Finished grants report `exit_status: {exit_code, signal}`
+satisfying `kranz-acp`'s strict XOR invariant (`exit_code != null` xor
+`signal != null`), and `grant_kill` / `grant_release` bound-wait for PTY
+process-tree reap and scrollback drain to return `descendants_reaped`,
+`output_drained`, and `released` (`CleanupReceipt`). `scrollback_lines`
+accepts an additive `last` count (`1..=2000`, mutually exclusive with
+`from`..`to`), and `wait` accepts `{kind: "attention", value: [...]}` across
+both PTY-hosted and native `agent` panes. `kranz_bind` registers the bound
+repository root with the grant
 store and includes additive `grant_key: bool` in its response and `kranz.bound`
 ledger record.
 The bootstrap snapshot may carry `output_warnings` (pane_id → per-kind

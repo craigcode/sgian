@@ -56,6 +56,20 @@ follow SemVer once the first public tag exists.
 
 ### Agents
 
+- Agent-to-agent steering refinements and saved-machine design
+  (`docs/design/agent-steering-and-machines.md`, #117): `ctl lines <PANE>`
+  gains `-n N` / `--last N` (`scrollback_lines { last }`) to tail scrubbed
+  scrollback without pre-querying total line counts, and `ctl wait <PANE>`
+  gains `--attention <working|needs_input|idle[,...]>` (`WaitCondition::Attention`)
+  across both PTY-hosted agents and native `agent` panes.
+- Execution grant `CleanupReceipt` and signal alignment (`src-tauri/src/grants.rs`,
+  `docs/design/execution-grants.md`): `grant_output`, `grant_wait`, `grant_kill`,
+  and `grant_release` now emit `exit_status: { exit_code, signal }` satisfying
+  `kranz-acp`'s strict XOR invariant, and `grant_kill` / `grant_release` bound-wait
+  for PTY process-tree reap and scrollback drain (`descendants_reaped`,
+  `output_drained`, `released`).
+- Upgraded `vt100` from `0.16.2` to `0.18.1` (`NonZeroU16` screen dimensions).
+
 - Shared context notes for a project (`docs/design/shared-context-notes.md`,
   step 1). `ctl project note add NAME --title TEXT` writes a short Markdown
   file under `<repo>/.sgian/projects/NAME/notes/` with the writer, the pane

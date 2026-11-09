@@ -312,6 +312,19 @@ pub enum AgentAttention {
     Idle,
 }
 
+impl AgentAttention {
+    pub(crate) fn parse_name(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "working" => Ok(Self::Working),
+            "needs_input" => Ok(Self::NeedsInput),
+            "idle" => Ok(Self::Idle),
+            other => Err(format!(
+                "invalid --attention state '{other}': expected working, needs_input, or idle"
+            )),
+        }
+    }
+}
+
 /// (T1) Per-pane agent state surfaced in the bootstrap payload's
 /// `agent_states` map (and mirrored by snapshot/find). `agent` is the agent
 /// CLI name when known (`"claude"` today; future names are additive); a pane
@@ -1332,12 +1345,17 @@ enum DaemonRequest {
         #[serde(default)]
         limit: usize,
     },
-    /// Lines `from..=to` (1-based, inclusive) of a pane's scrollback, control
-    /// sequences stripped — the range a ledger record or a search hit cites.
+    /// Lines `from..=to` (1-based, inclusive) or the trailing `last` lines of
+    /// a pane's scrollback, control sequences stripped — the range a ledger
+    /// record or search hit cites, or the tail an orchestrator reads.
     ScrollbackLines {
         pane_id: String,
+        #[serde(default)]
         from: usize,
+        #[serde(default)]
         to: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last: Option<usize>,
     },
     UpdateWorkspaceLayout {
         layout: Value,
@@ -1640,6 +1658,7 @@ enum WaitCondition {
     Regex(String),
     Idle(u64),
     Exit,
+    Attention(Vec<AgentAttention>),
 }
 
 /// Poll cadence for a blocking `wait`. The handler re-checks its condition this often,
@@ -2057,6 +2076,7 @@ struct PaneLiveness {
     command: Option<String>,
     cwd: Option<String>,
     exit_code: Option<i32>,
+    exit_signal: Option<String>,
     /// The shell pane's child pid, so the official agent probe can map a
     /// `claude agents --json` session to its pane through the process tree
     /// (M3b). `None` for agent panes and restored-not-yet-spawned panes.
@@ -2072,25 +2092,39 @@ struct PaneMeta {
     exit_code: Option<i32>,
 }
 
-/// Derive the reported exit code from a reaped child's `ExitStatus`.
+/// Derive `(exit_code, signal)` from a reaped child's `ExitStatus`.
 ///
 /// portable-pty 0.8's `ExitStatus` forces the numeric code to 1 for a signal death
 /// and exposes the signal only through its `Display` ("Terminated by <name>") — it
-/// has no public signal accessor — so a signal-terminated child is reported with a
-/// `None` (documented) exit code rather than a misleading `1` that would collide
-/// with a genuine `exit 1`. A normal exit yields its real code (0, 7, 42, …).
-fn reaped_exit_code(status: &ExitStatus) -> Option<i32> {
+/// has no public signal accessor — so a signal-terminated child is reported with
+/// `(None, Some(signal))` rather than a misleading `1` that would collide with a
+/// genuine `exit 1`. A normal exit yields `(Some(code), None)`.
+fn reaped_exit_outcome(status: &ExitStatus) -> (Option<i32>, Option<String>) {
     if status.success() {
-        return Some(0);
+        return (Some(0), None);
     }
-    if status.to_string().starts_with("Terminated by") {
-        None
+    let display = status.to_string();
+    if let Some(sig) = display.strip_prefix("Terminated by ") {
+        let sig = sig.trim();
+        let name = if sig.is_empty() { "signal" } else { sig };
+        (None, Some(name.to_string()))
+    } else if display.starts_with("Terminated by") {
+        (None, Some("signal".to_string()))
     } else {
-        Some(status.exit_code() as i32)
+        (Some(status.exit_code() as i32), None)
     }
 }
 
-/// Sink for OSC window-title sequences. vt100 0.16 reports the title via the
+#[cfg(test)]
+fn reaped_exit_code(status: &ExitStatus) -> Option<i32> {
+    reaped_exit_outcome(status).0
+}
+
+fn non_zero_dim(n: u16) -> std::num::NonZeroU16 {
+    std::num::NonZeroU16::new(n.max(1)).expect("max(1) is non-zero")
+}
+
+/// Sink for OSC window-title sequences. vt100 reports the title via the
 /// `Callbacks` trait (there is no `Screen::title()` getter), so the model owns this
 /// sink and reads the latest title from it. OSC 0 and OSC 2 both invoke
 /// `set_window_title`; OSC 1 (icon name) is intentionally ignored so the captured
@@ -2134,9 +2168,20 @@ struct PaneModel {
 impl PaneModel {
     fn new(cols: u16, rows: u16) -> Self {
         Self {
-            parser: vt100::Parser::new_with_callbacks(rows, cols, 0, TitleSink::default()),
+            parser: vt100::Parser::new_with_callbacks(
+                non_zero_dim(rows),
+                non_zero_dim(cols),
+                0,
+                TitleSink::default(),
+            ),
             revision: 0,
         }
+    }
+
+    /// Screen dimensions as `(rows, cols)` in `u16` (vt100 0.18 returns `NonZeroU16`).
+    fn screen_size(&self) -> (u16, u16) {
+        let (rows, cols) = self.parser.screen().size();
+        (rows.get(), cols.get())
     }
 
     /// Feed raw PTY bytes into the parser and bump the revision once. vt100 is robust
@@ -2150,7 +2195,9 @@ impl PaneModel {
     /// Resize the grid to `cols`x`rows`. The revision is deliberately NOT bumped
     /// (resize is not output) and never reset, so it stays monotonic across resize.
     fn set_size(&mut self, cols: u16, rows: u16) {
-        self.parser.screen_mut().set_size(rows, cols);
+        self.parser
+            .screen_mut()
+            .set_size(non_zero_dim(rows), non_zero_dim(cols));
     }
 
     /// Reset to a fresh screen (used when a pane is restarted in place). The
@@ -2158,7 +2205,12 @@ impl PaneModel {
     /// change, and without the bump revision N would map to two different screens
     /// across a restart — a revision-deduping client would never repaint (L10).
     fn reset(&mut self, cols: u16, rows: u16) {
-        self.parser = vt100::Parser::new_with_callbacks(rows, cols, 0, TitleSink::default());
+        self.parser = vt100::Parser::new_with_callbacks(
+            non_zero_dim(rows),
+            non_zero_dim(cols),
+            0,
+            TitleSink::default(),
+        );
         self.revision = self.revision.saturating_add(1);
     }
 }
@@ -3993,8 +4045,50 @@ impl DaemonServer {
                         .collect::<Vec<_>>(),
                 }))
             }
-            DaemonRequest::ScrollbackLines { pane_id, from, to } => {
+            DaemonRequest::ScrollbackLines {
+                pane_id,
+                from,
+                to,
+                last,
+            } => {
                 self.ensure_pane_exists(&pane_id)?;
+                if let Some(count) = last {
+                    if from != 0 || to != 0 {
+                        return Err(
+                            "scrollback_lines accepts either a line range or last, not both"
+                                .to_string(),
+                        );
+                    }
+                    if count == 0 {
+                        return Err("last must be at least 1".to_string());
+                    }
+                    if count > SCROLLBACK_LINES_MAX_PER_REQUEST {
+                        return Err(format!(
+                            "at most {SCROLLBACK_LINES_MAX_PER_REQUEST} lines per request"
+                        ));
+                    }
+                    let lines = scrollback_text_lines(&self.scrollback_dir, &pane_id);
+                    let total = lines.len();
+                    if total == 0 {
+                        return Ok(json!({
+                            "pane_id": pane_id,
+                            "total_lines": 0,
+                            "from": 0,
+                            "to": 0,
+                            "lines": Vec::<&str>::new(),
+                        }));
+                    }
+                    let start = total.saturating_sub(count) + 1;
+                    let slice: Vec<&str> =
+                        lines[start - 1..total].iter().map(String::as_str).collect();
+                    return Ok(json!({
+                        "pane_id": pane_id,
+                        "total_lines": total,
+                        "from": start,
+                        "to": total,
+                        "lines": slice,
+                    }));
+                }
                 if from == 0 || to < from {
                     return Err("line range must be 1-based with from <= to".to_string());
                 }
@@ -4323,14 +4417,20 @@ impl DaemonServer {
             ),
             _ => None,
         };
+        if let WaitCondition::Attention(states) = condition {
+            if states.is_empty() {
+                return Err("--attention requires at least one attention state".to_string());
+            }
+        }
         let needs_text = matches!(condition, WaitCondition::Text(_) | WaitCondition::Regex(_));
+        let needs_live_agent = matches!(condition, WaitCondition::Attention(_));
 
         // (T2) L6: an agent pane has no vt100 screen model, so --text/--regex
         // can never match — fail fast instead of silently timing out.
-        // --exit/--idle still apply (liveness/revision only).
+        // --exit/--idle/--attention apply across both shell and agent panes.
         if needs_text && self.lock_registry()?.pane_kind(pane_id) == Some(PaneKind::Agent) {
             return Err(format!(
-                "agent panes have no screen model; only --exit/--idle apply: {pane_id}"
+                "agent panes have no screen model; only --exit/--idle/--attention apply: {pane_id}"
             ));
         }
 
@@ -4395,7 +4495,7 @@ impl DaemonServer {
                             let revision = model.revision;
                             if needs_text {
                                 let key = {
-                                    let (rows, cols) = model.parser.screen().size();
+                                    let (rows, cols) = model.screen_size();
                                     (revision, rows, cols)
                                 };
                                 if text_cache_key != Some(key) {
@@ -4472,6 +4572,27 @@ impl DaemonServer {
                         return Ok(make_outcome(true, "exit", revision, exit_code));
                     }
                 }
+                WaitCondition::Attention(wanted) => {
+                    let current = self.router.agent_state(pane_id).attention.or_else(|| {
+                        #[cfg(any(unix, windows))]
+                        {
+                            self.lock_terminals()
+                                .ok()
+                                .and_then(|t| t.agent_session_attention(pane_id))
+                        }
+                        #[cfg(not(any(unix, windows)))]
+                        {
+                            None
+                        }
+                    });
+                    if let Some(att) = current {
+                        if wanted.contains(&att) {
+                            let mut out = make_outcome(true, "attention", revision, None);
+                            out["attention"] = json!(att);
+                            return Ok(out);
+                        }
+                    }
+                }
             }
 
             // The timeout bounds the wait and is a distinct result (VAL-PRIM-010/011/013).
@@ -4481,11 +4602,11 @@ impl DaemonServer {
                 }
             }
 
-            // A non-exit text/regex wait whose pane has died can never be satisfied by
-            // new output, so resolve it as an unmatched timeout instead of blocking
-            // forever (VAL-PRIM-049). `--idle` is excluded: a dead pane is quiet, so it
-            // resolves naturally as `idle` above.
-            if ended && needs_text {
+            // A non-exit text/regex/attention wait whose pane has died can never be
+            // satisfied by new output or attention transitions, so resolve it as an
+            // unmatched timeout instead of blocking forever (VAL-PRIM-049). `--idle` is
+            // excluded: a dead pane is quiet, so it resolves naturally as `idle` above.
+            if ended && (needs_text || needs_live_agent) {
                 return Ok(make_outcome(false, "timeout", revision, None));
             }
 
@@ -4513,8 +4634,8 @@ impl DaemonServer {
             let model = model
                 .lock()
                 .map_err(|_| format!("pane model lock poisoned: {pane_id}"))?;
+            let (rows, cols) = model.screen_size();
             let screen = model.parser.screen();
-            let (rows, cols) = screen.size();
             // `rows(0, cols)` yields one plain-text String per visible row (ANSI already
             // interpreted), so `lines.len() == rows` (VAL-PRIM-019/020).
             let lines: Vec<String> = screen.rows(0, cols).collect();
@@ -4620,7 +4741,7 @@ impl DaemonServer {
                     let model = model
                         .lock()
                         .map_err(|_| format!("pane model lock poisoned: {}", pane.id))?;
-                    let (rows, cols) = model.parser.screen().size();
+                    let (rows, cols) = model.screen_size();
                     let title = model.parser.callbacks().title.clone().unwrap_or_default();
                     (title, model.revision, cols, rows)
                 }

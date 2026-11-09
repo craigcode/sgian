@@ -678,11 +678,27 @@ fn grant_kill_terminates_running_pty_child_and_wakes_concurrent_grant_wait() {
         })
         .expect("grant_kill");
     assert_eq!(killed["killed"], json!(true));
+    assert_eq!(killed["descendants_reaped"], json!(true), "{killed}");
+    assert_eq!(killed["output_drained"], json!(true), "{killed}");
+    assert_eq!(killed["released"], json!(false), "{killed}");
+    // Strict XOR invariant (`exit_code.is_some() != signal.is_some()`): a
+    // signal-killed child reports `exit_code: null` and a non-empty `signal`.
+    assert_eq!(killed["exit_status"]["exit_code"], Value::Null, "{killed}");
+    assert!(
+        killed["exit_status"]["signal"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "expected signal name on killed grant: {killed}"
+    );
 
     let wait_resp = waiter.join().expect("waiter joined");
     assert!(wait_resp.ok, "{wait_resp:?}");
     assert_eq!(wait_resp.result["exited"], json!(true));
     assert_eq!(wait_resp.result["timed_out"], json!(false));
+    assert_eq!(wait_resp.result["exit_status"]["exit_code"], Value::Null);
+    assert!(wait_resp.result["exit_status"]["signal"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
 
     // Second `grant_kill` after exit is idempotent (`already_exited: true`).
     let killed_again: Value = client
@@ -691,11 +707,21 @@ fn grant_kill_terminates_running_pty_child_and_wakes_concurrent_grant_wait() {
         })
         .expect("idempotent grant_kill");
     assert_eq!(killed_again["already_exited"], json!(true));
+    assert_eq!(killed_again["descendants_reaped"], json!(true));
+    assert_eq!(killed_again["output_drained"], json!(true));
 
-    // Pane stays in registry after kill + release.
-    let _: Value = client
+    // Pane stays in registry after kill + release; CleanupReceipt carries
+    // `released: true`, `descendants_reaped: true`, `output_drained: true`.
+    let released: Value = client
         .request(DaemonRequest::GrantRelease { terminal_id: tid })
         .expect("release");
+    assert_eq!(released["released"], json!(true));
+    assert_eq!(released["descendants_reaped"], json!(true));
+    assert_eq!(released["output_drained"], json!(true));
+    assert_eq!(released["exit_status"]["exit_code"], Value::Null);
+    assert!(released["exit_status"]["signal"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
     let status: PaneStatus = client
         .request(DaemonRequest::PaneStatus { pane_id })
         .expect("pane status after kill+release");

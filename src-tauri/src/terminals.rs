@@ -292,6 +292,7 @@ impl TerminalStore {
                     command: None,
                     cwd: None,
                     exit_code: None,
+                    exit_signal: None,
                     pid: None,
                 });
             }
@@ -398,6 +399,7 @@ impl TerminalStore {
                     command: Some(command_str),
                     cwd: Some(cwd_str),
                     exit_code: None,
+                    exit_signal: None,
                     pid: child_pid,
                 },
             );
@@ -474,9 +476,9 @@ impl TerminalStore {
             // point, means the captured code and the single PaneEnded emission can
             // never race a second emitter (Invariant 1); `wait()` is authoritative,
             // and an errored wait falls back to a `None` code without double-emitting.
-            let exit_code = match child.wait() {
-                Ok(status) => reaped_exit_code(&status),
-                Err(_) => None,
+            let (exit_code, exit_signal) = match child.wait() {
+                Ok(status) => reaped_exit_outcome(&status),
+                Err(_) => (None, None),
             };
 
             // Only report the pane ended if this reader still owns the live session;
@@ -492,6 +494,7 @@ impl TerminalStore {
                         if entry.generation == generation && !entry.ended {
                             entry.ended = true;
                             entry.exit_code = exit_code;
+                            entry.exit_signal = exit_signal.clone();
                             true
                         } else {
                             false
@@ -506,7 +509,7 @@ impl TerminalStore {
                 output_router.clear_agent_attention(&output_pane_id);
                 output_router.emit_pane_ended(&output_pane_id, exit_code);
                 if let Some(grants) = &grant_store {
-                    grants.notify_pane_exit(&output_pane_id, generation, exit_code);
+                    grants.notify_pane_exit(&output_pane_id, generation, exit_code, exit_signal);
                 }
             }
         });
@@ -595,27 +598,27 @@ impl TerminalStore {
         true
     }
 
-    /// Snapshot `(ended, exit_code)` for `(pane_id, generation)` if that
-    /// generation is still the pane's current liveness entry, or `(true, None)`
-    /// if superseded/absent.
+    /// Snapshot `(ended, exit_code, exit_signal)` for `(pane_id, generation)`
+    /// if that generation is still the pane's current liveness entry, or
+    /// `(true, None, Some("superseded"))` if superseded/absent.
     pub(crate) fn generation_exit_snapshot(
         &self,
         pane_id: &str,
         generation: u64,
-    ) -> (bool, Option<i32>) {
+    ) -> (bool, Option<i32>, Option<String>) {
         self.liveness
             .lock()
             .ok()
             .and_then(|liveness| {
                 liveness.get(pane_id).map(|entry| {
                     if entry.generation == generation {
-                        (entry.ended, entry.exit_code)
+                        (entry.ended, entry.exit_code, entry.exit_signal.clone())
                     } else {
-                        (true, None)
+                        (true, None, Some("superseded".to_string()))
                     }
                 })
             })
-            .unwrap_or((true, None))
+            .unwrap_or((true, None, Some("superseded".to_string())))
     }
 
     /// Kill every live session's child directly. Daemon shutdown must not rely

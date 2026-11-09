@@ -2000,31 +2000,85 @@ pub(crate) struct LinesArgs {
     pub(crate) pane_ref: String,
     pub(crate) from: usize,
     pub(crate) to: usize,
+    pub(crate) last: Option<usize>,
 }
 
-/// `lines <PANE> <A>[:<B>]`.
+/// `lines <PANE> (<A>[:<B>] | (-n | --last) <N>)`.
 pub(crate) fn parse_lines_args(args: &[String]) -> Result<LinesArgs, String> {
-    let [pane_ref, range] = args else {
-        return Err("lines requires a pane and a line range A[:B]".to_string());
-    };
-    let (from, to) = match range.split_once(':') {
-        Some((a, b)) => (a, b),
-        None => (range.as_str(), range.as_str()),
-    };
-    let from: usize = from
-        .parse()
-        .map_err(|_| format!("invalid line number '{from}'"))?;
-    let to: usize = to
-        .parse()
-        .map_err(|_| format!("invalid line number '{to}'"))?;
-    if from == 0 || to < from {
-        return Err("line range must be 1-based with A <= B".to_string());
+    let mut pane_ref: Option<String> = None;
+    let mut range_raw: Option<String> = None;
+    let mut last: Option<usize> = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        match arg {
+            "-n" | "--last" => {
+                if last.is_some() {
+                    return Err("lines accepts at most one -n/--last count".to_string());
+                }
+                let raw = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("{arg} requires a positive line count"))?;
+                let count: usize = raw
+                    .parse()
+                    .map_err(|_| format!("invalid {arg} count '{raw}'"))?;
+                if count == 0 {
+                    return Err(format!("{arg} count must be at least 1"));
+                }
+                last = Some(count);
+                index += 2;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(format!("unexpected argument for lines: {other}"));
+            }
+            other => {
+                if pane_ref.is_none() {
+                    pane_ref = Some(other.to_string());
+                } else if range_raw.is_none() {
+                    range_raw = Some(other.to_string());
+                } else {
+                    return Err(format!("unexpected argument for lines: {other}"));
+                }
+                index += 1;
+            }
+        }
     }
-    Ok(LinesArgs {
-        pane_ref: pane_ref.clone(),
-        from,
-        to,
-    })
+
+    let pane_ref = pane_ref
+        .ok_or_else(|| "lines requires a pane and a line range A[:B] or -n N".to_string())?;
+    match (range_raw, last) {
+        (Some(_), Some(_)) => {
+            Err("lines accepts either a line range A[:B] or -n/--last N, not both".to_string())
+        }
+        (None, Some(count)) => Ok(LinesArgs {
+            pane_ref,
+            from: 0,
+            to: 0,
+            last: Some(count),
+        }),
+        (Some(range), None) => {
+            let (from, to) = match range.split_once(':') {
+                Some((a, b)) => (a, b),
+                None => (range.as_str(), range.as_str()),
+            };
+            let from: usize = from
+                .parse()
+                .map_err(|_| format!("invalid line number '{from}'"))?;
+            let to: usize = to
+                .parse()
+                .map_err(|_| format!("invalid line number '{to}'"))?;
+            if from == 0 || to < from {
+                return Err("line range must be 1-based with A <= B".to_string());
+            }
+            Ok(LinesArgs {
+                pane_ref,
+                from,
+                to,
+                last: None,
+            })
+        }
+        (None, None) => Err("lines requires a line range A[:B] or -n/--last N".to_string()),
+    }
 }
 
 pub(crate) fn control_lines(
@@ -2037,6 +2091,7 @@ pub(crate) fn control_lines(
         pane_id,
         from: parsed.from,
         to: parsed.to,
+        last: parsed.last,
     })?;
     if json_output {
         return write_json_stdout(&result);
@@ -3003,13 +3058,16 @@ pub(crate) fn control_grant(
             if json_output {
                 write_json_stdout(&outcome)?;
             } else if !timed_out {
-                let code = outcome["exit"]["exit_code"]
-                    .as_i64()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "-".to_string());
+                let status = if let Some(code) = outcome["exit"]["exit_code"].as_i64() {
+                    code.to_string()
+                } else if let Some(sig) = outcome["exit"]["signal"].as_str() {
+                    format!("signal:{sig}")
+                } else {
+                    "-".to_string()
+                };
                 writeln!(
                     stdout,
-                    "{}\t{code}",
+                    "{}\t{status}",
                     outcome["terminal_id"].as_str().unwrap_or("-")
                 )
                 .map_err(|error| format!("failed to write stdout: {error}"))?;
@@ -4223,7 +4281,7 @@ pub(crate) struct WaitArgs {
     pub(crate) timeout_ms: Option<u64>,
 }
 
-/// Parse `ctl wait <pane> (--text S | --regex RE | --idle MS | --exit) [--timeout MS]`.
+/// Parse `ctl wait <pane> (--text S | --regex RE | --idle MS | --exit | --attention STATES) [--timeout MS]`.
 /// Pure: no daemon client, no I/O. Enforces EXACTLY one condition (a missing or
 /// conflicting condition is a usage error, never an open-ended wait) and a numeric
 /// `--idle`/`--timeout` (VAL-PRIM-016 / VAL-PRIM-017).
@@ -4240,7 +4298,9 @@ pub(crate) fn parse_wait_args(args: &[String]) -> Result<WaitArgs, String> {
         cond: WaitCondition,
     ) -> Result<(), String> {
         if slot.is_some() {
-            return Err("wait accepts only one of --text/--regex/--idle/--exit".to_string());
+            return Err(
+                "wait accepts only one of --text/--regex/--idle/--exit/--attention".to_string(),
+            );
         }
         *slot = Some(cond);
         Ok(())
@@ -4270,7 +4330,7 @@ pub(crate) fn parse_wait_args(args: &[String]) -> Result<WaitArgs, String> {
                 literal = true;
                 index += 1;
             }
-            "--text" | "--regex" | "--idle" | "--timeout" => {
+            "--text" | "--regex" | "--idle" | "--timeout" | "--attention" => {
                 // A `--` in the value slot escapes the NEXT token as the value.
                 let value_index = if args.get(index + 1).map(String::as_str) == Some("--") {
                     index + 2
@@ -4290,6 +4350,28 @@ pub(crate) fn parse_wait_args(args: &[String]) -> Result<WaitArgs, String> {
                             format!("--idle requires a non-negative integer (ms), got {value:?}")
                         })?;
                         set_condition(&mut condition, WaitCondition::Idle(ms))?;
+                    }
+                    "--attention" => {
+                        let mut states: Vec<AgentAttention> = Vec::new();
+                        for part in value.split(',') {
+                            if part.trim().is_empty() {
+                                return Err(
+                                    "--attention requires comma-separated states (working,needs_input,idle)"
+                                        .to_string(),
+                                );
+                            }
+                            let att = AgentAttention::parse_name(part)?;
+                            if !states.contains(&att) {
+                                states.push(att);
+                            }
+                        }
+                        if states.is_empty() {
+                            return Err(
+                                "--attention requires at least one state (working,needs_input,idle)"
+                                    .to_string(),
+                            );
+                        }
+                        set_condition(&mut condition, WaitCondition::Attention(states))?;
                     }
                     "--timeout" => {
                         timeout_ms = Some(value.parse::<u64>().map_err(|_| {
@@ -4320,8 +4402,9 @@ pub(crate) fn parse_wait_args(args: &[String]) -> Result<WaitArgs, String> {
     }
 
     let pane_ref = pane_ref.ok_or_else(|| "wait requires a pane id".to_string())?;
-    let condition =
-        condition.ok_or_else(|| "wait requires one of --text/--regex/--idle/--exit".to_string())?;
+    let condition = condition.ok_or_else(|| {
+        "wait requires one of --text/--regex/--idle/--exit/--attention".to_string()
+    })?;
     Ok(WaitArgs {
         pane_ref,
         condition,
@@ -4386,6 +4469,10 @@ pub(crate) fn control_wait(
                 "exit" => match outcome.get("exit_code").and_then(Value::as_i64) {
                     Some(code) => format!("matched: exit (code {code})"),
                     None => "matched: exit".to_string(),
+                },
+                "attention" => match outcome.get("attention").and_then(Value::as_str) {
+                    Some(att) => format!("matched: attention ({att})"),
+                    None => "matched: attention".to_string(),
                 },
                 other => format!("matched: {other}"),
             }
@@ -5943,10 +6030,12 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                 Substring search over a pane's whole scrollback
                                   (control sequences stripped): `line<TAB>text`.
                                   -i ignores case; -n caps hits (default 100).
-  lines <PANE> <A>[:<B>]        Print scrollback lines A..B (1-based, inclusive):
-                                  the range a ledger record or search hit cites.
-                                  Numbers are relative to the current file; the
-                                  16 MiB cap drops the oldest half and renumbers.
+  lines <PANE> (<A>[:<B>] | -n N | --last N)
+                                Print scrollback lines A..B (1-based, inclusive) or
+                                  the trailing N lines (-n/--last N): the range a
+                                  ledger record or search hit cites, or the tail an
+                                  orchestrator reads. Numbers are relative to the
+                                  current file; the 16 MiB cap drops the oldest half.
   ledger [PANE] [-n N] [--verify]
                                 Print a pane's hash-chained lease ledger (JSONL).
                                   --verify walks the chain and names the first break.
@@ -5979,16 +6068,18 @@ Commands (PANE is a pane id or title; defaults to the active pane):
                                 With --panes A,B, run in only the named subset.
                                 Batched --json includes timed_out, elapsed_ms, tail, error.
                                 Aggregate exit is 0 only if every targeted pane succeeded.
-  wait <PANE> (--text S | --regex RE | --idle MS | --exit) [--timeout MS]
+  wait <PANE> (--text S | --regex RE | --idle MS | --exit | --attention STATES) [--timeout MS]
                                 Block until a pane satisfies a condition.
                                   --text S / --regex RE  match the visible screen
                                   --idle MS              no new output for MS ms
                                   --exit                 the pane's process ends
+                                  --attention STATES     comma-separated agent states
+                                                         (working,needs_input,idle)
                                   --timeout MS           bound the wait
                                   -- ends flag parsing (--text -- --help matches
                                   the literal text "--help")
                                 Exits 0 on match, non-zero on timeout; --json prints
-                                  {matched,reason,revision,exit_code?,elapsed_ms}.
+                                  {matched,reason,revision,attention?,exit_code?,elapsed_ms}.
   snapshot <PANE> [--json]      Read a pane's rendered visible screen.
                                 Default prints the screen (one line per visible row);
                                   --json prints the full struct (pane_id, cols, rows,

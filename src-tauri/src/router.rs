@@ -115,8 +115,8 @@ pub(crate) fn classify_agent_attention(text: &str) -> AgentAttention {
 /// (T1) The pane's visible screen as newline-joined rows — the same
 /// rows-concatenation the wait/snapshot path renders from the vt100 model.
 pub(crate) fn model_screen_text(model: &PaneModel) -> String {
+    let cols = model.screen_size().1;
     let screen = model.parser.screen();
-    let cols = screen.size().1;
     screen.rows(0, cols).collect::<Vec<String>>().join("\n")
 }
 
