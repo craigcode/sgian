@@ -1377,6 +1377,8 @@ fn native_ipc_discovery_exposes_location_but_never_token() {
         data_dir: data_dir.clone(),
         token: "super-secret-token".to_string(),
         auto_spawn: false,
+        client_token: None,
+        tcp_endpoint: None,
     };
 
     let info = native_ipc_endpoint(&client).expect("discovery metadata");

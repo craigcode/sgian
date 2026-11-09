@@ -1,6 +1,6 @@
 # Agent-to-agent steering and saved remote workspaces (`machines`)
 
-**Status:** Design accepted; `ctl` steering primitives (`ctl lines --last`, `ctl wait --attention`) and `CleanupReceipt` alignment shipped; saved remote workspaces (`machines`, #114) and Windows remote attach (#116) follow directly on this contract.
+**Status:** Shipped (`ctl` steering primitives and `CleanupReceipt` alignment in #117; saved remote workspaces `machines` in #114; Windows loopback remote target in #116; AWS Session Manager transport tracked in #115).
 
 ## 1. Problem
 
@@ -93,7 +93,7 @@ Validation rules:
 - `name`: `1..=64` ASCII `[A-Za-z0-9._-]`, must not start with `-` or `.`, and must not equal `"local"` (reserved for the local workspace). Names are unique across `machines`.
 - `transport`: `"ssh"` (default) or `"ssm"` (reserved for AWS Session Manager targets in #115; `target` carries the instance/task identifier when `transport == "ssm"`).
 - `host` / `workspace` / `target`: non-empty bounded strings that must never start with `-` (preventing SSH/CLI option injection even before `--` argument delimiters).
-- Credentials are **never** stored inline in `config.json`. `ctl` stores per-machine `client_token` secrets in owner-only (`0600`) files under `<app_support_dir>/machines/<name>.token` (or explicit `token_file`), while the native macOS and Windows clients store them in the macOS Keychain (`com.sgian.client-token`, account `machine:<name>`) and Windows Credential Vault / DPAPI (`Sgian/machine/<name>`), falling back to the `0600` token file when present so `ctl machine add` works immediately in both CLI and GUI.
+- Credentials are **never** stored inline in `config.json`. `ctl` stores per-machine `client_token` secrets in owner-only (`0600`) files under `<app_support_dir>/machines/<name>.token` (or explicit `token_file`), while the native macOS and Windows clients store them in the macOS Keychain (`com.sgian.client-token`, account `machine:<name>`) and Windows Credential Vault (`SgianClientToken`, account `machine:<name>`), falling back to the `0600` token file when present so `ctl machine add` works immediately in both CLI and GUI.
 
 ### 3.2 Pane addressing in `sgian ctl`
 
@@ -114,11 +114,11 @@ Management verbs:
 
 Sgian's remote daemon remains unchanged on Unix: it listens only on its local `0700` Unix domain socket. On Windows (#116), where OpenSSH cannot forward named pipes (`\\.\pipe\...`), the remote daemon can opt into a loopback-only TCP listener (`127.0.0.1:<remote_loopback_port>`) that **strictly requires** a per-client `client_token` (`ClientIdentity`) on handshake (refusing bare workspace-token auth because loopback TCP carries no kernel peer-UID/SID guarantee).
 
-To avoid duplicating SSH process management across Rust, Swift, and C#, `sgian ctl --machine <name> --json ipc-endpoint` owns tunnel establishment and prints a standard `NativeIpcEndpoint` pointing at a local Unix domain socket (`<runtime_dir>/machines/<name>/daemon.sock`, `0700` directory, supported natively on macOS, Linux, and Windows 10/11 `AF_UNIX`):
+To avoid duplicating SSH process management across Rust, Swift, and C#, `sgian ctl --machine <name> --json ipc-endpoint` owns tunnel establishment and prints a standard `NativeIpcEndpoint` pointing at a local Unix domain socket (`<runtime_dir>/machines/<name>/daemon.sock`, `0700` directory, supported natively on macOS, Linux, and Windows 10/11 `AF_UNIX`), or `127.0.0.1:<local_port>` (`transport: "tcp_loopback"`) when a Windows client forwards a remote `loopback_port`:
 
-1. Acquire an advisory lock (`<runtime_dir>/machines/<name>/tunnel.lock`) so concurrent `ctl` or GUI calls do not race two tunnels.
-2. If `daemon.sock` already exists and passes an authenticated `Ping` handshake with the machine's credential, reuse it immediately.
+1. Acquire an exclusive lock (`<runtime_dir>/machines/<name>/tunnel.lock`) so concurrent `ctl` or GUI calls do not race two tunnels.
+2. If `daemon.sock` (or the recorded `tunnel.port` on Windows) already exists and passes an authenticated `Ping` handshake with the machine's credential, reuse it immediately.
 3. Otherwise, run `ssh -o BatchMode=yes [-p PORT] -- <HOST> sgian ctl --workspace <WORKSPACE> --json ipc-endpoint` to discover the remote daemon's Unix `endpoint` (or `loopback_port` on Windows) without copying `daemon.token` over the wire.
-4. Remove any stale local `daemon.sock`, spawn a detached `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StreamLocalBindUnlink=yes -L <local_sock>:<remote_target> [-p PORT] -- <HOST>`, record its PID in `tunnel.pid`, verify the local socket with an authenticated handshake, and return the local `NativeIpcEndpoint`.
+4. Remove any stale local `daemon.sock`, spawn a detached `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StreamLocalBindUnlink=yes -L <local_bind>:<remote_target> [-p PORT] -- <HOST>`, record its PID in `tunnel.pid` (and local port in `tunnel.port` when applicable), verify the tunnel with an authenticated handshake, and return the local `NativeIpcEndpoint`.
 
 Both `apps/macos` and `apps/windows` call `sgian ctl --machine <name> --json ipc-endpoint` just as they call `sgian ctl --workspace <path> --json ipc-endpoint` today, keeping background `Subscribe` streams open per configured machine so sidebar badges (`needs_input`, `working`, `lease_state`, `output_warning`) stay live across local and remote workspaces simultaneously.

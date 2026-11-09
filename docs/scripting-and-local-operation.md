@@ -170,16 +170,73 @@ what crosses a network:
    - Sgian's local IPC boundary does not keep an agent CLI's prompts or tool
      outputs from leaving the machine to its configured model provider.
 
-4. **Optional remote access (`ssh -L` only).**
-   - Remote `ctl` or desktop access forwards the Unix socket over SSH and
-     presents a scoped per-client credential (`SGIAN_CLIENT_TOKEN`, issued via
-     `ctl identity issue --holder NAME --scope read|write`).
-   - `sgian ctl serve` binds **only** to `127.0.0.1` (default port `8321`),
-     requires a per-run random session key exchanged into an `HttpOnly;
-     SameSite=Strict` cookie (so other local OS accounts on a shared host cannot
-     read the loopback port), validates `Host`/`Origin`, caps open connections,
-     and is read-only unless `--allow-write` is passed on the host. Reach it
-     from a phone or laptop exclusively over `ssh -N -L 8321:127.0.0.1:8321`.
+4. **Optional remote access (`ssh -L` and saved `machines`).**
+   - Remote `ctl` or desktop access forwards the remote daemon's IPC endpoint
+     over SSH (`ssh -N -L`) and authenticates with a scoped per-client
+     credential (`SGIAN_CLIENT_TOKEN`, Keychain/PasswordVault, or a `0600`
+     per-machine token file issued via `ctl identity issue --holder NAME --scope
+     read|write`).
+   - **Saved remote workspaces (`machines`, #114):** Register remote hosts once
+     in user-global `config.json` with `ctl machine add|list|remove` and target
+     them from any directory via `--machine <name>` (`-m <name>` before the
+     subcommand), `SGIAN_MACHINE`, or `<machine>/<pane>` shorthand:
+
+     ```bash
+     # 1. On the remote host, issue a scoped client credential:
+     sgian ctl --workspace /srv/repo identity issue --holder laptop-op --scope read --scope write
+
+     # 2. On the local workstation, save the machine and store the token (0600):
+     printf '%s\n' "$REMOTE_TOKEN" | sgian ctl machine add devbox \
+       --host ubuntu@10.0.1.5 \
+       --workspace /srv/repo \
+       --token-stdin
+
+     # 3. Target panes directly — Sgian discovers the remote endpoint and owns
+     #    the local ssh -N -L tunnel under runtime/machines/<name>/:
+     sgian ctl --machine devbox panes
+     sgian ctl wait devbox/pane-2 --attention needs_input,idle
+     sgian ctl lines devbox/pane-2 -n 60
+     ```
+
+     Native macOS and Windows desktop clients read the same global `machines`
+     list, display saved machines in the sidebar and command palette, and attach
+     through `sgian ctl --machine <name> --json ipc-endpoint`.
+   - **Windows daemon as a remote target (#116):** Windows named pipes cannot be
+     forwarded directly by OpenSSH `-L`. Setting `"remote_loopback_port": 0` (for
+     an OS-assigned ephemeral port recorded in `daemon.loopback_port`) or an
+     explicit port `1..=65535` in the Windows workspace or global `config.json`
+     (or starting the daemon with `--listen-loopback <PORT>`) binds a second IPC
+     listener strictly on `127.0.0.1:<port>` alongside the local named pipe.
+     `ctl --json ipc-endpoint` surfaces `"loopback_port"`, which `machines`
+     forwards over `ssh -N -L` automatically. Because loopback TCP lacks kernel
+     peer-UID/SID identity, every connection on `127.0.0.1:<port>` **strictly
+     requires** a valid per-client `client_token` (`daemon.token` alone is
+     rejected).
+   - **Headless Windows daemon operation (Task Scheduler / S4U):**
+     - Standard SSH sessions or Task Scheduler tasks configured with **"Run
+       whether user is logged on or not"** (S4U / non-interactive logon) run
+       outside the interactive desktop (`Session 0`). Windows `ConPTY`
+       (`CreatePseudoConsole`) works headlessly in `Session 0` on Windows 10
+       1809+ / Windows 11 / Server 2019+, so shell panes, `ctl run`, and CLI
+       agents operate without an interactive GUI logon.
+     - Register a startup task for persistent headless operation:
+       `schtasks /Create /TN "SgianDaemon-Repo" /SC ONSTART /RU "<DOMAIN\User>" /RP * /RL LIMITED /TR "\"C:\Program Files\Sgian\sgian.exe\" --daemon --cwd \"C:\Users\User\repo\" --listen-loopback 0"`
+       (or use S4U `"Do not store password"` when network share / DPAPI user-key
+       decryption is not needed).
+     - **Session 0 caveats:** Interactive GUI credential prompts (Git Credential
+       Manager modal windows, browser-based OAuth login flows) cannot render in
+       `Session 0`. Pre-authenticate agent CLIs (`ANTHROPIC_API_KEY` or stored
+       non-GUI credentials), configure non-interactive Git credentials (SSH keys
+       via the Windows `ssh-agent` service or PATs in a file/credential store
+       compatible with your logon type), and avoid S4U passwordless tasks if a
+       tool relies on user-DPAPI secrets that require a full password logon.
+   - **Loopback web view (`sgian ctl serve`):** Binds **only** to `127.0.0.1`
+     (default port `8321`), requires a per-run random session key exchanged into
+     an `HttpOnly; SameSite=Strict` cookie (so other local OS accounts on a
+     shared host cannot read the loopback port), validates `Host`/`Origin`, caps
+     open connections, and is read-only unless `--allow-write` is passed on the
+     host. Reach it from a phone or laptop exclusively over
+     `ssh -N -L 8321:127.0.0.1:8321`.
 
 ## 3. Agent backend adapter contract
 

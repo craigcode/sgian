@@ -36,6 +36,7 @@ const CTL_ARG: &str = "ctl";
 const WORKSPACE_ARG: &str = "--workspace";
 const SOCKET_ARG: &str = "--socket";
 const DATA_DIR_ARG: &str = "--data-dir";
+const LISTEN_LOOPBACK_ARG: &str = "--listen-loopback";
 const APP_SUPPORT_DIR: &str = "Sgian";
 /// Existing installations keep using their original data root when the new
 /// root does not yet exist. Besides preserving workspaces/config, this keeps
@@ -54,6 +55,7 @@ const CONFIG_FILE: &str = "config.json";
 const SCROLLBACK_DIR: &str = "scrollback";
 const RUNTIME_DIR: &str = "runtime";
 const SOCKET_FILE: &str = "daemon.sock";
+const LOOPBACK_PORT_FILE: &str = "daemon.loopback_port";
 const TOKEN_FILE: &str = "daemon.token";
 /// Per-client credentials (docs/design/client-identity.md): beside the
 /// workspace token, owner-only, token hashes only.
@@ -663,6 +665,16 @@ struct Config {
     /// global list when non-empty.
     #[serde(default)]
     profiles: Vec<PaneProfile>,
+    /// Opt-in loopback TCP IPC listener port (`127.0.0.1:<port>`, or `0` for an
+    /// OS-assigned ephemeral port recorded in `daemon.loopback_port`) used when a
+    /// Windows daemon acts as a remote SSH target (#116). Every loopback TCP
+    /// connection strictly requires a per-client `client_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_loopback_port: Option<u16>,
+    /// Saved remote workspaces (`ctl --machine <name>`, #114), stored in the
+    /// user's global `config.json`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) machines: Vec<MachineEntry>,
 }
 
 /// A named creation preset for shell or agent panes (ENHANCEMENTS §4).
@@ -740,6 +752,12 @@ impl Config {
                 self.profiles
             } else {
                 other.profiles
+            },
+            remote_loopback_port: other.remote_loopback_port.or(self.remote_loopback_port),
+            machines: if other.machines.is_empty() {
+                self.machines
+            } else {
+                other.machines
             },
         }
     }
@@ -917,6 +935,7 @@ impl Config {
                 ));
             }
         }
+        validate_machines(&self.machines)?;
         Ok(())
     }
 
@@ -948,6 +967,7 @@ impl Config {
             "agent_claude_bin": self.agent_claude_bin,
             "agent_droid_bin": self.agent_droid_bin,
             "profiles": self.profiles,
+            "remote_loopback_port": self.remote_loopback_port,
         })
     }
 
@@ -1020,6 +1040,7 @@ impl Config {
             "agent_claude_bin": self.agent_claude_bin,
             "agent_droid_bin": self.agent_droid_bin,
             "profiles": profiles,
+            "remote_loopback_port": self.remote_loopback_port,
         })
     }
 
@@ -5400,7 +5421,11 @@ impl DaemonServer {
     /// a valid workspace token: the client chose to be held to it); with no
     /// credential the workspace token is the root credential; else refused.
     /// The generic error never says which check failed (VAL-SEC-009).
-    fn authenticate(&self, hello: &IpcHello) -> Result<(u16, ClientIdentity), String> {
+    fn authenticate(
+        &self,
+        hello: &IpcHello,
+        require_client_token: bool,
+    ) -> Result<(u16, ClientIdentity), String> {
         if hello.frame_type != "hello" {
             return Err("first daemon frame must be hello".to_string());
         }
@@ -5410,6 +5435,12 @@ impl DaemonServer {
                 Some(identity) => Ok((negotiate_wire_version(hello.max_wire_version), identity)),
                 None => Err("daemon authentication failed".to_string()),
             };
+        }
+        if require_client_token {
+            return Err(
+                "loopback TCP connections require a per-client credential (client_token)"
+                    .to_string(),
+            );
         }
         if !constant_time_eq(&hello.token, &self.token) {
             return Err("daemon authentication failed".to_string());
@@ -6702,6 +6733,8 @@ mod serve;
 use serve::*;
 mod daemon_client;
 use daemon_client::*;
+mod machines;
+use machines::*;
 mod ctl;
 use ctl::*;
 mod serve_http;

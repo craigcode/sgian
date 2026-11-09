@@ -13,7 +13,8 @@ use std::os::unix::net::UnixStream;
 pub(crate) fn test_transport_pair() -> std::io::Result<(TransportStream, TransportStream)> {
     #[cfg(unix)]
     {
-        return UnixStream::pair();
+        let (left, right) = UnixStream::pair()?;
+        return Ok((TransportStream::Local(left), TransportStream::Local(right)));
     }
     #[cfg(windows)]
     {
@@ -241,3 +242,6 @@ pub(crate) use notes::*;
 mod grants;
 #[allow(unused_imports)]
 pub(crate) use grants::*;
+mod machines;
+#[allow(unused_imports)]
+pub(crate) use machines::*;

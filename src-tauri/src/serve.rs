@@ -28,8 +28,15 @@ pub(crate) fn run_daemon_from_args(args: &[String]) -> Result<(), String> {
     let data_dir = arg_value(args, DATA_DIR_ARG)
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_data_dir_for(&workspace, &workspace_key(&workspace)));
+    let loopback_override = match arg_value(args, LISTEN_LOOPBACK_ARG) {
+        Some(raw) => Some(
+            raw.parse::<u16>()
+                .map_err(|_| format!("invalid {LISTEN_LOOPBACK_ARG} port '{raw}'"))?,
+        ),
+        None => None,
+    };
 
-    run_daemon(workspace, socket_path, data_dir)
+    run_daemon_with_loopback_override(workspace, socket_path, data_dir, loopback_override)
 }
 
 /// Keep the background daemon out of a transient console on Windows. This is
@@ -365,12 +372,22 @@ pub(crate) fn classify_accept_error(error: &std::io::Error) -> AcceptErrorClass 
     }
 }
 
+#[cfg(test)]
 pub(crate) fn run_daemon(
     cwd: PathBuf,
     socket_path: PathBuf,
     data_dir: PathBuf,
 ) -> Result<(), String> {
-    let (config, config_warnings) = load_config(&data_dir);
+    run_daemon_with_loopback_override(cwd, socket_path, data_dir, None)
+}
+
+pub(crate) fn run_daemon_with_loopback_override(
+    cwd: PathBuf,
+    socket_path: PathBuf,
+    data_dir: PathBuf,
+    loopback_override: Option<u16>,
+) -> Result<(), String> {
+    let (mut config, config_warnings) = load_config(&data_dir);
     // There is no previous safe policy at startup. Ignoring a broken layer
     // could discard scrub_env or inherit a more permissive agent mode.
     if !config_warnings.is_empty() {
@@ -378,6 +395,9 @@ pub(crate) fn run_daemon(
             "refusing to start with invalid configuration: {}",
             config_warnings.join("; ")
         ));
+    }
+    if let Some(port) = loopback_override {
+        config.remote_loopback_port = Some(port);
     }
     run_daemon_with_config_and_warnings(cwd, socket_path, data_dir, config, config_warnings)
 }
@@ -550,6 +570,40 @@ pub(crate) fn run_daemon_with_config_and_warnings(
         .set_nonblocking(true)
         .map_err(|error| format!("failed to configure daemon listener: {error}"))?;
     set_private_file_permissions(&socket_path)?;
+
+    let loopback_port_path = socket_path.parent().map(|p| p.join(LOOPBACK_PORT_FILE));
+    if let Some(ref port_path) = loopback_port_path {
+        let _ = fs::remove_file(port_path);
+    }
+    let tcp_listener = if let Some(requested_port) = config.remote_loopback_port {
+        let bound =
+            std::net::TcpListener::bind(("127.0.0.1", requested_port)).map_err(|error| {
+                format!(
+                "failed to bind remote loopback IPC listener on 127.0.0.1:{requested_port}: {error}"
+            )
+            })?;
+        bound
+            .set_nonblocking(true)
+            .map_err(|error| format!("failed to configure remote loopback listener: {error}"))?;
+        let actual_port = bound
+            .local_addr()
+            .map_err(|error| format!("failed to query remote loopback listener port: {error}"))?
+            .port();
+        if let Some(ref port_path) = loopback_port_path {
+            let temp_path = port_path.with_extension("loopback_port.tmp");
+            write_file_atomic(
+                &temp_path,
+                port_path,
+                format!("{actual_port}\n").as_bytes(),
+                false,
+            )?;
+            let _ = set_private_file_permissions(port_path);
+        }
+        Some((bound, actual_port))
+    } else {
+        None
+    };
+
     let server = Arc::new(DaemonServer::with_config(
         cwd.clone(),
         data_dir.clone(),
@@ -604,6 +658,14 @@ pub(crate) fn run_daemon_with_config_and_warnings(
         cwd = %cwd.display(),
         "daemon started"
     );
+    if let Some((_, bound_port)) = &tcp_listener {
+        tracing::info!(
+            workspace_key = %server.workspace_key,
+            event = "daemon_loopback_bound",
+            loopback_port = *bound_port,
+            "remote loopback IPC listener bound on 127.0.0.1"
+        );
+    }
 
     // Surface config-load warnings from startup (malformed global/workspace
     // config.json). The daemon runs with that layer treated as absent, but the
@@ -701,6 +763,55 @@ pub(crate) fn run_daemon_with_config_and_warnings(
     let (config_notify_tx, config_notify_rx) = channel::<()>();
     let _config_watcher = setup_config_watcher(&data_dir, config_notify_tx);
 
+    let spawn_accepted_connection = |stream: TransportStream| {
+        // Concurrency cap (L18): refuse connections beyond the bound
+        // instead of pinning an unbounded number of threads.
+        let active_count = active_connections.load(Ordering::SeqCst);
+        let subscriber_count = server.router.subscriber_count();
+        if active_count >= MAX_CONCURRENT_CONNECTIONS
+            || live_transport_limit_reached(active_count, subscriber_count)
+        {
+            tracing::warn!(
+                workspace_key = %server.workspace_key,
+                event = "connection_limit",
+                active_connections = active_count,
+                subscribers = subscriber_count,
+                active_limit = MAX_CONCURRENT_CONNECTIONS,
+                live_transport_limit = MAX_LIVE_TRANSPORTS,
+                "connection limit reached; dropping new connection"
+            );
+            drop(stream);
+            return;
+        }
+        let _ = stream.set_nonblocking(false);
+        let server = Arc::clone(&server);
+        active_connections.fetch_add(1, Ordering::SeqCst);
+        let guard = ConnectionGuard(Arc::clone(&active_connections));
+        // (M8) std::thread::spawn PANICS on OS thread-creation failure,
+        // which would unwind and kill the accept loop; Builder::spawn
+        // returns the error instead. On failure the closure drops here,
+        // closing the stream and freeing the connection slot.
+        let client_workspace_key = server.workspace_key.clone();
+        if let Err(error) = std::thread::Builder::new().spawn(move || {
+            let _guard = guard;
+            if let Err(error) = handle_daemon_client(Arc::clone(&server), stream) {
+                tracing::warn!(
+                    workspace_key = %server.workspace_key,
+                    event = "client_error",
+                    error = %error,
+                    "client connection ended with an error"
+                );
+            }
+        }) {
+            tracing::error!(
+                workspace_key = %client_workspace_key,
+                event = "connection_thread_spawn_failed",
+                error = %error,
+                "failed to spawn connection thread; dropping connection"
+            );
+        }
+    };
+
     while !server.should_shutdown() && !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
         // Flush lazily-persisted state (resize/focus churn) at most once per interval
         // instead of fsyncing workspace.json on every such request.
@@ -720,17 +831,20 @@ pub(crate) fn run_daemon_with_config_and_warnings(
             last_lazy_flush = Instant::now();
         }
 
+        let mut accepted_any = false;
+
         match listener.accept() {
             Ok((stream, _address)) => {
                 idle_since = None;
+                accepted_any = true;
                 // (M6) Same-user boundary made explicit: a peer running as
                 // another uid is dropped before the hello (Unix only; Windows
                 // pipes are owner-restricted at creation).
                 #[cfg(unix)]
-                {
+                let peer_allowed = {
                     // SAFETY: getuid has no preconditions and cannot fail.
                     let own = unsafe { libc::getuid() };
-                    match peer_uid(&stream) {
+                    match stream.local_unix_stream().and_then(peer_uid) {
                         Some(uid) if uid != own => {
                             tracing::warn!(
                                 workspace_key = %server.workspace_key,
@@ -738,8 +852,7 @@ pub(crate) fn run_daemon_with_config_and_warnings(
                                 peer_uid = uid,
                                 "dropping connection from another user"
                             );
-                            drop(stream);
-                            continue;
+                            false
                         }
                         // Where the platform can answer, an unanswered
                         // question is a refusal, not a pass (S7).
@@ -749,123 +862,27 @@ pub(crate) fn run_daemon_with_config_and_warnings(
                                 event = "peer_uid_unreadable",
                                 "dropping connection whose peer uid could not be read"
                             );
-                            drop(stream);
-                            continue;
+                            false
                         }
-                        _ => {}
+                        _ => true,
                     }
-                }
-                // Concurrency cap (L18): refuse connections beyond the bound
-                // instead of pinning an unbounded number of threads.
-                let active_count = active_connections.load(Ordering::SeqCst);
-                let subscriber_count = server.router.subscriber_count();
-                if active_count >= MAX_CONCURRENT_CONNECTIONS
-                    || live_transport_limit_reached(active_count, subscriber_count)
-                {
-                    tracing::warn!(
-                        workspace_key = %server.workspace_key,
-                        event = "connection_limit",
-                        active_connections = active_count,
-                        subscribers = subscriber_count,
-                        active_limit = MAX_CONCURRENT_CONNECTIONS,
-                        live_transport_limit = MAX_LIVE_TRANSPORTS,
-                        "connection limit reached; dropping new connection"
-                    );
+                };
+                #[cfg(not(unix))]
+                let peer_allowed = true;
+
+                if peer_allowed {
+                    spawn_accepted_connection(stream);
+                } else {
                     drop(stream);
-                    continue;
-                }
-                let _ = stream.set_nonblocking(false);
-                let server = Arc::clone(&server);
-                active_connections.fetch_add(1, Ordering::SeqCst);
-                let guard = ConnectionGuard(Arc::clone(&active_connections));
-                // (M8) std::thread::spawn PANICS on OS thread-creation failure,
-                // which would unwind and kill the accept loop; Builder::spawn
-                // returns the error instead. On failure the closure drops here,
-                // closing the stream and freeing the connection slot.
-                let client_workspace_key = server.workspace_key.clone();
-                if let Err(error) = std::thread::Builder::new().spawn(move || {
-                    let _guard = guard;
-                    if let Err(error) = handle_daemon_client(Arc::clone(&server), stream) {
-                        tracing::warn!(
-                            workspace_key = %server.workspace_key,
-                            event = "client_error",
-                            error = %error,
-                            "client connection ended with an error"
-                        );
-                    }
-                }) {
-                    tracing::error!(
-                        workspace_key = %client_workspace_key,
-                        event = "connection_thread_spawn_failed",
-                        error = %error,
-                        "failed to spawn connection thread; dropping connection"
-                    );
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                // Poll for config file-watch events. On change, reload config
-                // into mutable shared state and broadcast ConfigChanged.
-                // Debounce: drain additional events (write_file_atomic's
-                // temp→rename may fire multiple events in quick succession).
-                if config_notify_rx.try_recv().is_ok() {
-                    while config_notify_rx.try_recv().is_ok() {}
-                    server.reload_config();
-                }
-                // Shared context notes edited outside the daemon.
-                server.drain_notes_changes();
-
-                // Prune old closed-pane suppression entries (L13).
-                if last_closed_sweep.elapsed() >= CLOSED_SWEEP_INTERVAL {
-                    server.router.sweep_closed(CLOSED_PANE_RETENTION);
-                    // (review-low) Prune scrollback orphans on the same cadence,
-                    // not just at startup: a reader racing ClosePane (preempted
-                    // between the is_closed check and the append) can re-create
-                    // a closed pane's deleted file and a cached append handle,
-                    // which would otherwise linger until daemon restart.
-                    if let Ok(registry) = server.lock_registry() {
-                        let live_pane_ids: HashSet<String> =
-                            registry.panes.iter().map(|pane| pane.id.clone()).collect();
-                        drop(registry);
-                        prune_orphan_scrollback(&server.scrollback_dir, &live_pane_ids, false);
-                        // (T2) M3: keep the agent-log sweep consistent with it.
-                        prune_orphan_agent_logs(&server.agents_dir, &live_pane_ids);
-                        server.router.prune_orphan_append_handles(&live_pane_ids);
-                    }
-                    last_closed_sweep = Instant::now();
-                }
-
-                // Optional idle shutdown: reap the daemon (and its shells) after no client
-                // has been connected for idle_limit seconds. Disabled when idle_limit == 0.
-                // Read from the live config each tick so a file-watch reload takes
-                // effect immediately (M4) instead of being frozen at startup.
-                // "No client" means no subscriber AND no active connection thread:
-                // a blocked `ctl wait` or an idle persistent v2 connection is a
-                // live client and must hold the daemon open (M7).
-                let idle_limit = server.effective_config().idle_shutdown_secs_effective();
-                if idle_limit > 0 {
-                    if server.router.subscriber_count() == 0
-                        && active_connections.load(Ordering::SeqCst) == 0
-                    {
-                        let since = *idle_since.get_or_insert_with(Instant::now);
-                        if since.elapsed() >= Duration::from_secs(idle_limit) {
-                            tracing::info!(
-                                workspace_key = %server.workspace_key,
-                                event = "idle_shutdown",
-                                "daemon idle-timeout shutdown"
-                            );
-                            break;
-                        }
-                    } else {
-                        idle_since = None;
-                    }
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => match classify_accept_error(&error) {
                 // (M8) Per-accept errors must not kill the daemon and every
                 // shell it owns: a peer that aborted before accept or an
                 // interrupted syscall is logged and skipped.
                 AcceptErrorClass::Transient => {
+                    accepted_any = true;
                     tracing::warn!(
                         workspace_key = %server.workspace_key,
                         event = "accept_error",
@@ -876,6 +893,7 @@ pub(crate) fn run_daemon_with_config_and_warnings(
                 // fd/memory pressure: back off briefly so a hot error loop
                 // can't spin at 100% CPU while the pressure persists.
                 AcceptErrorClass::ResourcePressure => {
+                    accepted_any = true;
                     tracing::warn!(
                         workspace_key = %server.workspace_key,
                         event = "accept_error",
@@ -893,6 +911,9 @@ pub(crate) fn run_daemon_with_config_and_warnings(
                     );
                     // This early exit skips the post-loop teardown: flush persisted
                     // state and kill the shells directly (see the post-loop comments).
+                    if let Some(ref port_path) = loopback_port_path {
+                        let _ = fs::remove_file(port_path);
+                    }
                     let _ = server.take_dirty();
                     let _ = server.persist();
                     if let Ok(mut terminals) = server.lock_terminals() {
@@ -902,12 +923,136 @@ pub(crate) fn run_daemon_with_config_and_warnings(
                 }
             },
         }
+
+        if let Some((ref tcp, _)) = tcp_listener {
+            match tcp.accept() {
+                Ok((tcp_stream, peer_addr)) => {
+                    accepted_any = true;
+                    if !peer_addr.ip().is_loopback() {
+                        tracing::warn!(
+                            workspace_key = %server.workspace_key,
+                            event = "non_loopback_peer_rejected",
+                            peer = %peer_addr,
+                            "dropping non-loopback TCP IPC peer"
+                        );
+                        drop(tcp_stream);
+                    } else {
+                        idle_since = None;
+                        let _ = tcp_stream.set_nodelay(true);
+                        spawn_accepted_connection(TransportStream::LoopbackTcp(tcp_stream));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => match classify_accept_error(&error) {
+                    AcceptErrorClass::Transient => {
+                        accepted_any = true;
+                        tracing::warn!(
+                            workspace_key = %server.workspace_key,
+                            event = "loopback_accept_error",
+                            error = %error,
+                            "transient loopback accept error; continuing"
+                        );
+                    }
+                    AcceptErrorClass::ResourcePressure => {
+                        accepted_any = true;
+                        tracing::warn!(
+                            workspace_key = %server.workspace_key,
+                            event = "loopback_accept_error",
+                            error = %error,
+                            "loopback accept under resource pressure; backing off"
+                        );
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    AcceptErrorClass::Fatal => {
+                        tracing::error!(
+                            workspace_key = %server.workspace_key,
+                            event = "loopback_listener_error",
+                            error = %error,
+                            "loopback listener error"
+                        );
+                        if let Some(ref port_path) = loopback_port_path {
+                            let _ = fs::remove_file(port_path);
+                        }
+                        let _ = server.take_dirty();
+                        let _ = server.persist();
+                        if let Ok(mut terminals) = server.lock_terminals() {
+                            terminals.kill_all_sessions();
+                        }
+                        return Err(format!("daemon loopback listener failed: {error}"));
+                    }
+                },
+            }
+        }
+
+        if !accepted_any {
+            // Poll for config file-watch events. On change, reload config
+            // into mutable shared state and broadcast ConfigChanged.
+            // Debounce: drain additional events (write_file_atomic's
+            // temp→rename may fire multiple events in quick succession).
+            if config_notify_rx.try_recv().is_ok() {
+                while config_notify_rx.try_recv().is_ok() {}
+                server.reload_config();
+            }
+            // Shared context notes edited outside the daemon.
+            server.drain_notes_changes();
+
+            // Prune old closed-pane suppression entries (L13).
+            if last_closed_sweep.elapsed() >= CLOSED_SWEEP_INTERVAL {
+                server.router.sweep_closed(CLOSED_PANE_RETENTION);
+                // (review-low) Prune scrollback orphans on the same cadence,
+                // not just at startup: a reader racing ClosePane (preempted
+                // between the is_closed check and the append) can re-create
+                // a closed pane's deleted file and a cached append handle,
+                // which would otherwise linger until daemon restart.
+                if let Ok(registry) = server.lock_registry() {
+                    let live_pane_ids: HashSet<String> =
+                        registry.panes.iter().map(|pane| pane.id.clone()).collect();
+                    drop(registry);
+                    prune_orphan_scrollback(&server.scrollback_dir, &live_pane_ids, false);
+                    // (T2) M3: keep the agent-log sweep consistent with it.
+                    prune_orphan_agent_logs(&server.agents_dir, &live_pane_ids);
+                    server.router.prune_orphan_append_handles(&live_pane_ids);
+                }
+                last_closed_sweep = Instant::now();
+            }
+
+            // Optional idle shutdown: reap the daemon (and its shells) after no client
+            // has been connected for idle_limit seconds. Disabled when idle_limit == 0.
+            // Read from the live config each tick so a file-watch reload takes
+            // effect immediately (M4) instead of being frozen at startup.
+            // "No client" means no subscriber AND no active connection thread:
+            // a blocked `ctl wait` or an idle persistent v2 connection is a
+            // live client and must hold the daemon open (M7).
+            let idle_limit = server.effective_config().idle_shutdown_secs_effective();
+            if idle_limit > 0 {
+                if server.router.subscriber_count() == 0
+                    && active_connections.load(Ordering::SeqCst) == 0
+                {
+                    let since = *idle_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_secs(idle_limit) {
+                        tracing::info!(
+                            workspace_key = %server.workspace_key,
+                            event = "idle_shutdown",
+                            "daemon idle-timeout shutdown"
+                        );
+                        break;
+                    }
+                } else {
+                    idle_since = None;
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     // Unlink the socket first: a replacement daemon spawned while this one tears down
     // binds a fresh socket at the same path, and a late unlink here would delete the
     // replacement's socket instead of ours.
     let _ = fs::remove_file(&socket_path);
+    if let Some(ref port_path) = loopback_port_path {
+        let _ = fs::remove_file(port_path);
+    }
+    drop(tcp_listener);
     drop(listener);
     // Final persist is UNCONDITIONAL (L16): gating on take_dirty raced an
     // in-flight handler's mark_dirty, silently dropping its state on shutdown.
@@ -1047,42 +1192,43 @@ pub(crate) fn handle_daemon_client_with_handshake_budget(
     let hello: IpcHello = serde_json::from_str(&hello_line)
         .map_err(|error| format!("invalid daemon hello: {error}"))?;
 
-    let (hello_response, negotiated_wire_version, identity) = match server.authenticate(&hello) {
-        Ok((negotiated, identity)) => (
-            IpcResponse {
-                ok: true,
-                // Extend (do NOT replace) the pre-existing protocol_version field
-                // with the negotiated wire version + capabilities (VAL-IPC-026).
-                result: json!({
-                    "protocol_version": PROTOCOL_VERSION,
-                    "negotiated_wire_version": negotiated,
-                    "capabilities": daemon_capabilities(),
-                    "identity": identity.describe(server.identity_policy()),
-                }),
-                error: None,
-            },
-            negotiated,
-            identity,
-        ),
-        Err(error) => {
-            // Never log the token value (VAL-SEC-009): the error message is a
-            // generic reason, not the presented or expected token.
-            tracing::warn!(
-                workspace_key = %server.workspace_key,
-                event = "auth_rejected",
-                "client auth rejected"
-            );
-            (
+    let (hello_response, negotiated_wire_version, identity) =
+        match server.authenticate(&hello, stream.is_loopback_tcp()) {
+            Ok((negotiated, identity)) => (
                 IpcResponse {
-                    ok: false,
-                    result: Value::Null,
-                    error: Some(error),
+                    ok: true,
+                    // Extend (do NOT replace) the pre-existing protocol_version field
+                    // with the negotiated wire version + capabilities (VAL-IPC-026).
+                    result: json!({
+                        "protocol_version": PROTOCOL_VERSION,
+                        "negotiated_wire_version": negotiated,
+                        "capabilities": daemon_capabilities(),
+                        "identity": identity.describe(server.identity_policy()),
+                    }),
+                    error: None,
                 },
-                1,
-                ClientIdentity::root(IdentityPolicy::Required),
-            )
-        }
-    };
+                negotiated,
+                identity,
+            ),
+            Err(error) => {
+                // Never log the token value (VAL-SEC-009): the error message is a
+                // generic reason, not the presented or expected token.
+                tracing::warn!(
+                    workspace_key = %server.workspace_key,
+                    event = "auth_rejected",
+                    "client auth rejected"
+                );
+                (
+                    IpcResponse {
+                        ok: false,
+                        result: Value::Null,
+                        error: Some(error),
+                    },
+                    1,
+                    ClientIdentity::root(IdentityPolicy::Required),
+                )
+            }
+        };
     // The handshake response is ALWAYS newline-JSON (even when v2 is negotiated) so a
     // v1 client can read it (VAL-IPC-024); the switch to framing happens only for
     // messages AFTER a successful v2 negotiation.

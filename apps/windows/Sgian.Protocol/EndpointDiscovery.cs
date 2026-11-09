@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using System.Text;
 using System.Text.Json;
 
@@ -8,11 +9,94 @@ public static class EndpointDiscovery
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-    public static async Task<NativeIpcEndpoint> DiscoverAsync(
+    public static string ResolveAppDataRoot(string? appDataRoot = null)
+    {
+        if (!string.IsNullOrWhiteSpace(appDataRoot))
+        {
+            return appDataRoot.Trim();
+        }
+        var envOverride = Environment.GetEnvironmentVariable("SGIAN_MACHINES_HOME")?.Trim();
+        if (!string.IsNullOrEmpty(envOverride))
+        {
+            return envOverride;
+        }
+        var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        var current = Path.Combine(roaming, "Sgian");
+        var legacy = Path.Combine(roaming, "Sgian2");
+        return Directory.Exists(current) || !Directory.Exists(legacy) ? current : legacy;
+    }
+
+    public static IReadOnlyList<SavedMachine> LoadSavedMachines(string? appDataRoot = null)
+    {
+        var configPath = Path.Combine(ResolveAppDataRoot(appDataRoot), "config.json");
+        if (!File.Exists(configPath))
+        {
+            return [];
+        }
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(configPath));
+            if (document.RootElement.ValueKind != JsonValueKind.Object ||
+                !document.RootElement.TryGetProperty("machines", out var machinesElement) ||
+                machinesElement.ValueKind != JsonValueKind.Array)
+            {
+                return [];
+            }
+            var parsed = machinesElement.Deserialize<SavedMachine[]>(JsonOptions) ?? [];
+            return parsed.Where(machine => !string.IsNullOrWhiteSpace(machine.Name)).ToArray();
+        }
+        catch (Exception error) when (error is JsonException or IOException or UnauthorizedAccessException)
+        {
+            return [];
+        }
+    }
+
+    public static string DefaultMachineTokenPath(
+        string machineName,
+        string? tokenFile = null,
+        string? appDataRoot = null)
+    {
+        if (!string.IsNullOrWhiteSpace(tokenFile))
+        {
+            return tokenFile.Trim();
+        }
+        return Path.Combine(ResolveAppDataRoot(appDataRoot), "machines", $"{machineName}.token");
+    }
+
+    public static Task<NativeIpcEndpoint> DiscoverAsync(
         string workspace,
         string? backendPath = null,
         CancellationToken cancellationToken = default,
-        Action<string>? onProgress = null)
+        Action<string>? onProgress = null) =>
+        RunDiscoveryAsync(
+            ["ctl", "--workspace", Path.GetFullPath(workspace), "--json", "ipc-endpoint"],
+            clientToken: null,
+            backendPath: backendPath,
+            requireTokenPath: true,
+            cancellationToken: cancellationToken,
+            onProgress: onProgress);
+
+    public static Task<NativeIpcEndpoint> DiscoverMachineAsync(
+        string machineName,
+        string? clientToken = null,
+        string? backendPath = null,
+        CancellationToken cancellationToken = default,
+        Action<string>? onProgress = null) =>
+        RunDiscoveryAsync(
+            ["ctl", "--machine", machineName, "--json", "ipc-endpoint"],
+            clientToken: clientToken,
+            backendPath: backendPath,
+            requireTokenPath: false,
+            cancellationToken: cancellationToken,
+            onProgress: onProgress);
+
+    private static async Task<NativeIpcEndpoint> RunDiscoveryAsync(
+        IReadOnlyList<string> arguments,
+        string? clientToken,
+        string? backendPath,
+        bool requireTokenPath,
+        CancellationToken cancellationToken,
+        Action<string>? onProgress)
     {
         var executable = LocateBackend(backendPath);
         onProgress?.Invoke($"Starting endpoint discovery with {executable}");
@@ -27,11 +111,14 @@ public static class EndpointDiscovery
             // a one-line JSON protocol, so do not wait on that inherited pipe.
             RedirectStandardError = false,
         };
-        start.ArgumentList.Add("ctl");
-        start.ArgumentList.Add("--workspace");
-        start.ArgumentList.Add(Path.GetFullPath(workspace));
-        start.ArgumentList.Add("--json");
-        start.ArgumentList.Add("ipc-endpoint");
+        foreach (var argument in arguments)
+        {
+            start.ArgumentList.Add(argument);
+        }
+        if (!string.IsNullOrWhiteSpace(clientToken))
+        {
+            start.Environment["SGIAN_CLIENT_TOKEN"] = clientToken.Trim();
+        }
 
         using var process = Process.Start(start)
             ?? throw new DaemonProtocolException("Could not start the Sgian backend.");
@@ -94,7 +181,8 @@ public static class EndpointDiscovery
         {
             var endpoint = JsonSerializer.Deserialize<NativeIpcEndpoint>(output, JsonOptions)
                 ?? throw new DaemonProtocolException("The Sgian backend returned no endpoint.");
-            if (endpoint.ProtocolVersion != 1 || endpoint.Endpoint.Length == 0 || endpoint.TokenPath.Length == 0)
+            if (endpoint.ProtocolVersion != 1 || endpoint.Endpoint.Length == 0 ||
+                (requireTokenPath && endpoint.TokenPath.Length == 0))
             {
                 throw new DaemonProtocolException("The Sgian backend returned incomplete endpoint metadata.");
             }
@@ -118,6 +206,17 @@ public static class EndpointDiscovery
         return name.Length > 0
             ? name
             : throw new DaemonProtocolException("The Windows named-pipe endpoint is empty.");
+    }
+
+    public static IPEndPoint ParseLoopbackEndpoint(string endpoint)
+    {
+        if (!IPEndPoint.TryParse(endpoint, out var parsed) ||
+            parsed.Port <= 0 ||
+            !IPAddress.IsLoopback(parsed.Address))
+        {
+            throw new DaemonProtocolException($"Refusing non-loopback or invalid TCP endpoint: {endpoint}");
+        }
+        return parsed;
     }
 
     private static async Task<string> ReadJsonDocumentAsync(

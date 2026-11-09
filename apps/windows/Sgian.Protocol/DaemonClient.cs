@@ -1,4 +1,5 @@
 using System.IO.Pipes;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 
@@ -32,6 +33,11 @@ public sealed class DaemonClient : IAsyncDisposable
     /// </summary>
     public static Func<string, string?>? ClientTokenLookup { get; set; }
 
+    /// <summary>
+    /// An app-supplied lookup for a saved machine credential (keyed by machine name).
+    /// </summary>
+    public static Func<string, string?>? MachineTokenLookup { get; set; }
+
     /// <summary>(M6) The per-client credential this process presents, if any: SGIAN_CLIENT_TOKEN, else the first line of SGIAN_CLIENT_TOKEN_FILE.</summary>
     public static string? ClientTokenFromEnvironment()
     {
@@ -59,10 +65,50 @@ public sealed class DaemonClient : IAsyncDisposable
         var token = File.Exists(endpoint.TokenPath)
             ? (await File.ReadAllTextAsync(endpoint.TokenPath, cancellationToken).ConfigureAwait(false)).Trim()
             : "";
-        // A remote client has no workspace token file; its credential rides the hello instead.
-        if (token.Length == 0 && clientToken is null)
+        return await ConnectEndpointAsync(endpoint, token, clientToken, cancellationToken, onProgress)
+            .ConfigureAwait(false);
+    }
+
+    public static async Task<DaemonClient> ConnectMachineAsync(
+        string machineName,
+        string? backendPath = null,
+        CancellationToken cancellationToken = default,
+        Action<string>? onProgress = null)
+    {
+        var preflightToken = ClientTokenFromEnvironment() ?? MachineTokenLookup?.Invoke(machineName);
+        var endpoint = await EndpointDiscovery.DiscoverMachineAsync(
+            machineName,
+            preflightToken,
+            backendPath,
+            cancellationToken,
+            onProgress).ConfigureAwait(false);
+        var clientToken = preflightToken;
+        if (string.IsNullOrEmpty(clientToken) &&
+            !string.IsNullOrEmpty(endpoint.TokenPath) &&
+            File.Exists(endpoint.TokenPath))
         {
-            throw new DaemonProtocolException($"Daemon token is empty at {endpoint.TokenPath}.");
+            clientToken = File.ReadLines(endpoint.TokenPath).FirstOrDefault()?.Trim();
+            if (string.IsNullOrEmpty(clientToken))
+            {
+                clientToken = null;
+            }
+        }
+        return await ConnectEndpointAsync(endpoint, "", clientToken, cancellationToken, onProgress)
+            .ConfigureAwait(false);
+    }
+
+    public static async Task<DaemonClient> ConnectEndpointAsync(
+        NativeIpcEndpoint endpoint,
+        string token,
+        string? clientToken,
+        CancellationToken cancellationToken = default,
+        Action<string>? onProgress = null)
+    {
+        // A remote client has no workspace token file; its credential rides the hello instead.
+        if (token.Length == 0 && string.IsNullOrEmpty(clientToken))
+        {
+            throw new DaemonProtocolException(
+                $"Daemon credential is missing for endpoint {endpoint.Endpoint} ({endpoint.TokenPath}).");
         }
 
         var client = new DaemonClient(endpoint, token, clientToken);
@@ -91,7 +137,7 @@ public sealed class DaemonClient : IAsyncDisposable
         await _requestGate.WaitAsync(operationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAuthenticatedPipeAsync(operationToken, onProgress)
+            await using var connection = await OpenAuthenticatedTransportAsync(operationToken, onProgress)
                 .ConfigureAwait(false);
             await WriteLineAsync(connection.Writer, request, operationToken).ConfigureAwait(false);
             onProgress?.Invoke("Daemon request written; waiting for response");
@@ -132,7 +178,7 @@ public sealed class DaemonClient : IAsyncDisposable
         var token = _subscriptionCancellation.Token;
         using var startup = CancellationTokenSource.CreateLinkedTokenSource(token);
         startup.CancelAfter(RequestTimeout);
-        await using var connection = await OpenAuthenticatedPipeAsync(startup.Token).ConfigureAwait(false);
+        await using var connection = await OpenAuthenticatedTransportAsync(startup.Token).ConfigureAwait(false);
         await WriteLineAsync(connection.Writer, new Dictionary<string, object?>
         {
             ["command"] = "subscribe",
@@ -169,29 +215,60 @@ public sealed class DaemonClient : IAsyncDisposable
         return ValueTask.CompletedTask;
     }
 
-    private async Task<AuthenticatedPipe> OpenAuthenticatedPipeAsync(
+    private async Task<AuthenticatedTransport> OpenAuthenticatedTransportAsync(
         CancellationToken cancellationToken,
         Action<string>? onProgress = null)
     {
-        if (!string.Equals(_endpoint.Transport, "named_pipe", StringComparison.Ordinal))
-        {
-            throw new DaemonProtocolException($"Expected a Windows named pipe, got {_endpoint.Transport}.");
-        }
-
-        var pipe = new NamedPipeClientStream(
-            ".",
-            EndpointDiscovery.PipeName(_endpoint.Endpoint),
-            PipeDirection.InOut,
-            PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+        Stream? stream = null;
+        IDisposable? owner = null;
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(TimeSpan.FromSeconds(5));
-            onProgress?.Invoke("Connecting to daemon named pipe");
-            await pipe.ConnectAsync(timeout.Token).ConfigureAwait(false);
-            onProgress?.Invoke("Daemon named pipe connected");
-            var reader = new BoundedLineReader(new StreamReader(pipe, new UTF8Encoding(false), false, 4096, leaveOpen: true));
-            var writer = new StreamWriter(pipe, new UTF8Encoding(false), 4096, leaveOpen: true)
+            switch (_endpoint.Transport)
+            {
+                case "named_pipe":
+                {
+                    var pipe = new NamedPipeClientStream(
+                        ".",
+                        EndpointDiscovery.PipeName(_endpoint.Endpoint),
+                        PipeDirection.InOut,
+                        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+                    stream = pipe;
+                    onProgress?.Invoke("Connecting to daemon named pipe");
+                    await pipe.ConnectAsync(timeout.Token).ConfigureAwait(false);
+                    onProgress?.Invoke("Daemon named pipe connected");
+                    break;
+                }
+                case "tcp_loopback":
+                {
+                    var ipEndPoint = EndpointDiscovery.ParseLoopbackEndpoint(_endpoint.Endpoint);
+                    var tcp = new TcpClient(ipEndPoint.AddressFamily) { NoDelay = true };
+                    owner = tcp;
+                    onProgress?.Invoke($"Connecting to loopback daemon endpoint {ipEndPoint}");
+                    await tcp.ConnectAsync(ipEndPoint.Address, ipEndPoint.Port, timeout.Token).ConfigureAwait(false);
+                    stream = tcp.GetStream();
+                    onProgress?.Invoke("Loopback daemon endpoint connected");
+                    break;
+                }
+                case "unix_socket":
+                {
+                    var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                    owner = socket;
+                    onProgress?.Invoke($"Connecting to Unix socket {_endpoint.Endpoint}");
+                    await socket.ConnectAsync(new UnixDomainSocketEndPoint(_endpoint.Endpoint), timeout.Token)
+                        .ConfigureAwait(false);
+                    stream = new NetworkStream(socket, ownsSocket: true);
+                    owner = null;
+                    onProgress?.Invoke("Unix socket connected");
+                    break;
+                }
+                default:
+                    throw new DaemonProtocolException($"Unsupported daemon transport: {_endpoint.Transport}.");
+            }
+
+            var reader = new BoundedLineReader(new StreamReader(stream, new UTF8Encoding(false), false, 4096, leaveOpen: true));
+            var writer = new StreamWriter(stream, new UTF8Encoding(false), 4096, leaveOpen: true)
             {
                 AutoFlush = true,
                 NewLine = "\n",
@@ -225,11 +302,12 @@ public sealed class DaemonClient : IAsyncDisposable
             var supportsAck = response.Result.TryGetProperty("capabilities", out var capabilities) &&
                 capabilities.ValueKind == JsonValueKind.Array &&
                 capabilities.EnumerateArray().Any(value => value.GetString() == "subscribe-ack");
-            return new AuthenticatedPipe(pipe, reader, writer, supportsAck);
+            return new AuthenticatedTransport(stream, owner, reader, writer, supportsAck);
         }
         catch
         {
-            await pipe.DisposeAsync().ConfigureAwait(false);
+            if (stream is not null) await stream.DisposeAsync().ConfigureAwait(false);
+            owner?.Dispose();
             throw;
         }
     }
@@ -248,17 +326,20 @@ public sealed class DaemonClient : IAsyncDisposable
         await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false)
             ?? throw new DaemonProtocolException("The daemon closed the connection.");
 
-    private sealed class AuthenticatedPipe : IAsyncDisposable
+    private sealed class AuthenticatedTransport : IAsyncDisposable
     {
-        private readonly NamedPipeClientStream _pipe;
+        private readonly Stream _stream;
+        private readonly IDisposable? _owner;
 
-        public AuthenticatedPipe(
-            NamedPipeClientStream pipe,
+        public AuthenticatedTransport(
+            Stream stream,
+            IDisposable? owner,
             BoundedLineReader reader,
             StreamWriter writer,
             bool supportsSubscribeAck)
         {
-            _pipe = pipe;
+            _stream = stream;
+            _owner = owner;
             Reader = reader;
             Writer = writer;
             SupportsSubscribeAck = supportsSubscribeAck;
@@ -272,7 +353,8 @@ public sealed class DaemonClient : IAsyncDisposable
         {
             Writer.Dispose();
             Reader.Dispose();
-            await _pipe.DisposeAsync().ConfigureAwait(false);
+            await _stream.DisposeAsync().ConfigureAwait(false);
+            _owner?.Dispose();
         }
     }
 }

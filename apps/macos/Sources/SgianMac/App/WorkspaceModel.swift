@@ -2,6 +2,22 @@ import AppKit
 import Combine
 import Foundation
 
+struct MachineSummary: Equatable, Sendable {
+    var connected = false
+    var paneCount = 0
+    var needsInputCount = 0
+    var workingCount = 0
+
+    var badgeText: String? {
+        guard connected else { return nil }
+        var parts: [String] = []
+        if needsInputCount > 0 { parts.append("\(needsInputCount) input") }
+        if workingCount > 0 { parts.append("\(workingCount) working") }
+        if parts.isEmpty, paneCount > 0 { parts.append("\(paneCount) \(paneCount == 1 ? "pane" : "panes")") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+}
+
 @MainActor
 final class WorkspaceModel: ObservableObject {
     @Published private(set) var panes: [Pane] = []
@@ -32,6 +48,10 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var status: ConnectionStatus = .disconnected
     @Published var errorMessage: String?
     @Published private(set) var workspaceURL: URL
+    @Published private(set) var localWorkspaceURL: URL
+    @Published private(set) var savedMachines: [SavedMachine] = []
+    @Published private(set) var activeMachine: SavedMachine?
+    @Published private(set) var machineSummaries: [String: MachineSummary] = [:]
     @Published private(set) var layout: PaneLayout?
     @Published var zoomed = false
     @Published var showingCommands = false
@@ -51,6 +71,7 @@ final class WorkspaceModel: ObservableObject {
     private var subscription: Subscription?
     private var connectionTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
+    private var machinePollTask: Task<Void, Never>?
     private var reconnectAttempt = 0
     private var generation = UUID()
     private var pendingInput: [String: String] = [:]
@@ -72,7 +93,19 @@ final class WorkspaceModel: ObservableObject {
             home: FileManager.default.homeDirectoryForCurrentUser.path,
             exists: WorkspaceModel.isDirectory
         )
-        workspaceURL = URL(fileURLWithPath: path, isDirectory: true)
+        let initialURL = URL(fileURLWithPath: path, isDirectory: true)
+        workspaceURL = initialURL
+        localWorkspaceURL = initialURL
+        let machines = WorkspaceLocator.loadSavedMachines()
+        savedMachines = machines
+        if let requested = ProcessInfo.processInfo.environment["SGIAN_MACHINE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !requested.isEmpty,
+           let matched = machines.first(where: { $0.name == requested })
+        {
+            activeMachine = matched
+            workspaceURL = URL(fileURLWithPath: matched.workspace, isDirectory: true)
+        }
         let savedFont = defaults.double(forKey: "terminalFontSize")
         terminalFontSize = savedFont == 0 ? 13 : min(30, max(9, savedFont))
     }
@@ -80,6 +113,7 @@ final class WorkspaceModel: ObservableObject {
     deinit {
         connectionTask?.cancel()
         reconnectTask?.cancel()
+        machinePollTask?.cancel()
         subscription?.cancel()
         inputDrains.values.forEach { $0.cancel() }
     }
@@ -114,25 +148,39 @@ final class WorkspaceModel: ObservableObject {
 
     func start() {
         guard connectionTask == nil else { return }
-        connect(to: workspaceURL)
+        reloadSavedMachines()
+        startMachinePolling()
+        if let machine = activeMachine {
+            connect(toMachine: machine)
+        } else {
+            connect(to: workspaceURL)
+        }
     }
 
-    func connect(to url: URL) {
-        let nextURL = url.standardizedFileURL.resolvingSymlinksInPath()
-        guard WorkspaceModel.isDirectory(nextURL.path) else {
-            // Forget a workspace that is gone so the next launch does not
-            // trip over it again, and leave the empty state offering a
-            // picker instead of a spinner.
-            let message = "Workspace does not exist: \(nextURL.path)"
-            errorMessage = message
-            if UserDefaults.standard.string(forKey: "workspacePath") == nextURL.path {
-                UserDefaults.standard.removeObject(forKey: "workspacePath")
-            }
-            recentWorkspaces.removeAll { $0 == nextURL.path || $0 == url.path }
-            UserDefaults.standard.set(recentWorkspaces, forKey: "recentWorkspaces")
-            if connectionTask == nil { status = .failed(message) }
-            return
+    func reloadSavedMachines() {
+        let loaded = WorkspaceLocator.loadSavedMachines()
+        if savedMachines != loaded {
+            savedMachines = loaded
         }
+        let validNames = Set(loaded.map(\.name))
+        machineSummaries = machineSummaries.filter { validNames.contains($0.key) }
+    }
+
+    func reconnect() {
+        reloadSavedMachines()
+        if let machine = activeMachine {
+            let refreshed = savedMachines.first(where: { $0.name == machine.name }) ?? machine
+            connect(toMachine: refreshed)
+        } else {
+            connect(to: workspaceURL)
+        }
+    }
+
+    func connectToLocalWorkspace() {
+        connect(to: localWorkspaceURL)
+    }
+
+    private func resetConnectionState() -> UUID {
         connectionTask?.cancel()
         layoutSaveTask?.cancel()
         reconnectTask?.cancel()
@@ -146,11 +194,6 @@ final class WorkspaceModel: ObservableObject {
         pendingInput = [:]
         ensuringTerminals = []
         generation = UUID()
-        let currentGeneration = generation
-        workspaceURL = nextURL
-        UserDefaults.standard.set(nextURL.path, forKey: "workspacePath")
-        recentWorkspaces = Array(([nextURL.path] + recentWorkspaces.filter { $0 != nextURL.path }).prefix(10))
-        UserDefaults.standard.set(recentWorkspaces, forKey: "recentWorkspaces")
         status = .connecting
         errorMessage = nil
         panes = []
@@ -174,11 +217,38 @@ final class WorkspaceModel: ObservableObject {
         layout = nil
         zoomed = false
         panePendingClose = nil
+        return generation
+    }
+
+    func connect(to url: URL) {
+        let nextURL = url.standardizedFileURL.resolvingSymlinksInPath()
+        guard WorkspaceModel.isDirectory(nextURL.path) else {
+            // Forget a workspace that is gone so the next launch does not
+            // trip over it again, and leave the empty state offering a
+            // picker instead of a spinner.
+            let message = "Workspace does not exist: \(nextURL.path)"
+            errorMessage = message
+            if UserDefaults.standard.string(forKey: "workspacePath") == nextURL.path {
+                UserDefaults.standard.removeObject(forKey: "workspacePath")
+            }
+            recentWorkspaces.removeAll { $0 == nextURL.path || $0 == url.path }
+            UserDefaults.standard.set(recentWorkspaces, forKey: "recentWorkspaces")
+            if connectionTask == nil { status = .failed(message) }
+            return
+        }
+        let currentGeneration = resetConnectionState()
+        activeMachine = nil
+        workspaceURL = nextURL
+        localWorkspaceURL = nextURL
+        UserDefaults.standard.set(nextURL.path, forKey: "workspacePath")
+        recentWorkspaces = Array(([nextURL.path] + recentWorkspaces.filter { $0 != nextURL.path }).prefix(10))
+        UserDefaults.standard.set(recentWorkspaces, forKey: "recentWorkspaces")
 
         connectionTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let client = DaemonIPCClient(locator: WorkspaceLocator(workspaceURL: nextURL))
+                let locator = WorkspaceLocator(workspaceURL: nextURL)
+                let client = DaemonIPCClient(locator: locator)
                 try await client.connectOrLaunch()
                 guard currentGeneration == generation else { return }
                 self.client = client
@@ -189,7 +259,7 @@ final class WorkspaceModel: ObservableObject {
                 guard currentGeneration == generation else { return }
                 apply(snapshot)
                 status = .connected
-                if DaemonIPCClient.clientToken(for: nextURL) != nil,
+                if DaemonIPCClient.clientToken(for: locator) != nil,
                    let identity = try? await client.request(["command": .string("whoami")], as: JSONValue.self),
                    let credentialHolder = identity["holder"]?.stringValue, !credentialHolder.isEmpty,
                    currentGeneration == generation {
@@ -207,6 +277,44 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
+    func connect(toMachine machine: SavedMachine) {
+        let currentGeneration = resetConnectionState()
+        activeMachine = machine
+        workspaceURL = URL(fileURLWithPath: machine.workspace, isDirectory: true)
+
+        connectionTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let locator = WorkspaceLocator(machine: machine)
+                let client = DaemonIPCClient(locator: locator)
+                try await client.connectOrLaunch()
+                guard currentGeneration == generation else { return }
+                self.client = client
+                let snapshot: WorkspaceSnapshot = try await client.request(
+                    ["command": .string("bootstrap_workspace")],
+                    as: WorkspaceSnapshot.self
+                )
+                guard currentGeneration == generation else { return }
+                apply(snapshot)
+                status = .connected
+                updateActiveMachineSummary()
+                if DaemonIPCClient.clientToken(for: locator) != nil,
+                   let identity = try? await client.request(["command": .string("whoami")], as: JSONValue.self),
+                   let credentialHolder = identity["holder"]?.stringValue, !credentialHolder.isEmpty,
+                   currentGeneration == generation {
+                    holder = credentialHolder
+                }
+                beginSubscription(client: client, generation: currentGeneration)
+                _ = try? await readConfiguration()
+            } catch {
+                guard currentGeneration == generation else { return }
+                machineSummaries[machine.name] = MachineSummary(connected: false)
+                status = .failed(error.localizedDescription)
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
     func chooseWorkspace() {
         let panel = NSOpenPanel()
         panel.title = "Choose a Sgian workspace"
@@ -214,7 +322,7 @@ final class WorkspaceModel: ObservableObject {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.directoryURL = workspaceURL
+        panel.directoryURL = localWorkspaceURL
         guard panel.runModal() == .OK, let url = panel.url else { return }
         connect(to: url)
     }
@@ -483,18 +591,98 @@ final class WorkspaceModel: ObservableObject {
     /// Whether the environment supplies the credential (it then overrides the Keychain).
     var credentialFromEnvironment: Bool { DaemonIPCClient.clientTokenFromEnvironment() != nil }
 
-    /// Whether a credential is stored in the Keychain for this workspace.
-    var hasStoredCredential: Bool { CredentialStore.load(for: workspaceURL) != nil }
+    /// Whether a credential is stored for the active workspace or saved machine.
+    var hasStoredCredential: Bool {
+        if let machine = activeMachine {
+            return CredentialStore.loadMachine(
+                machine.name,
+                fallbackTokenURL: WorkspaceLocator(machine: machine).tokenURL
+            ) != nil
+        }
+        return CredentialStore.load(for: workspaceURL) != nil
+    }
 
-    /// Store (or, with nil, forget) this workspace's credential in the login
-    /// Keychain and reconnect so the daemon binds the connection to it.
+    /// Store (or, with nil, forget) this workspace or machine credential in the
+    /// login Keychain and reconnect so the daemon binds the connection to it.
     func setClientCredential(_ token: String?) {
+        if let machine = activeMachine {
+            guard CredentialStore.saveMachine(token, for: machine.name) else {
+                errorMessage = "The credential could not be saved to the Keychain."
+                return
+            }
+            holder = WorkspaceModel.defaultHolder()
+            connect(toMachine: machine)
+            return
+        }
         guard CredentialStore.save(token, for: workspaceURL) else {
             errorMessage = "The credential could not be saved to the Keychain."
             return
         }
         holder = WorkspaceModel.defaultHolder()
         connect(to: workspaceURL)
+    }
+
+    private func updateActiveMachineSummary() {
+        guard let machine = activeMachine else { return }
+        var needsInput = 0
+        var working = 0
+        for pane in panes where paneStates[pane.id] != .ended {
+            switch attention(for: pane.id) {
+            case .needsInput: needsInput += 1
+            case .working: working += 1
+            default: break
+            }
+        }
+        machineSummaries[machine.name] = MachineSummary(
+            connected: status == .connected,
+            paneCount: panes.count,
+            needsInputCount: needsInput,
+            workingCount: working
+        )
+    }
+
+    private func startMachinePolling() {
+        machinePollTask?.cancel()
+        machinePollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                self.reloadSavedMachines()
+                let inactive = self.savedMachines.filter { $0.name != self.activeMachine?.name }
+                for machine in inactive {
+                    if Task.isCancelled { return }
+                    let locator = WorkspaceLocator(machine: machine)
+                    // Probe existing local tunnel sockets without spawning unsolicited
+                    // SSH connections for idle saved machines.
+                    guard FileManager.default.fileExists(atPath: locator.socketURL.path) else {
+                        continue
+                    }
+                    let probeClient = DaemonIPCClient(locator: locator)
+                    if let snapshot = try? await probeClient.request(
+                        ["command": .string("bootstrap_workspace")],
+                        as: WorkspaceSnapshot.self
+                    ) {
+                        var needsInput = 0
+                        var working = 0
+                        for pane in snapshot.panes where snapshot.paneStates[pane.id] != .ended {
+                            switch snapshot.agentStates[pane.id]?.attention {
+                            case .needsInput: needsInput += 1
+                            case .working: working += 1
+                            default: break
+                            }
+                        }
+                        self.machineSummaries[machine.name] = MachineSummary(
+                            connected: true,
+                            paneCount: snapshot.panes.count,
+                            needsInputCount: needsInput,
+                            workingCount: working
+                        )
+                    } else {
+                        self.machineSummaries[machine.name] = MachineSummary(connected: false)
+                    }
+                }
+                try? await Task.sleep(for: .seconds(15))
+            }
+        }
     }
 
     func usage(for paneID: String) -> AgentUsage? { agentUsage[paneID] }
@@ -649,9 +837,11 @@ final class WorkspaceModel: ObservableObject {
         } else {
             selectedPaneID = snapshot.activePaneID ?? snapshot.panes.first?.id
         }
+        updateActiveMachineSummary()
     }
 
     private func apply(_ event: DaemonEvent) {
+        defer { updateActiveMachineSummary() }
         switch event.kind {
         case "pty_output":
             guard let paneID = event["pane_id"]?.stringValue,

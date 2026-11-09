@@ -737,7 +737,7 @@ fn subscriber_cap_rejects_beyond_limit_and_recovers_after_disconnect() {
     for _ in 0..MAX_SUBSCRIBERS {
         let (client, server) = UnixStream::pair().expect("unix stream pair should be available");
         router
-            .add_subscriber(server, 1)
+            .add_subscriber(TransportStream::Local(server), 1)
             .expect("subscribe within the cap");
         peers.push(client);
     }
@@ -747,7 +747,7 @@ fn subscriber_cap_rejects_beyond_limit_and_recovers_after_disconnect() {
     // handed back so the caller can respond and close it (no leak).
     let (client, server) = UnixStream::pair().expect("unix stream pair should be available");
     let (reason, stream) = router
-        .add_subscriber(server, 1)
+        .add_subscriber(TransportStream::Local(server), 1)
         .expect_err("subscribe beyond the cap should be refused");
     assert!(
         reason.contains("subscriber limit"),
@@ -767,7 +767,7 @@ fn subscriber_cap_rejects_beyond_limit_and_recovers_after_disconnect() {
     wait_for(|| router.subscriber_count() < MAX_SUBSCRIBERS);
     let (client, server) = UnixStream::pair().expect("unix stream pair should be available");
     router
-        .add_subscriber(server, 1)
+        .add_subscriber(TransportStream::Local(server), 1)
         .expect("subscribe after a disconnect freed a slot");
     peers.push(client);
 }
@@ -783,7 +783,7 @@ fn slow_subscriber_is_dropped_when_its_queue_fills() {
     let router = OutputRouter::new(scrollback_dir.path().to_path_buf());
     let (client, server) = UnixStream::pair().expect("unix stream pair");
     router
-        .add_subscriber(server, 1)
+        .add_subscriber(TransportStream::Local(server), 1)
         .expect("subscribe within the cap");
     assert_eq!(router.subscriber_count(), 1);
 

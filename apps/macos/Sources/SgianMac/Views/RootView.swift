@@ -154,7 +154,7 @@ private struct EmptyWorkspaceView: View {
                 }
             } else if case .failed = model.status {
                 HStack {
-                    Button("Reconnect") { model.connect(to: model.workspaceURL) }
+                    Button("Reconnect", action: model.reconnect)
                         .buttonStyle(.borderedProminent)
                     Button("Choose Workspace…") { model.chooseWorkspace() }
                 }
@@ -179,7 +179,12 @@ private struct EmptyWorkspaceView: View {
 
     private var statusMessage: String {
         switch model.status {
-        case .connecting: "Attaching to the session daemon for \(model.workspaceURL.path)"
+        case .connecting:
+            if let machine = model.activeMachine {
+                "Attaching to remote workspace \(machine.name) (\(machine.displaySubtitle))"
+            } else {
+                "Attaching to the session daemon for \(model.workspaceURL.path)"
+            }
         case .connected: "Create a terminal or agent conversation to get started."
         case let .failed(message): message
         case .disconnected: "A native workspace for terminals and coding agents."

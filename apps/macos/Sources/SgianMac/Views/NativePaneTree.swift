@@ -156,11 +156,17 @@ struct NativeCommandPalette: View {
             ("Zoom / Show all panes", { model.toggleZoom() }),
             ("Find in terminal", { model.showingSearch = true }),
             ("Open workspace…", { model.chooseWorkspace() }),
-            ("Reconnect", { model.connect(to: model.workspaceURL) }),
+            ("Reconnect", { model.reconnect() }),
             ("Take keyboard for active pane", { model.takeLease() }),
             ("Release keyboard (with hand-back note)…", { model.openReleaseDialog() }),
             ("Close active pane…", { model.requestClose() }),
         ]
+        if model.activeMachine != nil {
+            items.append(("Switch to local workspace: \(model.localWorkspaceURL.lastPathComponent)", { model.connectToLocalWorkspace() }))
+        }
+        items += model.savedMachines.map { machine in
+            ("Switch to machine: \(machine.name) (\(machine.displaySubtitle))", { model.connect(toMachine: machine) })
+        }
         items += model.panes.map { pane in ("Focus: \(pane.title) [\(pane.id)]", { model.select(pane.id) }) }
         return items.filter { query.isEmpty || $0.0.localizedCaseInsensitiveContains(query) }
     }

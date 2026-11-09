@@ -20,6 +20,18 @@ pub(crate) struct NativeIpcEndpoint {
     pub(crate) workspace_key: String,
     pub(crate) protocol_version: u32,
     pub(crate) capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) loopback_port: Option<u16>,
+}
+
+pub(crate) fn read_daemon_loopback_port(socket_path: &Path) -> Option<u16> {
+    let port_path = socket_path.parent()?.join(LOOPBACK_PORT_FILE);
+    fs::read_to_string(port_path)
+        .ok()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
 }
 
 pub(crate) fn native_ipc_endpoint(client: &DaemonClient) -> Result<NativeIpcEndpoint, String> {
@@ -37,13 +49,16 @@ pub(crate) fn native_ipc_endpoint(client: &DaemonClient) -> Result<NativeIpcEndp
         workspace_key: workspace_key(&workspace),
         protocol_version: PROTOCOL_VERSION,
         capabilities: vec!["subscribe-ack".to_string()],
+        loopback_port: read_daemon_loopback_port(&client.socket_path),
     })
 }
 
-pub(crate) fn control_ipc_endpoint(client: &DaemonClient, json_output: bool) -> Result<(), String> {
-    let info = native_ipc_endpoint(client)?;
+pub(crate) fn print_ipc_endpoint_info(
+    info: &NativeIpcEndpoint,
+    json_output: bool,
+) -> Result<(), String> {
     if json_output {
-        return write_json_stdout(&info);
+        return write_json_stdout(info);
     }
 
     let mut stdout = std::io::stdout();
@@ -51,7 +66,16 @@ pub(crate) fn control_ipc_endpoint(client: &DaemonClient, json_output: bool) -> 
         .and_then(|_| writeln!(stdout, "endpoint\t{}", info.endpoint))
         .and_then(|_| writeln!(stdout, "token\t{}", info.token_path))
         .and_then(|_| writeln!(stdout, "workspace\t{}", info.workspace))
+        .and_then(|_| match info.loopback_port {
+            Some(port) => writeln!(stdout, "loopback_port\t{port}"),
+            None => Ok(()),
+        })
         .map_err(|error| format!("failed to write stdout: {error}"))
+}
+
+pub(crate) fn control_ipc_endpoint(client: &DaemonClient, json_output: bool) -> Result<(), String> {
+    let info = native_ipc_endpoint(client)?;
+    print_ipc_endpoint_info(&info, json_output)
 }
 
 pub(crate) fn is_control_invocation(args: &[String]) -> bool {
@@ -699,33 +723,79 @@ pub(crate) fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
     };
 
     match command {
-        "help" | "--help" | "-h" => print_control_help(),
+        "help" | "--help" | "-h" => return print_control_help(),
+        "pane" => return control_pane_subcommand(options),
+        "machine" => {
+            if options.machine.is_some() || options.explicit_workspace {
+                return Err(
+                    "ctl machine manages saved machines globally and does not accept --machine or --workspace"
+                        .to_string(),
+                );
+            }
+            return control_machine(&options.args[1..], options.json);
+        }
+        _ => {}
+    }
+
+    let (effective_machine, sub_args) = rewrite_qualified_subcommand_args(
+        command,
+        &options.args[1..],
+        options.machine.as_deref(),
+        options.explicit_workspace,
+        &known_machine_names(),
+    )?;
+
+    let reject_remote = |cmd_name: &str| -> Result<(), String> {
+        if let Some(ref name) = effective_machine {
+            return Err(format!(
+                "`ctl {cmd_name}` inspects local host state and cannot be used with --machine '{name}'"
+            ));
+        }
+        Ok(())
+    };
+
+    let connect_existing = || -> Result<DaemonClient, String> {
+        match effective_machine.as_deref() {
+            Some(name) => ensure_machine_client(name).map(|(client, _)| client),
+            None => DaemonClient::connect_existing(options.workspace.clone()),
+        }
+    };
+    let connect_or_spawn = || -> Result<DaemonClient, String> {
+        match effective_machine.as_deref() {
+            Some(name) => ensure_machine_client(name).map(|(client, _)| client),
+            None => DaemonClient::connect_or_spawn(options.workspace.clone()),
+        }
+    };
+
+    match command {
         "workspaces" => {
-            ensure_no_extra_args("workspaces", &options.args[1..])?;
+            reject_remote("workspaces")?;
+            ensure_no_extra_args("workspaces", &sub_args)?;
             control_list_workspaces(options.json)
         }
         "ipc-endpoint" => {
-            ensure_no_extra_args("ipc-endpoint", &options.args[1..])?;
-            let client = DaemonClient::connect_or_spawn(options.workspace)?;
-            control_ipc_endpoint(&client, options.json)
+            ensure_no_extra_args("ipc-endpoint", &sub_args)?;
+            if let Some(ref name) = effective_machine {
+                let (_, info) = ensure_machine_client(name)?;
+                print_ipc_endpoint_info(&info, options.json)
+            } else {
+                let client = DaemonClient::connect_or_spawn(options.workspace)?;
+                control_ipc_endpoint(&client, options.json)
+            }
         }
         "panes" | "list" => {
-            ensure_no_extra_args(command, &options.args[1..])?;
-            let client = DaemonClient::connect_existing(options.workspace)?;
+            ensure_no_extra_args(command, &sub_args)?;
+            let client = connect_existing()?;
             control_list_panes(&client, options.json)
         }
         "new" => {
-            let client = DaemonClient::connect_or_spawn(options.workspace)?;
-            control_new_pane(&client, &options.args[1..], options.json)
+            let client = connect_or_spawn()?;
+            control_new_pane(&client, &sub_args, options.json)
         }
         "status" => {
-            let client = DaemonClient::connect_existing(options.workspace)?;
-            let status_args = &options.args[1..];
-            if status_args
-                .iter()
-                .any(|arg| arg == "--verbose" || arg == "-v")
-            {
-                if let Some(extra) = status_args
+            let client = connect_existing()?;
+            if sub_args.iter().any(|arg| arg == "--verbose" || arg == "-v") {
+                if let Some(extra) = sub_args
                     .iter()
                     .find(|arg| *arg != "--verbose" && *arg != "-v")
                 {
@@ -733,116 +803,108 @@ pub(crate) fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
                 }
                 control_status_verbose(&client, options.json)
             } else {
-                if status_args.len() > 1 {
-                    return Err(format!(
-                        "unexpected argument for status: {}",
-                        status_args[1]
-                    ));
+                if sub_args.len() > 1 {
+                    return Err(format!("unexpected argument for status: {}", sub_args[1]));
                 }
-                control_pane_status(&client, status_args, options.json)
+                control_pane_status(&client, &sub_args, options.json)
             }
         }
         "send" => {
-            let client = DaemonClient::connect_or_spawn(options.workspace)?;
-            control_send_input(&client, &options.args[1..])
+            let client = connect_or_spawn()?;
+            control_send_input(&client, &sub_args)
         }
         "interrupt" => {
-            let client = DaemonClient::connect_or_spawn(options.workspace)?;
-            control_interrupt(&client, &options.args[1..])
+            let client = connect_or_spawn()?;
+            control_interrupt(&client, &sub_args)
         }
         "restart" => {
-            if options.args.len() > 2 {
-                return Err(format!(
-                    "unexpected argument for restart: {}",
-                    options.args[2]
-                ));
+            if sub_args.len() > 1 {
+                return Err(format!("unexpected argument for restart: {}", sub_args[1]));
             }
-            let client = DaemonClient::connect_or_spawn(options.workspace)?;
-            control_restart_pane(&client, &options.args[1..], options.json)
+            let client = connect_or_spawn()?;
+            control_restart_pane(&client, &sub_args, options.json)
         }
         "lease" => {
-            if has_help_flag(&options.args[1..]) {
+            if has_help_flag(&sub_args) {
                 return print_control_help();
             }
-            let parsed = parse_lease_args(&options.args[1..])?;
+            let parsed = parse_lease_args(&sub_args)?;
             // Status never spawns a daemon; take/release start one on demand
             // like the other mutating pane commands.
             let client = if parsed.verb == LeaseVerb::Status {
-                DaemonClient::connect_existing(options.workspace)?
+                connect_existing()?
             } else {
-                DaemonClient::connect_or_spawn(options.workspace)?
+                connect_or_spawn()?
             };
             control_lease(&client, parsed, options.json)
         }
         "project" => {
-            if has_help_flag(&options.args[1..]) {
+            if has_help_flag(&sub_args) {
                 return print_control_help();
             }
-            let parsed = parse_project_args(&options.args[1..])?;
+            let parsed = parse_project_args(&sub_args)?;
             let client = if matches!(
                 parsed.verb,
                 ProjectVerb::List | ProjectVerb::Show | ProjectVerb::Ledger | ProjectVerb::Notes
             ) {
-                DaemonClient::connect_existing(options.workspace)?
+                connect_existing()?
             } else {
-                DaemonClient::connect_or_spawn(options.workspace)?
+                connect_or_spawn()?
             };
             control_project(&client, parsed, options.json)
         }
         "kranz" => {
-            if has_help_flag(&options.args[1..]) {
+            if has_help_flag(&sub_args) {
                 return print_control_help();
             }
-            let parsed = parse_kranz_args(&options.args[1..])?;
+            let parsed = parse_kranz_args(&sub_args)?;
             let client = if parsed.verb == KranzVerb::Status {
-                DaemonClient::connect_existing(options.workspace)?
+                connect_existing()?
             } else {
-                DaemonClient::connect_or_spawn(options.workspace)?
+                connect_or_spawn()?
             };
             control_kranz(&client, parsed, options.json)
         }
         "grant" => {
-            if has_help_flag(&options.args[1..]) {
+            if has_help_flag(&sub_args) {
                 return print_control_help();
             }
-            let parsed = parse_grant_args(&options.args[1..])?;
+            let parsed = parse_grant_args(&sub_args)?;
             let client = if matches!(parsed, GrantArgs::Exec { .. }) {
-                DaemonClient::connect_or_spawn(options.workspace)?
+                connect_or_spawn()?
             } else {
-                DaemonClient::connect_existing(options.workspace)?
+                connect_existing()?
             };
             control_grant(&client, parsed, options.json)
         }
         "search" => {
-            if has_help_flag(&options.args[1..]) {
+            if has_help_flag(&sub_args) {
                 return print_control_help();
             }
-            let parsed = parse_search_args(&options.args[1..])?;
-            let client = DaemonClient::connect_existing(options.workspace)?;
+            let parsed = parse_search_args(&sub_args)?;
+            let client = connect_existing()?;
             control_search(&client, parsed, options.json)
         }
         "lines" => {
-            if has_help_flag(&options.args[1..]) {
+            if has_help_flag(&sub_args) {
                 return print_control_help();
             }
-            let parsed = parse_lines_args(&options.args[1..])?;
-            let client = DaemonClient::connect_existing(options.workspace)?;
+            let parsed = parse_lines_args(&sub_args)?;
+            let client = connect_existing()?;
             control_lines(&client, parsed, options.json)
         }
         "ledger" => {
-            if has_help_flag(&options.args[1..]) {
+            if has_help_flag(&sub_args) {
                 return print_control_help();
             }
-            let parsed = parse_ledger_args(&options.args[1..])?;
+            reject_remote("ledger")?;
+            let parsed = parse_ledger_args(&sub_args)?;
             let client = DaemonClient::connect_existing(options.workspace)?;
             control_ledger(&client, parsed, options.json)
         }
         "attach" => {
-            if options.args.len() > 2 {
-                return Err(format!(
-                    "unexpected argument for attach: {}",
-                    options.args[2]
-                ));
+            if sub_args.len() > 1 {
+                return Err(format!("unexpected argument for attach: {}", sub_args[1]));
             }
             // (07-19 CLI low) the global parser consumes --json, but attach
             // streams raw PTY output — there is no JSON shape; fail loudly
@@ -850,8 +912,8 @@ pub(crate) fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             if options.json {
                 return Err("--json is not supported for attach".to_string());
             }
-            let client = DaemonClient::connect_existing(options.workspace)?;
-            control_attach_pane(&client, &options.args[1..])
+            let client = connect_existing()?;
+            control_attach_pane(&client, &sub_args)
         }
         "logs" => {
             // (07-19 CLI low) same silent `--json` trap as attach: the log tail
@@ -859,92 +921,97 @@ pub(crate) fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             if options.json {
                 return Err("--json is not supported for logs".to_string());
             }
+            reject_remote("logs")?;
             let client = DaemonClient::connect_existing(options.workspace)?;
-            control_logs(&client, &options.args[1..])
+            control_logs(&client, &sub_args)
         }
         "exec" => {
-            let client = DaemonClient::connect_or_spawn(options.workspace)?;
-            control_exec(&client, &options.args[1..], options.json)
+            let client = connect_or_spawn()?;
+            control_exec(&client, &sub_args, options.json)
         }
         "broadcast" => {
-            let client = DaemonClient::connect_or_spawn(options.workspace)?;
-            control_broadcast(&client, &options.args[1..], options.json)
+            let client = connect_or_spawn()?;
+            control_broadcast(&client, &sub_args, options.json)
         }
         "sync" => {
-            if options.args.len() > 2 {
-                return Err(format!("unexpected argument for sync: {}", options.args[2]));
+            if sub_args.len() > 1 {
+                return Err(format!("unexpected argument for sync: {}", sub_args[1]));
             }
-            let client = DaemonClient::connect_or_spawn(options.workspace)?;
-            control_sync_input(&client, &options.args[1..], options.json)
+            let client = connect_or_spawn()?;
+            control_sync_input(&client, &sub_args, options.json)
         }
         "run" => {
-            let client = DaemonClient::connect_or_spawn(options.workspace)?;
-            control_run(&client, &options.args[1..], options.json)
+            let client = connect_or_spawn()?;
+            control_run(&client, &sub_args, options.json)
         }
         "process" => {
-            let client = DaemonClient::connect_or_spawn(options.workspace)?;
-            control_process(&client, &options.args[1..], options.json)
+            let client = connect_or_spawn()?;
+            control_process(&client, &sub_args, options.json)
         }
         "diagnostic" | "diagnostics" => {
-            let client = DaemonClient::connect_existing(options.workspace)?;
-            control_diagnostic(&client, &options.args[1..], options.json)
+            let client = connect_existing()?;
+            control_diagnostic(&client, &sub_args, options.json)
         }
         "wait" => {
             // wait blocks on an existing pane; never spawn a daemon just to wait.
-            let client = DaemonClient::connect_existing(options.workspace)?;
-            control_wait(&client, &options.args[1..], options.json)
+            let client = connect_existing()?;
+            control_wait(&client, &sub_args, options.json)
         }
         "snapshot" => {
             // snapshot reads an existing pane; never spawn a daemon just to read it.
-            let client = DaemonClient::connect_existing(options.workspace)?;
-            control_snapshot(&client, &options.args[1..], options.json)
+            let client = connect_existing()?;
+            control_snapshot(&client, &sub_args, options.json)
         }
         "find" => {
             // find queries existing panes; never spawn a daemon just to query.
-            let client = DaemonClient::connect_existing(options.workspace)?;
-            control_find(&client, &options.args[1..], options.json)
+            let client = connect_existing()?;
+            control_find(&client, &sub_args, options.json)
         }
         "agent" => {
             // agent reads/marks an existing pane; never spawn a daemon for it.
-            let client = DaemonClient::connect_existing(options.workspace)?;
-            control_agent(&client, &options.args[1..], options.json)
+            let client = connect_existing()?;
+            control_agent(&client, &sub_args, options.json)
         }
         "daemons" => {
-            ensure_no_extra_args("daemons", &options.args[1..])?;
+            reject_remote("daemons")?;
+            ensure_no_extra_args("daemons", &sub_args)?;
             control_list_daemons(options.json)
         }
         "hook" => {
-            if has_help_flag(&options.args[1..]) {
+            if has_help_flag(&sub_args) {
                 return print_control_help();
             }
-            let parsed = parse_hook_args(&options.args[1..])?;
+            reject_remote("hook")?;
+            let parsed = parse_hook_args(&sub_args)?;
             control_hook(options.workspace, parsed, options.json)
         }
         "statusline" => {
-            if has_help_flag(&options.args[1..]) {
+            if has_help_flag(&sub_args) {
                 return print_control_help();
             }
-            let parsed = parse_statusline_args(&options.args[1..])?;
+            reject_remote("statusline")?;
+            let parsed = parse_statusline_args(&sub_args)?;
             control_statusline(options.workspace, parsed, options.json)
         }
         "serve" => {
-            if has_help_flag(&options.args[1..]) {
+            if has_help_flag(&sub_args) {
                 return print_control_help();
             }
-            let parsed = parse_serve_args(options.workspace, &options.args[1..])?;
+            reject_remote("serve")?;
+            let parsed = parse_serve_args(options.workspace, &sub_args)?;
             control_serve(parsed)
         }
         "identity" => {
-            if has_help_flag(&options.args[1..]) {
+            if has_help_flag(&sub_args) {
                 return print_control_help();
             }
-            let parsed = parse_identity_args(&options.args[1..])?;
-            let client = DaemonClient::connect_existing(options.workspace)?;
+            let parsed = parse_identity_args(&sub_args)?;
+            let client = connect_existing()?;
             control_identity(&client, parsed, options.json)
         }
         "whoami" => {
-            ensure_no_extra_args("whoami", &options.args[1..])?;
-            let client = DaemonClient::connect_existing(options.workspace)?;
+            ensure_no_extra_args("whoami", &sub_args)?;
+            let client = connect_existing()?;
             let identity: Value = client.request(DaemonRequest::Whoami)?;
             if options.json {
                 return write_json_stdout(&identity);
@@ -974,15 +1041,21 @@ pub(crate) fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             .map_err(|error| format!("failed to write stdout: {error}"))
         }
         "write-config" => {
-            let client = DaemonClient::connect_or_spawn(options.workspace)?;
-            control_write_config(&client, &options.args[1..], options.json)
+            let client = connect_or_spawn()?;
+            control_write_config(&client, &sub_args, options.json)
         }
         "shutdown" => {
-            if let Some(extra) = options.args[1..].iter().find(|arg| *arg != "--all") {
+            if let Some(extra) = sub_args.iter().find(|arg| *arg != "--all") {
                 return Err(format!("unexpected argument for shutdown: {extra}"));
             }
-            if options.args.iter().any(|arg| arg == "--all") {
+            if sub_args.iter().any(|arg| arg == "--all") {
+                if effective_machine.is_some() {
+                    return Err("`ctl shutdown --all` applies only to local daemons".to_string());
+                }
                 control_shutdown_all(options.json)
+            } else if let Some(ref name) = effective_machine {
+                let (client, _) = ensure_machine_client(name)?;
+                control_shutdown(&client, options.json)
             } else {
                 // Stopping a daemon that isn't running is a success, not a reason to
                 // spawn one just to kill it.
@@ -993,13 +1066,28 @@ pub(crate) fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
                 }
             }
         }
-        "pane" => control_pane_subcommand(options),
         other => Err(format!("unknown ctl command: {other}")),
     }
 }
 
 pub(crate) fn parse_control_options(raw_args: Vec<String>) -> Result<ControlOptions, String> {
-    let mut workspace = resolve_workspace_dir();
+    let env_workspace = std::env::var_os("SGIAN_WORKSPACE")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty());
+    let env_machine = std::env::var("SGIAN_MACHINE")
+        .ok()
+        .map(|val| val.trim().to_string())
+        .filter(|val| !val.is_empty());
+    parse_control_options_with_env(raw_args, env_workspace, env_machine)
+}
+
+pub(crate) fn parse_control_options_with_env(
+    raw_args: Vec<String>,
+    env_workspace: Option<PathBuf>,
+    env_machine: Option<String>,
+) -> Result<ControlOptions, String> {
+    let mut cli_workspace: Option<PathBuf> = None;
+    let mut cli_machine: Option<String> = None;
     let mut json = false;
     let mut positionals: Vec<String> = Vec::new();
     let mut after_double_dash = false;
@@ -1020,7 +1108,21 @@ pub(crate) fn parse_control_options(raw_args: Vec<String>) -> Result<ControlOpti
                 let value = raw_args
                     .get(index + 1)
                     .ok_or_else(|| "--workspace requires a path".to_string())?;
-                workspace = PathBuf::from(value);
+                cli_workspace = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--machine" => {
+                let value = raw_args
+                    .get(index + 1)
+                    .ok_or_else(|| "--machine requires a machine name".to_string())?;
+                cli_machine = Some(value.clone());
+                index += 2;
+            }
+            "-m" if positionals.is_empty() => {
+                let value = raw_args
+                    .get(index + 1)
+                    .ok_or_else(|| "-m requires a machine name".to_string())?;
+                cli_machine = Some(value.clone());
                 index += 2;
             }
             "--json" => {
@@ -1042,8 +1144,9 @@ pub(crate) fn parse_control_options(raw_args: Vec<String>) -> Result<ControlOpti
             }
             value => {
                 // The first positional is the subcommand. For commands that take free
-                // text (send/exec), stop interpreting later tokens as global flags so a
-                // payload containing --json/--workspace is preserved verbatim.
+                // text (send/exec) or subcommand-scoped flags (`machine add --workspace`),
+                // stop interpreting later tokens as global flags so payloads/flags
+                // are preserved verbatim.
                 if positionals.is_empty() && is_freeform_subcommand(value) {
                     freeform = true;
                 }
@@ -1053,8 +1156,64 @@ pub(crate) fn parse_control_options(raw_args: Vec<String>) -> Result<ControlOpti
         }
     }
 
+    if cli_workspace.is_some() && cli_machine.is_some() {
+        return Err("--workspace and --machine cannot be used together".to_string());
+    }
+
+    let is_machine_mgmt = positionals.first().map(String::as_str) == Some("machine");
+    let default_ws = || {
+        env_workspace.clone().unwrap_or_else(|| {
+            resolve_workspace_dir_from_cwd(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            )
+        })
+    };
+
+    let (workspace, explicit_workspace, machine) = if let Some(raw_machine) = cli_machine {
+        let name = validate_machine_name(&raw_machine)?;
+        (default_ws(), false, Some(name))
+    } else if let Some(explicit_ws) = cli_workspace {
+        (explicit_ws, true, None)
+    } else if is_machine_mgmt {
+        (default_ws(), false, None)
+    } else {
+        if env_workspace.is_some() && env_machine.is_some() {
+            return Err(
+                "SGIAN_MACHINE and SGIAN_WORKSPACE cannot both be set; pass --machine or --workspace explicitly"
+                    .to_string(),
+            );
+        }
+        if let Some(raw_machine) = env_machine {
+            let name = validate_machine_name(&raw_machine)?;
+            (default_ws(), false, Some(name))
+        } else {
+            let has_env_ws = env_workspace.is_some();
+            (default_ws(), has_env_ws, None)
+        }
+    };
+
+    // Allow trailing `--json` on `ctl machine ... --json` even though `machine` is
+    // parsed freeform to protect `machine add --workspace`.
+    if is_machine_mgmt {
+        let mut filtered = Vec::with_capacity(positionals.len());
+        let mut seen_sep = false;
+        for token in positionals {
+            if !seen_sep && token == "--" {
+                seen_sep = true;
+                filtered.push(token);
+            } else if !seen_sep && token == "--json" {
+                json = true;
+            } else {
+                filtered.push(token);
+            }
+        }
+        positionals = filtered;
+    }
+
     Ok(ControlOptions {
         workspace,
+        explicit_workspace,
+        machine,
         json,
         args: positionals,
     })
@@ -1084,7 +1243,7 @@ pub(crate) fn is_freeform_subcommand(name: &str) -> bool {
     // (L5 — the alias diverged from the direct command).
     matches!(
         name,
-        "send" | "exec" | "broadcast" | "run" | "process" | "pane"
+        "send" | "exec" | "broadcast" | "run" | "process" | "pane" | "machine"
     )
 }
 
@@ -1157,8 +1316,13 @@ pub(crate) fn control_pane_subcommand(mut options: ControlOptions) -> Result<(),
 
 pub(crate) fn prepend_ctl_args(options: ControlOptions) -> Vec<String> {
     let mut args = vec!["sgian".to_string(), CTL_ARG.to_string()];
-    args.push("--workspace".to_string());
-    args.push(options.workspace.display().to_string());
+    if let Some(machine) = options.machine {
+        args.push("--machine".to_string());
+        args.push(machine);
+    } else if options.explicit_workspace {
+        args.push("--workspace".to_string());
+        args.push(options.workspace.display().to_string());
+    }
     if options.json {
         args.push("--json".to_string());
     }
@@ -1512,7 +1676,7 @@ pub(crate) fn control_status_verbose(
 /// environment, the credential's holder (the daemon would refuse any other);
 /// else the self-declared default. One `whoami` round trip when credentialed.
 pub(crate) fn effective_holder(client: &DaemonClient) -> String {
-    if client_token_from_env().is_some() {
+    if client.has_client_token() {
         if let Ok(identity) = client.request::<Value>(DaemonRequest::Whoami) {
             if let Some(holder) = identity["holder"].as_str().filter(|h| !h.is_empty()) {
                 return holder.to_string();
@@ -5897,6 +6061,8 @@ Global options (may precede the command; --json/--workspace may also follow
 commands that don't take free text. They are recognized even right after a
 value-taking flag, so use `--` when a VALUE must literally be one of them):
   -w, --workspace PATH   Target a workspace directory (default: current dir)
+  -m, --machine NAME     Target a saved remote workspace (or $SGIAN_MACHINE);
+                         pane commands also accept <machine>/<pane> shorthand
       --json             Emit machine-readable JSON
   -h, --help             Show this help
       --                 End global-flag recognition; later tokens pass through
@@ -5904,6 +6070,10 @@ value-taking flag, so use `--` when a VALUE must literally be one of them):
 Commands (PANE is a pane id or title; defaults to the active pane):
   workspaces                    List known workspaces
   daemons                       List workspaces and whether their daemon is running
+  machine list                  List saved remote workspaces in global config.json
+  machine add <NAME> --host <HOST> --workspace <PATH> [--port N] [--token-stdin | --token-file PATH]
+                                Save a remote SSH workspace target (or --transport ssm --target ID)
+  machine remove <NAME>         Remove a saved remote workspace and its local tunnel/token state
   ipc-endpoint                  Start/locate the daemon and print native-client
                                 IPC discovery metadata (never prints the token)
   panes | list                  List panes in the workspace

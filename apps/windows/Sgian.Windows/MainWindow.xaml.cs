@@ -53,7 +53,8 @@ public sealed partial class MainWindow : Window
         ViewModel.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName is nameof(ViewModel.Status) or nameof(ViewModel.ErrorMessage) or
-                nameof(ViewModel.WorkspacePath) or nameof(ViewModel.LeaseNotice)) RefreshChrome();
+                nameof(ViewModel.WorkspacePath) or nameof(ViewModel.ActiveMachine) or
+                nameof(ViewModel.LeaseNotice)) RefreshChrome();
             // The empty state shows the status and the error; rebuild it when
             // either changes so it does not keep saying "Connecting" after a
             // failure, and so the picker button appears when a workspace is
@@ -176,8 +177,20 @@ public sealed partial class MainWindow : Window
     private void RefreshChrome()
     {
         ConnectionStatus.Text = ViewModel.Status;
-        WorkspaceLabel.Text = Path.GetFileName(ViewModel.WorkspacePath.TrimEnd(Path.DirectorySeparatorChar));
-        ToolTipService.SetToolTip(WorkspaceLabel, ViewModel.WorkspacePath);
+        if (ViewModel.ActiveMachine is { } machine)
+        {
+            WorkspaceIcon.Glyph = "\uE968";
+            WorkspaceHeaderLabel.Text = "Remote machine";
+            WorkspaceLabel.Text = machine.Name;
+            ToolTipService.SetToolTip(WorkspaceLabel, machine.DisplaySubtitle);
+        }
+        else
+        {
+            WorkspaceIcon.Glyph = "\uE8B7";
+            WorkspaceHeaderLabel.Text = "Workspace";
+            WorkspaceLabel.Text = Path.GetFileName(ViewModel.WorkspacePath.TrimEnd(Path.DirectorySeparatorChar));
+            ToolTipService.SetToolTip(WorkspaceLabel, ViewModel.WorkspacePath);
+        }
         ErrorBar.Message = ViewModel.ErrorMessage ?? "";
         ErrorBar.IsOpen = !string.IsNullOrWhiteSpace(ViewModel.ErrorMessage);
         LeaseBar.Message = ViewModel.LeaseNotice ?? "";
@@ -346,7 +359,14 @@ public sealed partial class MainWindow : Window
             ("Release keyboard (with hand-back note)…", ReleaseLeaseAsync),
             ("Check for updates", () => NativeUpdates.CheckAsync(Root.XamlRoot)),
         };
+        ViewModel.ReloadSavedMachines();
         actions.AddRange(ViewModel.Panes.Select(pane => ($"Focus: {pane.Title} [{pane.Id}]", (Func<Task>)(() => ViewModel.SelectAsync(pane)))));
+        if (ViewModel.ActiveMachine is not null)
+        {
+            actions.Add(($"Switch to local workspace: {ViewModel.LocalWorkspacePath}", () => ViewModel.ConnectLocalWorkspaceAsync()));
+        }
+        actions.AddRange(ViewModel.SavedMachines.Select(machine =>
+            ($"Machine: {machine.Name} ({machine.DisplaySubtitle})", (Func<Task>)(() => ViewModel.ConnectMachineAsync(machine)))));
         actions.AddRange(ViewModel.RecentWorkspaces.Select(path => ($"Workspace: {path}", (Func<Task>)(() => ViewModel.ConnectAsync(path)))));
         try
         {
@@ -479,7 +499,45 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async void ChooseWorkspace_Click(object sender, RoutedEventArgs e) => await ChooseWorkspaceAsync();
+    private async void ChooseWorkspace_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.ReloadSavedMachines();
+        if (ViewModel.SavedMachines.Count == 0 && ViewModel.ActiveMachine is null)
+        {
+            await ChooseWorkspaceAsync();
+            return;
+        }
+
+        var flyout = new MenuFlyout();
+        foreach (var machine in ViewModel.SavedMachines)
+        {
+            var captured = machine;
+            var item = new MenuFlyoutItem
+            {
+                Text = $"{captured.Name} \u00B7 {captured.DisplaySubtitle}",
+            };
+            item.Click += async (_, _) => await ViewModel.ConnectMachineAsync(captured);
+            flyout.Items.Add(item);
+        }
+        if (flyout.Items.Count > 0)
+        {
+            flyout.Items.Add(new MenuFlyoutSeparator());
+        }
+        if (ViewModel.ActiveMachine is not null)
+        {
+            var localName = Path.GetFileName(ViewModel.LocalWorkspacePath.TrimEnd(Path.DirectorySeparatorChar));
+            var localItem = new MenuFlyoutItem
+            {
+                Text = $"Local workspace ({localName})",
+            };
+            localItem.Click += async (_, _) => await ViewModel.ConnectLocalWorkspaceAsync();
+            flyout.Items.Add(localItem);
+        }
+        var chooseItem = new MenuFlyoutItem { Text = "Choose local workspace\u2026" };
+        chooseItem.Click += async (_, _) => await ChooseWorkspaceAsync();
+        flyout.Items.Add(chooseItem);
+        flyout.ShowAt(WorkspaceSwitcherButton);
+    }
 
     private async Task ChooseWorkspaceAsync()
     {

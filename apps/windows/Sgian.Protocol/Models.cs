@@ -25,6 +25,51 @@ public sealed record NativeIpcEndpoint
 
     [JsonPropertyName("capabilities")]
     public IReadOnlyList<string> Capabilities { get; init; } = [];
+
+    [JsonPropertyName("loopback_port")]
+    public ushort? LoopbackPort { get; init; }
+}
+
+public sealed record SavedMachine
+{
+    [JsonPropertyName("name")]
+    public string Name { get; init; } = "";
+
+    [JsonPropertyName("transport")]
+    public string Transport { get; init; } = "ssh";
+
+    [JsonPropertyName("host")]
+    public string? Host { get; init; }
+
+    [JsonPropertyName("port")]
+    public ushort? Port { get; init; }
+
+    [JsonPropertyName("workspace")]
+    public string Workspace { get; init; } = "";
+
+    [JsonPropertyName("target")]
+    public string? Target { get; init; }
+
+    [JsonPropertyName("token_file")]
+    public string? TokenFile { get; init; }
+
+    [JsonIgnore]
+    public string DisplaySubtitle
+    {
+        get
+        {
+            if (!string.IsNullOrEmpty(Host))
+            {
+                var endpoint = Port is { } port ? $"{Host}:{port}" : Host;
+                return $"{endpoint} \u00B7 {Workspace}";
+            }
+            if (!string.IsNullOrEmpty(Target))
+            {
+                return $"{Target} \u00B7 {Workspace}";
+            }
+            return Workspace;
+        }
+    }
 }
 
 public sealed record Pane

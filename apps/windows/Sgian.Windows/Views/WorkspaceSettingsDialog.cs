@@ -99,10 +99,15 @@ internal static class WorkspaceSettingsDialog
                 panel.Children.Add(forget);
             }
             panel.Children.Add(new TextBlock { Text = model.HasStoredCredential
-                ? "A credential is stored for this workspace; the daemon attributes your input and leases to it."
-                : $"Without a credential this PC connects with the workspace token as {LeaseState.DefaultHolder()}.", TextWrapping = TextWrapping.Wrap });
+                ? "A client credential is configured for this target; the daemon attributes your input and leases to it."
+                : model.ActiveMachine is not null
+                    ? "Remote targets require a scoped client credential (`sgian ctl identity issue`)."
+                    : $"Without a credential this PC connects with the workspace token as {LeaseState.DefaultHolder()}.", TextWrapping = TextWrapping.Wrap });
         }
-        var dialog = new ContentDialog { XamlRoot = root, Title = $"Settings · {Path.GetFileName(model.WorkspacePath)}",
+        var settingsTargetLabel = model.ActiveMachine is { } activeMachine
+            ? activeMachine.Name
+            : Path.GetFileName(model.WorkspacePath);
+        var dialog = new ContentDialog { XamlRoot = root, Title = $"Settings · {settingsTargetLabel}",
             Content = new ScrollViewer { Content = panel, MaxHeight = 520 }, PrimaryButtonText = "Save", CloseButtonText = "Cancel" };
         dialog.PrimaryButtonClick += async (_, args) =>
         {

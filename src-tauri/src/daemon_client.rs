@@ -45,13 +45,31 @@ impl DaemonConnection {
         token: &str,
         read_timeout: Option<Duration>,
     ) -> Result<Self, String> {
-        let stream = transport_connect(socket_path)
-            .map_err(|error| format!("failed to connect to daemon: {error}"))?;
+        Self::connect_with_options(socket_path, None, token, None, read_timeout)
+    }
+
+    pub(crate) fn connect_with_options(
+        socket_path: &Path,
+        tcp_endpoint: Option<std::net::SocketAddr>,
+        token: &str,
+        client_token_override: Option<&str>,
+        read_timeout: Option<Duration>,
+    ) -> Result<Self, String> {
+        let stream = match tcp_endpoint {
+            Some(addr) => transport_connect_loopback(addr).map_err(|error| {
+                format!("failed to connect to daemon loopback endpoint {addr}: {error}")
+            })?,
+            None => transport_connect(socket_path)
+                .map_err(|error| format!("failed to connect to daemon: {error}"))?,
+        };
         // Best-effort: a transport that cannot set timeouts still works, it just
         // keeps the old blocking behavior.
         let _ = stream.set_read_timeout(read_timeout);
         let _ = stream.set_write_timeout(read_timeout);
-        Self::handshake(stream, token, client_token_from_env().as_deref())
+        let resolved_client_token = client_token_override
+            .map(str::to_string)
+            .or_else(client_token_from_env);
+        Self::handshake(stream, token, resolved_client_token.as_deref())
     }
 
     /// Adjust this connection's read deadline. Event subscriptions clear it
@@ -1490,6 +1508,8 @@ pub(crate) fn resolve_workspace_dir_from_cwd(current: PathBuf) -> PathBuf {
 #[derive(Debug)]
 pub(crate) struct ControlOptions {
     pub(crate) workspace: PathBuf,
+    pub(crate) explicit_workspace: bool,
+    pub(crate) machine: Option<String>,
     pub(crate) json: bool,
     pub(crate) args: Vec<String>,
 }

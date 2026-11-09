@@ -475,3 +475,56 @@ func daemonRoundTrip() async throws {
     let malformed = try JSONDecoder().decode(JSONValue.self, from: Data(#"{"event":"project_notes_changed"}"#.utf8))
     #expect(ProjectNote.changedProject(event: malformed) == nil)
 }
+
+@Test func savedMachinesLoadFromGlobalConfigAndResolveTunnelPaths() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sgian-machines-test-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    #expect(WorkspaceLocator.loadSavedMachines(appSupportURL: root).isEmpty)
+
+    let configJSON = #"""
+    {
+      "machines": [
+        {
+          "name": "devbox",
+          "host": "ubuntu@10.0.1.5",
+          "port": 2222,
+          "workspace": "/srv/repo"
+        },
+        {
+          "name": "winbox",
+          "transport": "ssh",
+          "host": "dev@10.0.1.9",
+          "workspace": "C:\\Users\\dev\\repo",
+          "token_file": "/custom/winbox.token"
+        }
+      ]
+    }
+    """#
+    try Data(configJSON.utf8).write(to: root.appendingPathComponent("config.json"))
+
+    let machines = WorkspaceLocator.loadSavedMachines(appSupportURL: root)
+    #expect(machines.count == 2)
+    #expect(machines[0].name == "devbox")
+    #expect(machines[0].transport == "ssh")
+    #expect(machines[0].displaySubtitle == "ubuntu@10.0.1.5:2222 · /srv/repo")
+
+    let defaultLocator = WorkspaceLocator(machine: machines[0], appSupportURL: root)
+    #expect(defaultLocator.workspaceKey == "machine:devbox")
+    #expect(defaultLocator.socketURL.path == root.appendingPathComponent("runtime/machines/devbox/daemon.sock").path)
+    #expect(defaultLocator.tokenURL.path == root.appendingPathComponent("machines/devbox.token").path)
+
+    let customLocator = WorkspaceLocator(machine: machines[1], appSupportURL: root)
+    #expect(customLocator.tokenURL.path == "/custom/winbox.token")
+
+    // CredentialStore.loadMachine falls back to the 0600 token file when no Keychain entry overrides it.
+    let machinesDir = root.appendingPathComponent("machines", isDirectory: true)
+    try FileManager.default.createDirectory(at: machinesDir, withIntermediateDirectories: true)
+    let fallbackTokenURL = defaultLocator.tokenURL
+    try Data("sgc_file_fallback_token\n".utf8).write(to: fallbackTokenURL)
+    let uniqueMachineName = "test-fallback-\(UUID().uuidString)"
+    defer { CredentialStore.saveMachine(nil, for: uniqueMachineName) }
+    #expect(CredentialStore.loadMachine(uniqueMachineName, fallbackTokenURL: fallbackTokenURL) == "sgc_file_fallback_token")
+}
