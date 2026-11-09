@@ -28,6 +28,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 use notify::Watcher;
@@ -409,8 +410,12 @@ pub(crate) struct WrittenNote {
     pub(crate) bytes: usize,
 }
 
+static NEXT_NOTE_STAGE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Write one note. The caller has validated the title and body; this
-/// enforces the count and directory caps and never overwrites.
+/// enforces the count and directory caps and never overwrites. Stages via a
+/// dot-prefixed file ignored by [`validate_note_file`] before linking into
+/// place so directory watchers never observe a 0-byte or half-written `.md`.
 pub(crate) fn add_note(dir: &Path, meta: &NoteMeta, body: &str) -> Result<WrittenNote, String> {
     let existing = note_files(dir)?;
     if existing.len() >= NOTES_MAX_COUNT {
@@ -429,13 +434,40 @@ pub(crate) fn add_note(dir: &Path, meta: &NoteMeta, body: &str) -> Result<Writte
         .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
     reject_symlinks_in_notes_dir(dir)?;
     let path = dir.join(&file);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut handle = options
-        .open(&path)
-        .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
-    std::io::Write::write_all(&mut handle, text.as_bytes())
-        .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    let stage_id = NEXT_NOTE_STAGE_ID.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = dir.join(format!(".sgian-note-{}-{stage_id}.tmp", std::process::id()));
+    let mut tmp_options = fs::OpenOptions::new();
+    tmp_options.write(true).create_new(true);
+    let mut tmp_handle = tmp_options
+        .open(&tmp_path)
+        .map_err(|error| format!("failed to create {}: {error}", tmp_path.display()))?;
+    if let Err(error) = std::io::Write::write_all(&mut tmp_handle, text.as_bytes()) {
+        drop(tmp_handle);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("failed to write {}: {error}", tmp_path.display()));
+    }
+    drop(tmp_handle);
+
+    match fs::hard_link(&tmp_path, &path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("failed to create {}: {error}", path.display()));
+        }
+        Err(_) => {
+            let _ = fs::remove_file(&tmp_path);
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut handle = options
+                .open(&path)
+                .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+            std::io::Write::write_all(&mut handle, text.as_bytes())
+                .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+        }
+    }
+
     Ok(WrittenNote {
         file,
         path,

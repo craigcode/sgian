@@ -2292,6 +2292,12 @@ struct DaemonServer {
     /// accept loop drains them into `project_notes_changed` events.
     notes_watch: Mutex<Option<notes::NotesWatch>>,
     notes_changes: Mutex<std::sync::mpsc::Receiver<PathBuf>>,
+    /// Serializes daemon note mutations + `notes_own_writes` / `notes_last_hash`
+    /// registration against `drain_notes_changes()` so fast watchers (`inotify`)
+    /// never inspect a daemon write before its expected hash is recorded. Leaf
+    /// I/O gate: never held across `ledger`, `router`, `registry`, `terminals`,
+    /// or `leases`.
+    notes_io_gate: Mutex<()>,
     /// Notes the daemon itself just wrote or removed, by (project, file) →
     /// resulting hash, so the watch does not announce them a second time.
     notes_own_writes: Mutex<HashMap<(String, String), Option<String>>>,
@@ -2582,6 +2588,7 @@ impl DaemonServer {
             cwd: cwd_for_notes,
             notes_watch: Mutex::new(notes_watch),
             notes_changes: Mutex::new(notes_rx),
+            notes_io_gate: Mutex::new(()),
             notes_own_writes: Mutex::new(HashMap::new()),
             notes_last_hash: Mutex::new(HashMap::new()),
             log_dispatch,
@@ -3195,8 +3202,21 @@ impl DaemonServer {
         }
     }
 
-    /// Announce a note the daemon itself wrote or removed, remember it so the
-    /// file watch's echo of the same change is dropped, and deliver the
+    /// Record the resulting content hash (or `None` on removal) of a daemon-owned
+    /// note mutation while `notes_io_gate` is still held so `drain_notes_changes`
+    /// drops the OS file-watcher echo even if an idle tick fires before ledger
+    /// fsync completes.
+    fn record_own_note_write(&self, project: &str, file: &str, hash: Option<String>) {
+        let key = (project.to_string(), file.to_string());
+        if let Ok(mut own) = self.notes_own_writes.lock() {
+            own.insert(key.clone(), hash.clone());
+        }
+        if let Ok(mut seen) = self.notes_last_hash.lock() {
+            seen.insert(key, hash);
+        }
+    }
+
+    /// Announce a note the daemon itself wrote or removed and deliver the
     /// opt-in prompt line when enabled on the project.
     fn announce_own_note(
         &self,
@@ -3205,13 +3225,6 @@ impl DaemonServer {
         hash: Option<String>,
         origin_pane: Option<&str>,
     ) {
-        let key = (project.to_string(), file.to_string());
-        if let Ok(mut own) = self.notes_own_writes.lock() {
-            own.insert(key.clone(), hash.clone());
-        }
-        if let Ok(mut seen) = self.notes_last_hash.lock() {
-            seen.insert(key, hash.clone());
-        }
         self.router.broadcast(&DaemonEvent::ProjectNotesChanged {
             project: project.to_string(),
             file: file.to_string(),
@@ -3225,41 +3238,50 @@ impl DaemonServer {
     /// one per (project, file), with the hash of what is there now. Runs on
     /// the accept loop's idle tick, so it never blocks a request.
     pub(crate) fn drain_notes_changes(&self) {
-        let mut changed: std::collections::BTreeSet<(String, String)> =
-            std::collections::BTreeSet::new();
-        if let Ok(receiver) = self.notes_changes.lock() {
-            while let Ok(path) = receiver.try_recv() {
-                if let Some(change) = notes::note_change_from_path(&path) {
-                    changed.insert(change);
+        let mut pending_announcements: Vec<(String, String, Option<String>)> = Vec::new();
+        {
+            let Ok(_io_guard) = self.notes_io_gate.lock() else {
+                return;
+            };
+            let mut changed: std::collections::BTreeSet<(String, String)> =
+                std::collections::BTreeSet::new();
+            if let Ok(receiver) = self.notes_changes.lock() {
+                while let Ok(path) = receiver.try_recv() {
+                    if let Some(change) = notes::note_change_from_path(&path) {
+                        changed.insert(change);
+                    }
                 }
             }
-        }
-        for (project, file) in changed {
-            let Ok(dir) = self.project_notes_dir(&project) else {
-                continue;
-            };
-            let hash = notes::read_note_file_bounded(&dir.join(&file))
-                .ok()
-                .map(|raw| notes::note_hash(&raw));
-            let key = (project.clone(), file.clone());
-            // The daemon's own write already announced exactly this state.
-            let own = self
-                .notes_own_writes
-                .lock()
-                .ok()
-                .and_then(|mut own| own.remove(&key));
-            if own.as_ref() == Some(&hash) {
-                continue;
-            }
-            // Drop duplicate FSEvents / metadata ticks whose content hash (or
-            // absence) matches the last state already announced.
-            if let Ok(mut seen) = self.notes_last_hash.lock() {
-                let prev = seen.get(&key);
-                if prev == Some(&hash) || (prev.is_none() && hash.is_none()) {
+            for (project, file) in changed {
+                let Ok(dir) = self.project_notes_dir(&project) else {
+                    continue;
+                };
+                let hash = notes::read_note_file_bounded(&dir.join(&file))
+                    .ok()
+                    .map(|raw| notes::note_hash(&raw));
+                let key = (project.clone(), file.clone());
+                // The daemon's own write already recorded this exact state.
+                let own = self
+                    .notes_own_writes
+                    .lock()
+                    .ok()
+                    .and_then(|mut own| own.remove(&key));
+                if own.as_ref() == Some(&hash) {
                     continue;
                 }
-                seen.insert(key, hash.clone());
+                // Drop duplicate FSEvents / metadata ticks whose content hash (or
+                // absence) matches the last state already announced.
+                if let Ok(mut seen) = self.notes_last_hash.lock() {
+                    let prev = seen.get(&key);
+                    if prev == Some(&hash) || (prev.is_none() && hash.is_none()) {
+                        continue;
+                    }
+                    seen.insert(key, hash.clone());
+                }
+                pending_announcements.push((project, file, hash));
             }
+        }
+        for (project, file, hash) in pending_announcements {
             self.router.broadcast(&DaemonEvent::ProjectNotesChanged {
                 project: project.clone(),
                 file: file.clone(),
@@ -3377,7 +3399,15 @@ impl DaemonServer {
             pane: pane_id.map(str::to_string),
             written_at_ms: now_millis(),
         };
-        let written = notes::add_note(&dir, &meta, &body)?;
+        let written = {
+            let _io_guard = self
+                .notes_io_gate
+                .lock()
+                .map_err(|_| "notes write lock poisoned".to_string())?;
+            let written = notes::add_note(&dir, &meta, &body)?;
+            self.record_own_note_write(name, &written.file, Some(written.hash.clone()));
+            written
+        };
         // One receipt: what the ledger records is what the client is told.
         let mut receipt = json!({
             "project": name,
@@ -3408,7 +3438,15 @@ impl DaemonServer {
     ) -> Result<Value, String> {
         let dir = self.project_notes_dir(name)?;
         let holder = validate_holder(holder)?;
-        let (hash, bytes) = notes::remove_note(&dir, file)?;
+        let (hash, bytes) = {
+            let _io_guard = self
+                .notes_io_gate
+                .lock()
+                .map_err(|_| "notes write lock poisoned".to_string())?;
+            let removed = notes::remove_note(&dir, file)?;
+            self.record_own_note_write(name, file, None);
+            removed
+        };
         let _ = self.ledger_record(
             &project_ledger_key(name),
             "note.removed",

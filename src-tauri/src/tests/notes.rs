@@ -662,7 +662,9 @@ fn project_notes_changes_are_announced_once() {
     // An edit outside the daemon reaches subscribers through the watch.
     let notes_dir = repo.path().join(".sgian/projects/feature/notes");
     let raw = "written by an editor\n";
-    fs::write(notes_dir.join("2020-01-01-outside.md"), raw).expect("outside write");
+    let outside_stage = notes_dir.join(".outside-stage.tmp");
+    fs::write(&outside_stage, raw).expect("stage outside write");
+    fs::rename(&outside_stage, notes_dir.join("2020-01-01-outside.md")).expect("outside write");
     let (project, changed, hash) = next_change(&mut events);
     assert_eq!(
         (project.as_str(), changed.as_str()),
@@ -689,7 +691,9 @@ fn project_notes_changes_are_announced_once() {
     assert_eq!(hash, None);
 
     // Nothing was announced twice: a probe write is the very next event.
-    fs::write(notes_dir.join("2020-01-02-probe.md"), "probe\n").expect("probe write");
+    let probe_stage = notes_dir.join(".probe-stage.tmp");
+    fs::write(&probe_stage, "probe\n").expect("stage probe write");
+    fs::rename(&probe_stage, notes_dir.join("2020-01-02-probe.md")).expect("probe write");
     let (_, changed, _) = next_change(&mut events);
     assert_eq!(changed, "2020-01-02-probe.md");
 
@@ -863,11 +867,10 @@ fn project_note_prompt_line_is_opt_in_skips_origin_and_leased_and_ledgers() {
     //    `pane_author`, since nobody declared an origin pane), and duplicate
     //    watch ticks with the same content hash do not double-deliver.
     let notes_dir = repo.path().join(".sgian/projects/feature/notes");
-    fs::write(
-        notes_dir.join("2026-10-31-outside.md"),
-        format!("external body {secret_body}\n"),
-    )
-    .expect("external note write");
+    let outside_tmp = notes_dir.join(".outside.tmp");
+    fs::write(&outside_tmp, format!("external body {secret_body}\n")).expect("stage outside note");
+    fs::rename(&outside_tmp, notes_dir.join("2026-10-31-outside.md"))
+        .expect("publish external note");
     let outside_line = "[sgian] project notes changed: 2026-10-31-outside.md";
     for target in [&pane_author, &pane_peer.id] {
         let wait_res: Value = client
@@ -952,6 +955,153 @@ fn project_note_prompt_line_is_opt_in_skips_origin_and_leased_and_ledgers() {
         notified[1]["payload"]["file"],
         json!("2026-10-31-outside.md")
     );
+
+    daemon.shutdown();
+}
+
+/// Regression for the `inotify` idle-tick race where `drain_notes_changes()`
+/// could observe a daemon-written note file before `notes_own_writes` recorded
+/// its hash (while `ledger_record` was fsyncing), delivering a spurious
+/// `[sgian] project notes changed:` prompt to the authoring pane.
+#[cfg(unix)]
+#[test]
+fn own_note_writes_never_notify_author_under_rapid_watcher_burst() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::create_dir(repo.path().join(".git")).expect("mark the repo");
+    let config = Config {
+        shell: Some("/bin/cat".into()),
+        shell_args: Some(vec![]),
+        ..Config::default()
+    };
+    let daemon = TestDaemon::spawn(config);
+    let client = daemon.client();
+    let initial: WorkspaceSnapshot = client
+        .request(DaemonRequest::BootstrapWorkspace)
+        .expect("bootstrap");
+    let pane_author = initial.panes[0].id.clone();
+    let pane_peer: Pane = client
+        .request(DaemonRequest::CreatePane {
+            title: Some("peer".into()),
+            profile: None,
+        })
+        .expect("peer pane");
+
+    let _: Project = client
+        .request(DaemonRequest::ProjectCreate {
+            name: "burst".into(),
+            goal: Some("watcher race check".into()),
+            repo: Some(repo.path().display().to_string()),
+            notify_notes: true,
+        })
+        .expect("create project");
+    for id in [&pane_author, &pane_peer.id] {
+        let _: Value = client
+            .request(DaemonRequest::ProjectAssign {
+                name: "burst".into(),
+                pane_id: id.clone(),
+            })
+            .expect("assign");
+    }
+
+    // Concurrent same-title burst exercises both `notes_io_gate` filename
+    // collision serialization and the watcher own-write suppression window.
+    let mut handles = Vec::new();
+    for idx in 0..4 {
+        let worker_client = daemon.client();
+        let author = pane_author.clone();
+        handles.push(thread::spawn(move || {
+            let mut last_file = String::new();
+            for step in 0..5 {
+                let res: Value = worker_client
+                    .request(DaemonRequest::ProjectNoteAdd {
+                        name: "burst".into(),
+                        title: "Burst note".into(),
+                        body: format!("worker {idx} step {step}"),
+                        holder: "lead-agent".into(),
+                        pane_id: Some(author.clone()),
+                    })
+                    .expect("concurrent note add");
+                last_file = res["file"].as_str().expect("file").to_string();
+            }
+            last_file
+        }));
+    }
+
+    let mut last_files = Vec::new();
+    for handle in handles {
+        last_files.push(handle.join().expect("worker join"));
+    }
+    for file in &last_files {
+        let expected = format!("[sgian] project notes changed: {file}");
+        let wait_res: Value = client
+            .request(DaemonRequest::Wait {
+                pane_id: pane_peer.id.clone(),
+                condition: WaitCondition::Text(expected),
+                timeout_ms: Some(4_000),
+            })
+            .expect("wait on peer");
+        assert_eq!(wait_res["matched"], json!(true), "{wait_res}");
+    }
+
+    // Let at least two 100ms accept-loop idle ticks drain any trailing watch events.
+    thread::sleep(Duration::from_millis(250));
+
+    let author_scroll: Value = client
+        .request(DaemonRequest::GetScrollback {
+            pane_id: pane_author.clone(),
+        })
+        .expect("author scrollback");
+    assert!(
+        !author_scroll["scrollback"]
+            .as_str()
+            .unwrap_or("")
+            .contains("[sgian] project notes changed:"),
+        "authoring pane must never be notified during concurrent burst"
+    );
+
+    let dossier: Value = client
+        .request(DaemonRequest::ProjectDossier {
+            name: "burst".into(),
+            lines: 0,
+        })
+        .expect("dossier");
+    let panes = dossier["panes"].as_array().expect("panes");
+    let author_dossier = panes
+        .iter()
+        .find(|p| p["id"] == json!(pane_author))
+        .expect("author in dossier");
+    let author_notified = author_dossier["ledger"]["records"]
+        .as_array()
+        .expect("author ledger")
+        .iter()
+        .filter(|r| r["type"] == json!("note.notified"))
+        .count();
+    assert_eq!(author_notified, 0);
+
+    let peer_dossier = panes
+        .iter()
+        .find(|p| p["id"] == json!(pane_peer.id))
+        .expect("peer in dossier");
+    let peer_notified = peer_dossier["ledger"]["records"]
+        .as_array()
+        .expect("peer ledger")
+        .iter()
+        .filter(|r| r["type"] == json!("note.notified"))
+        .count();
+    assert_eq!(peer_notified, 20);
+
+    let notes_dir = repo.path().join(".sgian/projects/burst/notes");
+    for entry in fs::read_dir(&notes_dir).expect("read notes dir") {
+        let name = entry
+            .expect("dir entry")
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            !name.starts_with('.'),
+            "staging dotfile leaked in notes dir: {name}"
+        );
+    }
 
     daemon.shutdown();
 }
