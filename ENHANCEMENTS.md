@@ -250,9 +250,18 @@ Open, in order:
 
 - **Execution grants — Kranz `TerminalProvider` consumer**: wiring `kranz-acp`
   to Sgian's `grant_*` endpoints on the Kranz side.
-- **M5 SSM / ECS Exec target**: needs an AWS host to test against.
-- **Hands-on acceptance on a phone**: the served view over `ssh -L` from a
-  real device (the phone-width layout was checked in a desktop browser at
+- **Machines** (#114): saved remote workspaces (SSH host, workspace path,
+  stored credential) with a client-owned tunnel, a sidebar section per
+  machine and `ctl --machine`. The native clients cannot open a forwarded
+  socket today.
+- **M5 SSM / ECS Exec target** (#115): needs an AWS host to test against.
+- **Windows daemon as a remote target** (#116): an attach path (SSM or a
+  loopback TCP listener, since a named pipe cannot be forwarded over SSH) and
+  daemon lifetime without an interactive logon.
+- **Spike: agent-to-agent steering ergonomics and cross-machine pane
+  addressing** (#117): a design note, not code.
+- **Hands-on acceptance on a phone** (#83): the served view over `ssh -L` from
+  a real device (the phone-width layout was checked in a desktop browser at
   375×812 only).
 
 ## 4. Workbench UX
