@@ -1,3 +1,6 @@
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
 using System.Text.Json;
 using Sgian.Protocol;
 
@@ -34,6 +37,7 @@ var tests = new (string Name, Action Body)[]
     ("Workspace startup resolution", WorkspaceStartupResolution),
     ("Output warning sample", OutputWarningSample),
     ("Project notes on the board", ProjectNotesModel),
+    ("Saved machines and loopback TCP transport", SavedMachinesAndLoopbackTransport),
 };
 
 var failures = new List<string>();
@@ -364,6 +368,147 @@ static void WorkspaceDefaults()
     Equal(0, snapshot.Scrollback.Count);
     Equal(0, snapshot.AgentEvents.Count);
     Equal(@"C:\work", snapshot.CurrentDirectory);
+}
+
+static void SavedMachinesAndLoopbackTransport()
+{
+    // 1. NativeIpcEndpoint loopback_port deserialization + ParseLoopbackEndpoint safety.
+    var withPort = JsonSerializer.Deserialize<NativeIpcEndpoint>("""
+        {"transport":"named_pipe","endpoint":"\\\\.\\pipe\\sgian2-test","token_path":"C:\\t","workspace":"C:\\w","workspace_key":"k","protocol_version":1,"capabilities":["subscribe-ack"],"loopback_port":49152}
+        """)!;
+    Equal<ushort?>(49152, withPort.LoopbackPort);
+    var withoutPort = JsonSerializer.Deserialize<NativeIpcEndpoint>("""
+        {"transport":"named_pipe","endpoint":"\\\\.\\pipe\\sgian2-test","token_path":"C:\\t","workspace":"C:\\w","workspace_key":"k","protocol_version":1}
+        """)!;
+    Equal<ushort?>(null, withoutPort.LoopbackPort);
+
+    Equal(49152, EndpointDiscovery.ParseLoopbackEndpoint("127.0.0.1:49152").Port);
+    Equal(49152, EndpointDiscovery.ParseLoopbackEndpoint("[::1]:49152").Port);
+    Throws<DaemonProtocolException>(() => EndpointDiscovery.ParseLoopbackEndpoint("192.0.2.1:49152"));
+    Throws<DaemonProtocolException>(() => EndpointDiscovery.ParseLoopbackEndpoint("0.0.0.0:49152"));
+    Throws<DaemonProtocolException>(() => EndpointDiscovery.ParseLoopbackEndpoint("127.0.0.1:0"));
+    Throws<DaemonProtocolException>(() => EndpointDiscovery.ParseLoopbackEndpoint("not-an-endpoint"));
+
+    // 2. SavedMachine global config loading + token path resolution.
+    var tempDir = Path.Combine(Path.GetTempPath(), $"sgian-machines-test-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(tempDir);
+    try
+    {
+        Equal(0, EndpointDiscovery.LoadSavedMachines(tempDir).Count);
+        File.WriteAllText(Path.Combine(tempDir, "config.json"), """
+            {
+              "machines": [
+                {"name":"devbox","host":"ubuntu@10.0.1.5","port":2222,"workspace":"/srv/repo"},
+                {"name":"winbox","transport":"ssh","host":"dev@10.0.1.9","workspace":"C:\\Users\\dev\\repo","token_file":"C:\\custom\\winbox.token"}
+              ]
+            }
+            """);
+        var machines = EndpointDiscovery.LoadSavedMachines(tempDir);
+        Equal(2, machines.Count);
+        Equal("devbox", machines[0].Name);
+        Equal("ssh", machines[0].Transport);
+        Equal("ubuntu@10.0.1.5:2222 \u00B7 /srv/repo", machines[0].DisplaySubtitle);
+        Equal(Path.Combine(tempDir, "machines", "devbox.token"),
+            EndpointDiscovery.DefaultMachineTokenPath("devbox", machines[0].TokenFile, tempDir));
+        Equal(@"C:\custom\winbox.token",
+            EndpointDiscovery.DefaultMachineTokenPath("winbox", machines[1].TokenFile, tempDir));
+    }
+    finally
+    {
+        try { Directory.Delete(tempDir, recursive: true); } catch { /* best effort */ }
+    }
+
+    // 3. Live DaemonClient handshake, request, and subscription over tcp_loopback.
+    RunLoopbackRoundTripAsync().GetAwaiter().GetResult();
+}
+
+static async Task RunLoopbackRoundTripAsync()
+{
+    using var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    var boundPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+    using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+    var serverTask = Task.Run(async () =>
+    {
+        // Serve two connections: (1) initial ping from ConnectEndpointAsync, (2) SubscribeAsync.
+        for (var connIndex = 0; connIndex < 2; connIndex++)
+        {
+            using var socket = await listener.AcceptTcpClientAsync(stopCts.Token);
+            await using var stream = socket.GetStream();
+            using var reader = new StreamReader(stream, new UTF8Encoding(false), false, 4096, leaveOpen: true);
+            await using var writer = new StreamWriter(stream, new UTF8Encoding(false), 4096, leaveOpen: true)
+            {
+                AutoFlush = true,
+                NewLine = "\n",
+            };
+
+            var helloLine = await reader.ReadLineAsync(stopCts.Token) ?? throw new Exception("EOF before hello");
+            using var helloDoc = JsonDocument.Parse(helloLine);
+            var root = helloDoc.RootElement;
+            Equal("", root.GetProperty("token").GetString() ?? "non-empty");
+            var clientToken = root.TryGetProperty("client_token", out var ct) ? ct.GetString() : null;
+            if (clientToken != "sgc_loopback_secret")
+            {
+                await writer.WriteLineAsync("""{"ok":false,"result":null,"error":"loopback IPC connections require a scoped client_token"}""");
+                continue;
+            }
+            await writer.WriteLineAsync("""{"ok":true,"result":{"capabilities":["subscribe-ack"],"identity":{"holder":"remote-op"}},"error":null}""");
+
+            var reqLine = await reader.ReadLineAsync(stopCts.Token) ?? throw new Exception("EOF before request");
+            using var reqDoc = JsonDocument.Parse(reqLine);
+            var command = reqDoc.RootElement.GetProperty("command").GetString();
+            if (command == "ping")
+            {
+                await writer.WriteLineAsync("""{"ok":true,"result":{"ok":true},"error":null}""");
+            }
+            else if (command == "subscribe")
+            {
+                await writer.WriteLineAsync("""{"event":"subscribe_ack"}""");
+                await writer.WriteLineAsync("""{"event":"pane_created","pane":{"id":"pane-9","title":"win-remote","kind":"shell","created_at_ms":1}}""");
+            }
+        }
+    }, stopCts.Token);
+
+    var endpoint = new NativeIpcEndpoint
+    {
+        Transport = "tcp_loopback",
+        Endpoint = $"127.0.0.1:{boundPort}",
+        TokenPath = "",
+        Workspace = @"C:\Users\op\repo",
+        WorkspaceKey = "machine:winbox",
+        ProtocolVersion = 1,
+        Capabilities = ["subscribe-ack"],
+    };
+
+    await using var client = await DaemonClient.ConnectEndpointAsync(
+        endpoint,
+        token: "",
+        clientToken: "sgc_loopback_secret",
+        cancellationToken: stopCts.Token);
+    Equal("remote-op", client.IdentityHolder);
+
+    using var subCts = CancellationTokenSource.CreateLinkedTokenSource(stopCts.Token);
+    string? createdPaneTitle = null;
+    try
+    {
+        await client.SubscribeAsync(
+            onEvent: ev =>
+            {
+                if (ev.Kind == "pane_created" && ev.Value("pane") is { } paneEl)
+                {
+                    createdPaneTitle = paneEl.GetProperty("title").GetString();
+                    subCts.Cancel();
+                }
+                return Task.CompletedTask;
+            },
+            cancellationToken: subCts.Token);
+    }
+    catch (OperationCanceledException) when (subCts.IsCancellationRequested)
+    {
+    }
+    Equal("win-remote", createdPaneTitle);
+    await serverTask;
 }
 
 static JsonElement Json(string json)

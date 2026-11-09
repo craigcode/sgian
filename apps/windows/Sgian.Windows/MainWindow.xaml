@@ -95,16 +95,16 @@
                     </ListView.ItemTemplate>
                 </ListView>
 
-                <Button Grid.Row="5" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
-                        Click="ChooseWorkspace_Click" ToolTipService.ToolTip="Choose workspace">
+                <Button x:Name="WorkspaceSwitcherButton" Grid.Row="5" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                        Click="ChooseWorkspace_Click" ToolTipService.ToolTip="Choose workspace or saved machine">
                     <Grid ColumnSpacing="9">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="*" />
                         </Grid.ColumnDefinitions>
-                        <FontIcon Glyph="&#xE8B7;" FontSize="14" />
+                        <FontIcon x:Name="WorkspaceIcon" Glyph="&#xE8B7;" FontSize="14" />
                         <StackPanel Grid.Column="1">
-                            <TextBlock Text="Workspace" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <TextBlock x:Name="WorkspaceHeaderLabel" Text="Workspace" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                             <TextBlock x:Name="WorkspaceLabel" TextTrimming="CharacterEllipsis" />
                         </StackPanel>
                     </Grid>

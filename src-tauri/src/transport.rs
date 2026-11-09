@@ -17,25 +17,149 @@ use super::*;
 
 /// The connected-stream type used by the IPC transport layer.
 ///
-/// On Unix this is `std::os::unix::net::UnixStream`; on Windows it is a
-/// named-pipe handle wrapper (`WindowsNamedPipeStream`). Both implement
-/// `Read` + `Write` and provide `try_clone`, `shutdown`, `set_write_timeout`,
-/// `set_read_timeout`, and `set_nonblocking` as inherent methods so the
-/// calling code is identical across platforms via this alias.
-#[cfg(unix)]
-pub(crate) type TransportStream = std::os::unix::net::UnixStream;
-#[cfg(windows)]
-pub(crate) type TransportStream = WindowsNamedPipeStream;
+/// `Local` wraps the primary owner-restricted OS IPC stream (`UnixStream` on
+/// Unix, `WindowsNamedPipeStream` on Windows). `LoopbackTcp` wraps an opt-in
+/// `127.0.0.1` stream used when a remote host forwards SSH tunnels to a
+/// loopback TCP listener (#116) or when a Windows client connects to a local
+/// SSH tunnel port (#114). Loopback TCP connections carry no kernel peer-UID or
+/// owner-SID guarantee and therefore MUST present a valid per-client
+/// `client_token` (`ClientIdentity`) during the `IpcHello` handshake.
+#[derive(Debug)]
+pub(crate) enum TransportStream {
+    #[cfg(unix)]
+    Local(std::os::unix::net::UnixStream),
+    #[cfg(windows)]
+    Local(WindowsNamedPipeStream),
+    LoopbackTcp(std::net::TcpStream),
+}
 
-/// The listener type used by the daemon's accept loop.
-///
-/// On Unix this is `std::os::unix::net::UnixListener`; on Windows it is a
-/// named-pipe server (`WindowsNamedPipeListener`). Both provide `accept()`
-/// (returning `(TransportStream, ())`) and `set_nonblocking(bool)`.
+impl TransportStream {
+    pub(crate) fn is_loopback_tcp(&self) -> bool {
+        matches!(self, Self::LoopbackTcp(_))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn local_unix_stream(&self) -> Option<&std::os::unix::net::UnixStream> {
+        match self {
+            Self::Local(stream) => Some(stream),
+            Self::LoopbackTcp(_) => None,
+        }
+    }
+
+    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
+        match self {
+            Self::Local(stream) => stream.try_clone().map(Self::Local),
+            Self::LoopbackTcp(stream) => stream.try_clone().map(Self::LoopbackTcp),
+        }
+    }
+
+    pub(crate) fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        match self {
+            Self::Local(stream) => stream.shutdown(how),
+            Self::LoopbackTcp(stream) => stream.shutdown(how),
+        }
+    }
+
+    pub(crate) fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Local(stream) => stream.set_write_timeout(dur),
+            Self::LoopbackTcp(stream) => stream.set_write_timeout(dur),
+        }
+    }
+
+    pub(crate) fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Local(stream) => stream.set_read_timeout(dur),
+            Self::LoopbackTcp(stream) => stream.set_read_timeout(dur),
+        }
+    }
+
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            Self::Local(stream) => stream.set_nonblocking(nonblocking),
+            Self::LoopbackTcp(stream) => stream.set_nonblocking(nonblocking),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn is_peer_disconnected(&self) -> bool {
+        match self {
+            Self::Local(pipe) => pipe.is_peer_disconnected(),
+            Self::LoopbackTcp(tcp) => {
+                let _ = tcp.set_nonblocking(true);
+                let mut byte = [0u8; 1];
+                let disconnected = match tcp.peek(&mut byte) {
+                    Ok(0) => true,
+                    Ok(_) => false,
+                    Err(error) => !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ),
+                };
+                let _ = tcp.set_nonblocking(false);
+                disconnected
+            }
+        }
+    }
+}
+
+impl Read for TransportStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Local(stream) => stream.read(buf),
+            Self::LoopbackTcp(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for TransportStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Local(stream) => stream.write(buf),
+            Self::LoopbackTcp(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Local(stream) => stream.flush(),
+            Self::LoopbackTcp(stream) => stream.flush(),
+        }
+    }
+}
+
 #[cfg(unix)]
-pub(crate) type TransportListener = std::os::unix::net::UnixListener;
-#[cfg(windows)]
-pub(crate) type TransportListener = WindowsNamedPipeListener;
+impl std::os::unix::io::AsRawFd for TransportStream {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        match self {
+            Self::Local(stream) => stream.as_raw_fd(),
+            Self::LoopbackTcp(stream) => stream.as_raw_fd(),
+        }
+    }
+}
+
+/// The primary local listener type used by the daemon's accept loop.
+///
+/// On Unix this wraps `std::os::unix::net::UnixListener`; on Windows it wraps
+/// `WindowsNamedPipeListener`. Both provide `accept()` (returning
+/// `(TransportStream, ())`) and `set_nonblocking(bool)`.
+pub(crate) struct TransportListener {
+    #[cfg(unix)]
+    inner: std::os::unix::net::UnixListener,
+    #[cfg(windows)]
+    inner: WindowsNamedPipeListener,
+}
+
+impl TransportListener {
+    pub(crate) fn accept(&self) -> std::io::Result<(TransportStream, ())> {
+        let (stream, _) = self.inner.accept()?;
+        Ok((TransportStream::Local(stream), ()))
+    }
+
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        self.inner.set_nonblocking(nonblocking)
+    }
+}
 
 /// Connect to the transport endpoint at `path`.
 ///
@@ -45,12 +169,29 @@ pub(crate) type TransportListener = WindowsNamedPipeListener;
 pub(crate) fn transport_connect(path: &Path) -> std::io::Result<TransportStream> {
     #[cfg(unix)]
     {
-        std::os::unix::net::UnixStream::connect(path)
+        std::os::unix::net::UnixStream::connect(path).map(TransportStream::Local)
     }
     #[cfg(windows)]
     {
-        WindowsNamedPipeStream::connect(path)
+        WindowsNamedPipeStream::connect(path).map(TransportStream::Local)
     }
+}
+
+/// Connect to a loopback TCP endpoint (`127.0.0.1:<port>`). Refuses non-loopback
+/// addresses so client code can never accidentally dial a public network socket
+/// directly without an SSH/SSM tunnel.
+pub(crate) fn transport_connect_loopback(
+    addr: std::net::SocketAddr,
+) -> std::io::Result<TransportStream> {
+    if !addr.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing non-loopback IPC address: {addr}"),
+        ));
+    }
+    let stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    let _ = stream.set_nodelay(true);
+    Ok(TransportStream::LoopbackTcp(stream))
 }
 
 /// Return the concrete endpoint a native client should connect to. Unix
@@ -82,11 +223,11 @@ pub(crate) fn transport_bind(path: &Path) -> std::io::Result<TransportListener> 
         let previous = unsafe { libc::umask(0o077) };
         let bound = std::os::unix::net::UnixListener::bind(path);
         unsafe { libc::umask(previous) };
-        bound
+        bound.map(|inner| TransportListener { inner })
     }
     #[cfg(windows)]
     {
-        WindowsNamedPipeListener::bind(path)
+        WindowsNamedPipeListener::bind(path).map(|inner| TransportListener { inner })
     }
 }
 

@@ -327,7 +327,7 @@ fn agent_manual_mark_overrides_detection() {
 pub(crate) fn router_event_reader(router: &OutputRouter) -> BufReader<UnixStream> {
     let (client, server_stream) = UnixStream::pair().expect("unix stream pair");
     router
-        .add_subscriber(server_stream, 1)
+        .add_subscriber(TransportStream::Local(server_stream), 1)
         .expect("subscribe within the cap");
     client
         .set_read_timeout(Some(Duration::from_secs(2)))

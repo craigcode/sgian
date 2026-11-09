@@ -16,13 +16,21 @@ non-secret discovery metadata:
 
 ```text
 sgian ctl --workspace <path> --json ipc-endpoint
+sgian ctl --machine <name> --json ipc-endpoint
 ```
 
-The response includes `transport`, the concrete `endpoint`, `token_path`, the
-canonical `workspace`, `workspace_key`, `protocol_version`, and supported native
-client capabilities. It never includes the token. On Windows, `endpoint` is the
+The response includes `transport` (`"unix_socket"`, `"named_pipe"`, or
+`"tcp_loopback"`), the concrete `endpoint`, `token_path`, the canonical
+`workspace`, `workspace_key`, `protocol_version`, supported native client
+capabilities, and optional `loopback_port` (present when the daemon has
+`remote_loopback_port` / `--listen-loopback` enabled on `127.0.0.1`). It never
+includes a raw token. On Windows, `endpoint` for local workspaces is the
 owner-SID-scoped `\\.\pipe\...` name produced by the same Rust function used by
-the daemon. This avoids duplicating its SID lookup and pipe-name hash in C#.
+the daemon. When `--machine <name>` is passed, the CLI discovers the remote
+daemon over SSH, starts or reuses a client-owned `ssh -N -L` tunnel under
+`runtime/machines/<name>/`, and returns the local forwarded endpoint (`"unix_socket"`
+on macOS/Linux or `"tcp_loopback"` `127.0.0.1:<port>` on Windows) with
+`workspace_key: "machine:<name>"`.
 
 The macOS client also knows the stable Unix layout directly: canonicalize the
 workspace, compute the 64-bit FNV-1a key, resolve the current/legacy application
@@ -46,7 +54,10 @@ connection. `client_token` is additive (docs/design/client-identity.md): a
 credential issued by `ctl identity issue` names the connection, fixes its
 holder and limits it to its scopes (`read`, `write`, `admin`); with one, the
 workspace token may be empty, which is how a client on another machine
-connects over an SSH-forwarded socket. A presented credential is held to: a
+connects over an SSH-forwarded socket. On opt-in loopback TCP listeners
+(`remote_loopback_port` on `127.0.0.1`), `client_token` is **mandatory** and a
+bare workspace `token` without `client_token` is rejected. A presented
+credential is held to: a
 revoked or unknown one is refused even beside a valid workspace token, and
 a revocation cuts a live connection at its next request. Hook and
 status-line reports (`agent_signal`, `agent_status`) are reads for the

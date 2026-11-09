@@ -26,6 +26,8 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     private string _status = "Disconnected";
     private string? _errorMessage;
     private string _workspacePath;
+    private string _localWorkspacePath;
+    private SavedMachine? _activeMachine;
     private double _terminalFontSize;
     private Guid _generation;
     private CancellationTokenSource? _layoutSaveCancellation;
@@ -43,6 +45,8 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     public bool Zoomed { get; private set; }
     public string PermissionMode { get; private set; } = "manual";
     public IReadOnlyList<string> RecentWorkspaces { get; private set; }
+    public IReadOnlyList<SavedMachine> SavedMachines { get; private set; } = [];
+    public string LocalWorkspacePath => _localWorkspacePath;
     public Guid Generation => _generation;
     public event EventHandler? WorkspaceReset;
     public event EventHandler? LayoutRestored;
@@ -51,9 +55,10 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
     {
         _dispatcher = dispatcher;
         DaemonClient.ClientTokenLookup ??= CredentialStore.Load;
+        DaemonClient.MachineTokenLookup ??= name => CredentialStore.LoadMachine(name);
         var settings = AppSettings.Load();
         RecentWorkspaces = settings.RecentWorkspaces ?? [];
-        _workspacePath = WorkspaceStartup.Resolve(
+        var resolvedLocal = WorkspaceStartup.Resolve(
             Environment.GetEnvironmentVariable("SGIAN_WORKSPACE"),
             settings.WorkspacePath,
             settings.RecentWorkspaces,
@@ -62,6 +67,16 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             Directory.Exists,
             [Environment.SystemDirectory, Environment.GetFolderPath(Environment.SpecialFolder.Windows), AppContext.BaseDirectory]);
+        _workspacePath = resolvedLocal;
+        _localWorkspacePath = resolvedLocal;
+        SavedMachines = EndpointDiscovery.LoadSavedMachines();
+        var requestedMachine = Environment.GetEnvironmentVariable("SGIAN_MACHINE")?.Trim();
+        if (!string.IsNullOrEmpty(requestedMachine) &&
+            SavedMachines.FirstOrDefault(machine => string.Equals(machine.Name, requestedMachine, StringComparison.Ordinal)) is { } matched)
+        {
+            _activeMachine = matched;
+            _workspacePath = matched.Workspace;
+        }
         _terminalFontSize = settings.TerminalFontSize is >= 9 and <= 30
             ? settings.TerminalFontSize
             : 13;
@@ -187,6 +202,14 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         private set => Set(ref _workspacePath, value);
     }
 
+    public SavedMachine? ActiveMachine
+    {
+        get => _activeMachine;
+        private set => Set(ref _activeMachine, value);
+    }
+
+    public void ReloadSavedMachines() => SavedMachines = EndpointDiscovery.LoadSavedMachines();
+
     /// <summary>Whether the terminals expose their screen to assistive technology (xterm's screen-reader mode); a per-PC preference.</summary>
     public bool ScreenReaderMode
     {
@@ -216,19 +239,68 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         }
     }
 
-    public async Task StartAsync() => await ConnectAsync(WorkspacePath);
+    public async Task StartAsync()
+    {
+        ReloadSavedMachines();
+        if (ActiveMachine is { } machine)
+        {
+            var refreshed = SavedMachines.FirstOrDefault(item => string.Equals(item.Name, machine.Name, StringComparison.Ordinal)) ?? machine;
+            await ConnectMachineAsync(refreshed);
+        }
+        else
+        {
+            await ConnectAsync(WorkspacePath);
+        }
+    }
+
+    public Task ConnectLocalWorkspaceAsync() => ConnectAsync(_localWorkspacePath);
 
     /// <summary>Whether the environment supplies the credential (it then overrides the vault).</summary>
     public bool CredentialFromEnvironment => DaemonClient.ClientTokenFromEnvironment() is not null;
 
-    public bool HasStoredCredential => CredentialStore.Load(WorkspacePath) is not null;
+    public bool HasStoredCredential => ActiveMachine is { } machine
+        ? CredentialStore.LoadMachine(
+            machine.Name,
+            EndpointDiscovery.DefaultMachineTokenPath(machine.Name, machine.TokenFile)) is not null
+        : CredentialStore.Load(WorkspacePath) is not null;
 
-    /// <summary>Store (or, with null, forget) this workspace's credential in the vault and reconnect so the daemon binds the connection to it.</summary>
+    /// <summary>Store (or, with null, forget) this workspace or machine credential in the vault and reconnect so the daemon binds the connection to it.</summary>
     public async Task SetClientCredentialAsync(string? token)
     {
+        if (ActiveMachine is { } machine)
+        {
+            try { CredentialStore.SaveMachine(machine.Name, token); }
+            catch (Exception error) { ErrorMessage = $"The credential could not be saved: {error.Message}"; return; }
+            await ConnectMachineAsync(machine);
+            return;
+        }
         try { CredentialStore.Save(WorkspacePath, token); }
         catch (Exception error) { ErrorMessage = $"The credential could not be saved: {error.Message}"; return; }
         await ConnectAsync(WorkspacePath);
+    }
+
+    private void ResetActiveWorkspaceView()
+    {
+        ErrorMessage = null;
+        Status = "Connecting";
+        Panes.Clear();
+        _chats.Clear();
+        _scrollback.Clear();
+        _sizes.Clear();
+        _projects.Clear();
+        _notes.Clear();
+        _outputWarnings.Clear();
+        _agentUsage.Clear();
+        _leaseNoticeCancellation?.Cancel();
+        LeaseNotice = null;
+        _daemonSupportsLeases = true;
+        Holder = LeaseState.DefaultHolder();
+        PermissionMode = "manual";
+        SelectedPane = null;
+        Layout = null;
+        Zoomed = false;
+        WorkspaceReset?.Invoke(this, EventArgs.Empty);
+        WorkspaceChanged?.Invoke(this, EventArgs.Empty);
     }
 
     public async Task ConnectAsync(string workspace)
@@ -252,7 +324,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             RecentWorkspaces = RecentWorkspaces
                 .Where(path => !string.Equals(path, fullPath, StringComparison.OrdinalIgnoreCase))
                 .ToArray();
-            SaveSettings(forgetWorkspace: string.Equals(WorkspacePath, fullPath, StringComparison.OrdinalIgnoreCase));
+            SaveSettings(forgetWorkspace: string.Equals(_localWorkspacePath, fullPath, StringComparison.OrdinalIgnoreCase));
             return;
         }
 
@@ -270,30 +342,13 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             if (generation != _generation) return;
         }
 
+        ActiveMachine = null;
+        _localWorkspacePath = fullPath;
         WorkspacePath = fullPath;
         RecentWorkspaces = new[] { fullPath }.Concat(RecentWorkspaces)
             .Distinct(StringComparer.OrdinalIgnoreCase).Take(10).ToArray();
         SaveSettings();
-        ErrorMessage = null;
-        Status = "Connecting";
-        Panes.Clear();
-        _chats.Clear();
-        _scrollback.Clear();
-        _sizes.Clear();
-        _projects.Clear();
-        _notes.Clear();
-        _outputWarnings.Clear();
-        _agentUsage.Clear();
-        _leaseNoticeCancellation?.Cancel();
-        LeaseNotice = null;
-        _daemonSupportsLeases = true;
-        Holder = LeaseState.DefaultHolder();
-        PermissionMode = "manual";
-        SelectedPane = null;
-        Layout = null;
-        Zoomed = false;
-        WorkspaceReset?.Invoke(this, EventArgs.Empty);
-        WorkspaceChanged?.Invoke(this, EventArgs.Empty);
+        ResetActiveWorkspaceView();
 
         try
         {
@@ -316,7 +371,58 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             Apply(snapshot, resetTerminals: true);
             Status = "Connected";
             App.TraceSmoke($"Workspace connected; selected pane is {SelectedPane?.Id ?? "none"}");
-            _ = SubscribeLoopAsync(client, generation, token);
+            _ = SubscribeLoopAsync(client, activeMachineName: null, generation, token);
+            await RefreshConfigurationAsync();
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+        }
+        catch (Exception error)
+        {
+            if (_generation != generation) return;
+            Fail(error);
+        }
+    }
+
+    public async Task ConnectMachineAsync(SavedMachine machine)
+    {
+        _connectionCancellation?.Cancel();
+        _layoutSaveCancellation?.Cancel();
+        _connectionCancellation?.Dispose();
+        _connectionCancellation = new CancellationTokenSource();
+        var token = _connectionCancellation.Token;
+        var generation = _generation = Guid.NewGuid();
+        if (_client is not null)
+        {
+            var previous = _client;
+            _client = null;
+            await previous.DisposeAsync();
+            if (generation != _generation) return;
+        }
+
+        ActiveMachine = machine;
+        WorkspacePath = machine.Workspace;
+        ResetActiveWorkspaceView();
+
+        try
+        {
+            App.TraceSmoke($"Starting saved machine discovery and tunnel for {machine.Name}");
+            var client = await DaemonClient.ConnectMachineAsync(
+                machine.Name,
+                cancellationToken: token,
+                onProgress: App.TraceSmoke);
+            if (_generation != generation)
+            {
+                await client.DisposeAsync();
+                return;
+            }
+            _client = client;
+            Holder = client.IdentityHolder ?? LeaseState.DefaultHolder();
+            var snapshot = await BootstrapAsync(client, token);
+            if (_generation != generation) return;
+            Apply(snapshot, resetTerminals: true);
+            Status = "Connected";
+            _ = SubscribeLoopAsync(client, activeMachineName: machine.Name, generation, token);
             await RefreshConfigurationAsync();
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -583,7 +689,11 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
         if (_client is not null) await _client.DisposeAsync();
     }
 
-    private async Task SubscribeLoopAsync(DaemonClient initialClient, Guid generation, CancellationToken token)
+    private async Task SubscribeLoopAsync(
+        DaemonClient initialClient,
+        string? activeMachineName,
+        Guid generation,
+        CancellationToken token)
     {
         var client = initialClient;
         var attempt = 0;
@@ -632,7 +742,9 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             {
                 await Task.Delay(delay, token);
                 await client.DisposeAsync();
-                client = await DaemonClient.ConnectAsync(WorkspacePath, cancellationToken: token);
+                client = activeMachineName is not null
+                    ? await DaemonClient.ConnectMachineAsync(activeMachineName, cancellationToken: token)
+                    : await DaemonClient.ConnectAsync(WorkspacePath, cancellationToken: token);
                 if (_generation != generation)
                 {
                     await client.DisposeAsync();
@@ -965,7 +1077,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
 
     private void SaveSettings(bool forgetWorkspace = false)
     {
-        try { new AppSettings(forgetWorkspace ? null : WorkspacePath, TerminalFontSize, RecentWorkspaces, ScreenReaderMode).Save(); }
+        try { new AppSettings(forgetWorkspace ? null : _localWorkspacePath, TerminalFontSize, RecentWorkspaces, ScreenReaderMode).Save(); }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         { ErrorMessage = $"Could not save settings: {error.Message}"; }
     }

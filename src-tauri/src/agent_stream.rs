@@ -2070,9 +2070,17 @@ pub(crate) struct DaemonClient {
     /// Whether ensure_daemon may spawn a daemon. Read-only ctl commands connect with
     /// this off so `ctl panes` for a typo'd workspace can't create dirs and daemons.
     pub(crate) auto_spawn: bool,
+    /// Explicit per-client credential (e.g. from `<app_support>/machines/<name>.token`).
+    pub(crate) client_token: Option<String>,
+    /// Optional loopback TCP endpoint (`127.0.0.1:<port>`) used for local SSH
+    /// tunnel forwarding on Windows (#114) and loopback attach tests (#116).
+    pub(crate) tcp_endpoint: Option<std::net::SocketAddr>,
 }
 
 impl DaemonClient {
+    pub(crate) fn has_client_token(&self) -> bool {
+        self.client_token.is_some() || client_token_from_env().is_some()
+    }
     pub(crate) fn connect_or_spawn(cwd: PathBuf) -> Result<Self, String> {
         let client = Self::new(cwd)?;
         client.ensure_daemon()?;
@@ -2104,6 +2112,8 @@ impl DaemonClient {
             data_dir,
             token,
             auto_spawn: false,
+            client_token: None,
+            tcp_endpoint: None,
         };
         client.raw_request(DaemonRequest::Ping).map_err(|error| {
             // (M6) A presented credential that the daemon refused is not a
@@ -2138,6 +2148,8 @@ impl DaemonClient {
             data_dir,
             token,
             auto_spawn: true,
+            client_token: None,
+            tcp_endpoint: None,
         })
     }
 
@@ -2285,7 +2297,13 @@ impl DaemonClient {
         &self,
         timeout: Option<Duration>,
     ) -> Result<DaemonConnection, String> {
-        DaemonConnection::connect_with_timeout(&self.socket_path, &self.token, timeout)
+        DaemonConnection::connect_with_options(
+            &self.socket_path,
+            self.tcp_endpoint,
+            &self.token,
+            self.client_token.as_deref(),
+            timeout,
+        )
     }
 
     /// Test-only low-level v1 handshake helper. The socket-based `TestDaemon` suite
@@ -2300,7 +2318,9 @@ impl DaemonClient {
 
     pub(crate) fn start_subscription(&self, app: AppHandle) {
         let socket_path = self.socket_path.clone();
+        let tcp_endpoint = self.tcp_endpoint;
         let token = self.token.clone();
+        let client_token = self.client_token.clone();
         thread::spawn(move || {
             let mut backoff = SubscriptionBackoff::new();
             loop {
@@ -2314,7 +2334,13 @@ impl DaemonClient {
                     thread::sleep(delay);
                 }
                 let session_started = Instant::now();
-                match DaemonConnection::connect(&socket_path, &token) {
+                match DaemonConnection::connect_with_options(
+                    &socket_path,
+                    tcp_endpoint,
+                    &token,
+                    client_token.as_deref(),
+                    Some(CLIENT_READ_TIMEOUT),
+                ) {
                     Ok(mut conn) => {
                         if conn.write_request(&DaemonRequest::Subscribe).is_err()
                             || conn.await_subscribe_ack().is_err()

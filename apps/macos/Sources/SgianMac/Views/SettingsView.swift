@@ -22,6 +22,10 @@ struct SettingsView: View {
     @State private var saving = false
     @State private var loadedWorkspace = ""
 
+    private var activeWorkspaceKey: String {
+        "\(model.activeMachine?.name ?? "local"):\(model.workspaceURL.path)"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             Form {
@@ -40,7 +44,7 @@ struct SettingsView: View {
                     Text("Agents use the provider CLI’s existing installation and login on this Mac.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Section("Workspace: \(model.workspaceURL.lastPathComponent)") {
+                Section(model.activeMachine.map { "Remote Workspace: \($0.name)" } ?? "Workspace: \(model.workspaceURL.lastPathComponent)") {
                     TextField("Shell executable", text: $shell)
                     TextField("Shell arguments (one per line)", text: $shellArguments, axis: .vertical)
                     TextField("Claude executable (optional)", text: $claudeBinary)
@@ -97,21 +101,27 @@ struct SettingsView: View {
                             }
                             .disabled(credential.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             if model.hasStoredCredential {
-                                Button("Forget Credential") {
+                                Button("Forget Keychain Credential") {
                                     model.setClientCredential(nil)
-                                    message = "Credential removed; reconnecting with the workspace token."
+                                    message = "Keychain credential removed; reconnecting."
                                 }
                             }
                         }
                         Text(model.hasStoredCredential
-                             ? "A credential is stored for this workspace; the daemon attributes your input and leases to it."
-                             : "Without a credential this Mac connects with the workspace token as \(WorkspaceModel.defaultHolder()).")
+                             ? "A client credential is configured for this target; the daemon attributes your input and leases to it."
+                             : (model.activeMachine != nil
+                                ? "Remote targets require a scoped client credential (`sgian ctl identity issue`)."
+                                : "Without a credential this Mac connects with the workspace token as \(WorkspaceModel.defaultHolder())."))
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 Section("Workspace") {
-                    Text(model.workspaceURL.path).textSelection(.enabled)
-                    Button("Choose Workspace…", action: model.chooseWorkspace)
+                    if let machine = model.activeMachine {
+                        Text("\(machine.name) — \(machine.displaySubtitle)").textSelection(.enabled)
+                    } else {
+                        Text(model.workspaceURL.path).textSelection(.enabled)
+                    }
+                    Button("Choose Local Workspace…", action: model.chooseWorkspace)
                 }
             }.formStyle(.grouped)
             HStack {
@@ -119,11 +129,11 @@ struct SettingsView: View {
                 Spacer()
                 Button("Reload") { Task { await load() } }.disabled(saving)
                 Button(saving ? "Saving…" : "Save Workspace Settings") { Task { await save() } }
-                    .disabled(!loaded || saving || loadedWorkspace != model.workspaceURL.path)
+                    .disabled(!loaded || saving || loadedWorkspace != activeWorkspaceKey)
             }.padding(14)
         }
         .frame(width: 600, height: 680)
-        .task(id: model.workspaceURL) { await load() }
+        .task(id: activeWorkspaceKey) { await load() }
     }
 
     private func load() async {
@@ -137,13 +147,13 @@ struct SettingsView: View {
             permissionMode = config["agent_permission_mode"]?.stringValue ?? "manual"
             restorePolicy = config["restore_policy"]?.stringValue ?? "auto_respawn"
             profiles = config["profiles"]?.arrayValue ?? []
-            loadedWorkspace = model.workspaceURL.path
+            loadedWorkspace = activeWorkspaceKey
             loaded = true; message = ""
         } catch { message = error.localizedDescription }
     }
 
     private func save() async {
-        guard loadedWorkspace == model.workspaceURL.path else { return }
+        guard loadedWorkspace == activeWorkspaceKey else { return }
         saving = true
         defer { saving = false }
         // Preserve all fields not exposed by this form, including environment restrictions.

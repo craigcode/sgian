@@ -141,10 +141,26 @@ final class DaemonIPCClient: @unchecked Sendable {
         clientTokenFromEnvironment() ?? CredentialStore.load(for: workspace)
     }
 
+    static func clientToken(for locator: WorkspaceLocator) -> String? {
+        if let machine = locator.machine {
+            return clientTokenFromEnvironment()
+                ?? CredentialStore.loadMachine(machine.name, fallbackTokenURL: locator.tokenURL)
+        }
+        return clientToken(for: locator.workspaceURL)
+    }
+
     private static func authenticatedSocket(locator: WorkspaceLocator) throws -> AuthenticatedSocket {
-        let clientToken = clientToken(for: locator.workspaceURL)
-        let fileToken = (try? String(contentsOf: locator.tokenURL, encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let clientToken = clientToken(for: locator)
+        // Saved remote machines store a per-client `sgc_...` token at
+        // `locator.tokenURL` (resolved via `clientToken(for:)` above), never a
+        // workspace root `daemon.token`.
+        let fileToken: String
+        if locator.machine != nil {
+            fileToken = ""
+        } else {
+            fileToken = (try? String(contentsOf: locator.tokenURL, encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
         // A remote client has no workspace token file; its credential rides
         // the hello instead (docs/design/client-identity.md).
         guard !fileToken.isEmpty || clientToken != nil
@@ -178,7 +194,16 @@ final class DaemonIPCClient: @unchecked Sendable {
             requestQueue.async { [locator] in
                 let process = Process()
                 process.executableURL = executable
-                process.arguments = ["ctl", "--workspace", locator.workspaceURL.path, "sync", "off"]
+                if let machine = locator.machine {
+                    process.arguments = ["ctl", "--machine", machine.name, "--json", "ipc-endpoint"]
+                    if let token = Self.clientToken(for: locator) {
+                        var environment = ProcessInfo.processInfo.environment
+                        environment["SGIAN_CLIENT_TOKEN"] = token
+                        process.environment = environment
+                    }
+                } else {
+                    process.arguments = ["ctl", "--workspace", locator.workspaceURL.path, "sync", "off"]
+                }
                 let diagnostics = Pipe()
                 process.standardOutput = diagnostics
                 process.standardError = diagnostics

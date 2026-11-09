@@ -5,23 +5,32 @@ permissions of the logged-in OS account. It does not sandbox shells, agent
 providers, repositories, or tools. A workspace is an organizational boundary,
 not an isolation boundary against another process running as the same user.
 
-The daemon listens on a local Unix socket or an owner-restricted Windows named
-pipe; it does not expose a TCP service. Clients must authenticate before any
-command is dispatched. On Unix, runtime and data directories are owner-only
-and a connection from another uid is dropped before the hello. Beyond the
-workspace token, the daemon issues per-client credentials (`ctl identity`)
-with `read`, `write` and `admin` scopes; a credential's holder is fixed by the
-daemon, so lease and refusal records attribute actions to a credential rather
-than a self-declared name. Only credential hashes are stored. With
-`identity: required`, the workspace token can read and administer but every
-write needs a credential. Remote access is an SSH-forwarded socket presenting
-a credential; the daemon never listens on the network. `sgian ctl serve` is
-the one loopback HTTP listener in the binary: it hosts the web client on
-`127.0.0.1` for a device on an SSH tunnel, acts as its own process's
-credential, is read-only unless `--allow-write` (typing and leases, never
-configuration), and requires a per-run session key that it prints once as a
-URL and keeps as an `HttpOnly` `SameSite=Strict` cookie, because loopback TCP
-has no peer identity and another local account could otherwise reach it.
+The daemon listens by default on a local Unix socket or an owner-restricted
+Windows named pipe; it never exposes a public network TCP service. Clients must
+authenticate before any command is dispatched. On Unix, runtime and data
+directories are owner-only and a connection from another uid is dropped before
+the hello. Beyond the workspace token, the daemon issues per-client credentials
+(`ctl identity`) with `read`, `write` and `admin` scopes; a credential's holder
+is fixed by the daemon, so lease and refusal records attribute actions to a
+credential rather than a self-declared name. Only credential hashes are stored.
+With `identity: required`, the workspace token can read and administer but every
+write needs a credential. Remote access (`ctl --machine` / saved `machines` in
+user-global `config.json`) uses a client-owned `ssh -N -L` tunnel (`BatchMode`,
+strict `--` host/command separation, shell-metacharacter validation on remote
+workspace paths, and `0600` non-symlinked token files or OS credential vaults)
+presenting a per-client credential; the daemon never listens on `0.0.0.0` or external interfaces.
+Two opt-in `127.0.0.1`-only loopback listeners exist for SSH port forwarding:
+1. `remote_loopback_port` (`--listen-loopback <PORT>`, #116), primarily so a
+   Windows daemon whose named pipe cannot be forwarded by OpenSSH `-L` can be
+   reached over `ssh -N -L`: binds strictly to `127.0.0.1` and **requires** a
+   valid per-client `client_token` on every connection (rejecting a bare
+   workspace `daemon.token`, since loopback TCP carries no kernel peer-UID/SID
+   check).
+2. `sgian ctl serve`, which hosts the web client on `127.0.0.1` for a device on
+   an SSH tunnel, acts as its own process's credential, is read-only unless
+   `--allow-write` (typing and leases, never configuration), and requires a
+   per-run session key that it prints once as a URL and keeps as an `HttpOnly`
+   `SameSite=Strict` cookie.
 Tokens, configuration, conversation logs, and scrollback are stored in the
 user's platform application-data directory. Conversation logs and terminal
 scrollback may contain sensitive information; do not include them in public

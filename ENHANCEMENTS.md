@@ -252,19 +252,26 @@ Shipped (2026-09-16):
   (`docs/design/agent-steering-and-machines.md`, #117). Documented the
   steering and saved-machine design and shipped `ctl lines <PANE> (-n|--last) N`
   and `ctl wait <PANE> --attention <working|needs_input|idle[,...]>`.
+- **Saved remote workspaces (`machines`, #114).** User-global `machines` config
+  (`ctl machine add|list|remove`), `0600` per-machine client token files plus
+  macOS Keychain / Windows PasswordVault integration, client-owned `ssh -N -L`
+  tunnel management (`src-tauri/src/machines.rs`), `--machine <name>` /
+  `SGIAN_MACHINE` / `<machine>/<pane>` targeting across `sgian ctl`, and saved
+  machine switchers in the native macOS and Windows desktop clients.
+- **Windows daemon as a remote target (#116).** Opt-in `127.0.0.1` loopback TCP
+  IPC listener (`remote_loopback_port` / `--listen-loopback <PORT>`, publishing
+  `daemon.loopback_port` and `ipc-endpoint.loopback_port`), strict per-client
+  `client_token` enforcement on loopback TCP handshakes, `"tcp_loopback"` client
+  transport in Rust and `Sgian.Protocol`, and Task Scheduler S4U / Session 0
+  ConPTY operational guidance (`docs/scripting-and-local-operation.md`).
 
 Open, in order:
 
 - **Execution grants — Kranz `TerminalProvider` consumer**: wiring `kranz-acp`
   to Sgian's `grant_*` endpoints on the Kranz side.
-- **Machines** (#114): saved remote workspaces (SSH host, workspace path,
-  stored credential) with a client-owned tunnel, a sidebar section per
-  machine and `ctl --machine`. The native clients cannot open a forwarded
-  socket today.
-- **M5 SSM / ECS Exec target** (#115): needs an AWS host to test against.
-- **Windows daemon as a remote target** (#116): an attach path (SSM or a
-  loopback TCP listener, since a named pipe cannot be forwarded over SSH) and
-  daemon lifetime without an interactive logon.
+- **M5 SSM / ECS Exec target** (#115): `MachineEntry` schema supports
+  `transport: "ssm"` and `target`; live transport wiring awaits AWS Linux EC2
+  and Windows WorkSpace test hosts.
 - **Hands-on acceptance on a phone** (#83): the served view over `ssh -L` from
   a real device (the phone-width layout was checked in a desktop browser at
   375×812 only).

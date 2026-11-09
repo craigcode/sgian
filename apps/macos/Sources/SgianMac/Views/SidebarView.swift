@@ -12,6 +12,42 @@ struct SidebarView: View {
     var body: some View {
         VStack(spacing: 0) {
             List(selection: selection) {
+                if !model.savedMachines.isEmpty {
+                    Section("Machines") {
+                        if model.activeMachine != nil {
+                            Button(action: model.connectToLocalWorkspace) {
+                                HStack(spacing: 9) {
+                                    Image(systemName: "laptopcomputer")
+                                        .frame(width: 17)
+                                        .foregroundStyle(.secondary)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(model.localWorkspaceURL.lastPathComponent)
+                                            .lineLimit(1)
+                                        Text("Local · \(model.localWorkspaceURL.deletingLastPathComponent().path)")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    }
+                                    Spacer(minLength: 4)
+                                }
+                                .padding(.vertical, 2)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help("Switch back to local workspace")
+                        }
+                        ForEach(model.savedMachines) { machine in
+                            MachineRow(
+                                machine: machine,
+                                isActive: model.activeMachine?.name == machine.name,
+                                summary: model.machineSummaries[machine.name],
+                                activeStatus: model.activeMachine?.name == machine.name ? model.status : nil,
+                                action: { model.connect(toMachine: machine) }
+                            )
+                        }
+                    }
+                }
                 if model.projects.isEmpty {
                     if !shells.isEmpty {
                         Section("Terminals") {
@@ -100,13 +136,13 @@ struct SidebarView: View {
     private var workspaceFooter: some View {
         Button(action: model.chooseWorkspace) {
             HStack(spacing: 9) {
-                Image(systemName: "folder")
-                    .foregroundStyle(.secondary)
+                Image(systemName: model.activeMachine == nil ? "folder" : "network")
+                    .foregroundStyle(model.activeMachine == nil ? Color.secondary : Color.accentColor)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(model.workspaceURL.lastPathComponent)
+                    Text(model.activeMachine?.name ?? model.workspaceURL.lastPathComponent)
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
-                    Text(model.workspaceURL.deletingLastPathComponent().path)
+                    Text(model.activeMachine?.displaySubtitle ?? model.workspaceURL.deletingLastPathComponent().path)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -120,7 +156,51 @@ struct SidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Change workspace")
+        .help(model.activeMachine == nil ? "Change workspace" : "Open a local workspace")
+    }
+}
+
+private struct MachineRow: View {
+    let machine: SavedMachine
+    let isActive: Bool
+    let summary: MachineSummary?
+    let activeStatus: ConnectionStatus?
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                Image(systemName: "network")
+                    .frame(width: 17)
+                    .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(machine.name)
+                        .fontWeight(isActive ? .semibold : .regular)
+                        .lineLimit(1)
+                    Text(summary?.badgeText ?? machine.displaySubtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer(minLength: 4)
+                if let activeStatus {
+                    ConnectionDot(status: activeStatus)
+                } else if let summary, summary.connected {
+                    if summary.needsInputCount > 0 {
+                        Circle().fill(.orange).frame(width: 7, height: 7).help("Needs input")
+                    } else if summary.workingCount > 0 {
+                        ProgressView().controlSize(.mini).help("Working")
+                    } else {
+                        Circle().fill(.green).frame(width: 7, height: 7).help("Tunnel connected")
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Connect to \(machine.name) (\(machine.displaySubtitle))")
     }
 }
 

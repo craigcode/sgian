@@ -69,6 +69,8 @@ impl TestDaemon {
             data_dir: self.data_dir.path().to_path_buf(),
             token: self.token.clone(),
             auto_spawn: false,
+            client_token: None,
+            tcp_endpoint: None,
         }
     }
 

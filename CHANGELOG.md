@@ -56,6 +56,20 @@ follow SemVer once the first public tag exists.
 
 ### Agents
 
+- Saved remote workspaces (`machines`, #114): user-global `machines` entries
+  managed via `ctl machine add|list|remove` with `0600` non-symlinked client
+  token storage (plus macOS login Keychain and Windows PasswordVault lookups),
+  client-owned `ssh -N -L` tunnel lifecycle (`src-tauri/src/machines.rs`),
+  `--machine <name>` / `-m <name>` / `SGIAN_MACHINE` and `<machine>/<pane>`
+  shorthand across `sgian ctl`, and saved machine switchers in the native macOS
+  and Windows desktop clients.
+- Windows daemon as a remote target (#116): opt-in `127.0.0.1` loopback TCP IPC
+  listener (`remote_loopback_port` in `config.json` and `--listen-loopback <PORT>`,
+  recording `daemon.loopback_port` and `ipc-endpoint.loopback_port`), mandatory
+  per-client `client_token` enforcement on loopback TCP connections,
+  `"tcp_loopback"` client transport in Rust and `Sgian.Protocol`, and headless
+  Windows Task Scheduler S4U / Session 0 ConPTY operational guidance
+  (`docs/scripting-and-local-operation.md`).
 - Agent-to-agent steering refinements and saved-machine design
   (`docs/design/agent-steering-and-machines.md`, #117): `ctl lines <PANE>`
   gains `-n N` / `--last N` (`scrollback_lines { last }`) to tail scrubbed

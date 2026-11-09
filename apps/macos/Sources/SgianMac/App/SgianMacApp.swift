@@ -66,7 +66,18 @@ struct SgianMacApp: App {
                         Button(path) { model.connect(to: URL(fileURLWithPath: path)) }
                     }
                 }
-                Button("Reconnect") { model.connect(to: model.workspaceURL) }
+                if !model.savedMachines.isEmpty {
+                    Menu("Machines") {
+                        ForEach(model.savedMachines) { machine in
+                            Button("\(machine.name) — \(machine.displaySubtitle)") {
+                                model.connect(toMachine: machine)
+                            }
+                        }
+                        Divider()
+                        Button("Reload Saved Machines", action: model.reloadSavedMachines)
+                    }
+                }
+                Button("Reconnect", action: model.reconnect)
             }
         }
 

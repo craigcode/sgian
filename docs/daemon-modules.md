@@ -23,9 +23,10 @@ API: the wire contract is the JSON in `docs/native-ipc.md`.
 | `ledger.rs` | 469 | Keyboard leases (`LeasePolicy`, `HeldLease`, predicates), the hash-chained ledger writer and verifier, `AgentUsage` from the status line. |
 | `notes.rs` | 538 | Per-project shared context notes under `<repo>/.sgian/projects/<name>/notes/`: ledgered writes, scrub on read, the `project_notes_changed` watch. |
 | `probe.rs` | 450 | `claude agents --json` mapping, process-table and Kranz-worker parsing, projects and roll-ups, hook-to-attention, pid placement. |
-| `serve.rs` | 1,501 | `run_daemon`, the accept loop (peer-uid check), the hello gate, subscriptions, the framed request loop. |
-| `daemon_client.rs` | 1,495 | `DaemonConnection` and the ctl-side `DaemonClient`, token and data-dir helpers. |
-| `ctl.rs` | 6,084 | `sgian ctl`: option parsing, every command, its argument parser and printer, the help text. |
+| `serve.rs` | 1,560 | `run_daemon`, dual local + opt-in `127.0.0.1` loopback TCP accept loop (peer-uid check on Unix sockets, mandatory `client_token` on loopback TCP), the hello gate, subscriptions, the framed request loop. |
+| `daemon_client.rs` | 1,540 | `DaemonConnection` and the ctl-side `DaemonClient` (local socket/pipe + loopback TCP), token and data-dir helpers. |
+| `machines.rs` | 910 | Saved remote workspaces (`machines`, #114): `MachineEntry` validation, global `config.json` + `0600` token storage, SSH endpoint discovery (Unix socket or Windows `loopback_port`), client-owned `ssh -N -L` tunnel lifecycle, and `<machine>/<pane>` resolution. |
+| `ctl.rs` | 6,350 | `sgian ctl`: option parsing (`--workspace`, `--machine`), every command (`ctl machine`, steering verbs, grants, projects, leases), its argument parser and printer, the help text. |
 | `serve_http.rs` | 889 | `sgian ctl serve`: the loopback HTTP host for the web client (embedded assets, `/api/invoke`, `/api/events` as SSE, read-only gate, Host check). |
 | `tests/` | ~21,000 | The unit and in-process integration suite: `mod.rs` (shared transport helpers), `harness.rs` (`TestDaemon`), and one file per area (terminal, env_scrub, ctl_parsers, ctl_run, observability, lifecycle, config, agents, lease_identity, notes, grants). |
 

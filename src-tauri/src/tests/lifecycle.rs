@@ -372,6 +372,8 @@ fn catchup_delivers_every_ended_pane_above_queue_limit() {
         data_dir: data_dir.path().to_path_buf(),
         token: token.clone(),
         auto_spawn: false,
+        client_token: None,
+        tcp_endpoint: None,
     };
 
     // Subscribe — the catch-up should push a PaneEnded for every ended pane.
@@ -624,6 +626,8 @@ fn concurrent_cold_start_yields_one_socket_owner() {
         data_dir: data_dir.path().to_path_buf(),
         token: token.clone(),
         auto_spawn: false,
+        client_token: None,
+        tcp_endpoint: None,
     };
     let ok: CommandOk = client
         .request(DaemonRequest::Ping)
@@ -706,6 +710,8 @@ fn clean_shutdown_releases_daemon_lock() {
         data_dir: data_dir.path().to_path_buf(),
         token: token.clone(),
         auto_spawn: false,
+        client_token: None,
+        tcp_endpoint: None,
     };
     let _: CommandOk = client
         .request(DaemonRequest::Shutdown)
@@ -805,6 +811,8 @@ fn respawn_after_shutdown_waits_for_lock_then_binds() {
         data_dir: data_dir.path().to_path_buf(),
         token: token.clone(),
         auto_spawn: false,
+        client_token: None,
+        tcp_endpoint: None,
     };
     let ok: CommandOk = client
         .request(DaemonRequest::Ping)
@@ -1005,6 +1013,8 @@ fn ensure_daemon_refuses_to_unlink_wedged_daemon_socket() {
         data_dir: data_dir.path().to_path_buf(),
         token: "test-token".to_string(),
         auto_spawn: true,
+        client_token: None,
+        tcp_endpoint: None,
     };
     let error = client
         .ensure_daemon()
@@ -1037,6 +1047,8 @@ fn ensure_daemon_removes_stale_socket_when_lock_is_free() {
         data_dir: data_dir.path().to_path_buf(),
         token: "test-token".to_string(),
         auto_spawn: true,
+        client_token: None,
+        tcp_endpoint: None,
     };
     let error = client
         .ensure_daemon()
@@ -1615,6 +1627,8 @@ fn corrupt_workspace_json_handled_gracefully() {
         data_dir: data_dir.path().to_path_buf(),
         token: token.clone(),
         auto_spawn: false,
+        client_token: None,
+        tcp_endpoint: None,
     };
     let _: Pane = client
         .request(DaemonRequest::CreatePane {
@@ -1653,6 +1667,8 @@ fn corrupt_workspace_json_handled_gracefully() {
         data_dir: data_dir.path().to_path_buf(),
         token: token.clone(),
         auto_spawn: false,
+        client_token: None,
+        tcp_endpoint: None,
     };
 
     // Bootstrap should succeed (reseed to fresh workspace).
