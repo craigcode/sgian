@@ -65,10 +65,10 @@ Daemon requests, additive:
 | Request | Effect |
 |---|---|
 | `grant_exec { grant, signature, pane? }` | verify, spawn in a fresh pane (or the given one) as a PTY child, return `{ terminal_id, pane_id }` |
-| `grant_output { terminal_id }` | output so far (bounded, control sequences intact), `exit` when finished |
-| `grant_wait { terminal_id, timeout_ms? }` | block until exit or timeout |
-| `grant_kill { terminal_id }` | SIGTERM then SIGKILL after a grace, same as pane close |
-| `grant_release { terminal_id }` | drop the record; the pane and its ledger stay |
+| `grant_output { terminal_id }` | output so far (bounded, control sequences intact), `exit_status` (`{ exit_code, signal }`, strict XOR) once finished |
+| `grant_wait { terminal_id, timeout_ms? }` | block until exit or timeout, returning `exit_status` (`{ exit_code, signal }`, strict XOR) once exited |
+| `grant_kill { terminal_id }` | SIGTERM then SIGKILL after a grace across root + descendants, bound-wait for PTY reap + scrollback drain, and return `CleanupReceipt` fields (`descendants_reaped`, `output_drained`, `released: false`, `exit_status`) |
+| `grant_release { terminal_id }` | terminate if still running, bound-wait for PTY reap + scrollback drain, drop the handle while keeping the pane and ledger, and return `CleanupReceipt` (`descendants_reaped`, `output_drained`, `released: true`, `exit_status`) |
 
 Kranz's `TerminalProvider` implementation maps `terminal/create` →
 `grant_exec`, `terminal/output` → `grant_output`, `terminal/wait_for_exit` →

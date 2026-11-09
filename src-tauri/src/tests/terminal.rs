@@ -923,9 +923,8 @@ fn drain_complete_utf8_keeps_incomplete_tail_after_valid_prefix() {
 // ---- MB in-daemon vt100 terminal model (mb-terminal-model) ----
 
 pub(crate) fn model_lines(model: &PaneModel) -> Vec<String> {
-    let screen = model.parser.screen();
-    let (_, cols) = screen.size();
-    screen.rows(0, cols).collect()
+    let (_, cols) = model.screen_size();
+    model.parser.screen().rows(0, cols).collect()
 }
 
 pub(crate) fn model_title(model: &PaneModel) -> Option<String> {
@@ -1016,12 +1015,12 @@ fn vt100_model_captures_osc_title() {
 fn vt100_model_set_size_tracks_resize_and_revision_is_monotonic() {
     // VAL-TERM-025 + VAL-TERM-006 + VAL-TERM-010/011.
     let mut model = PaneModel::new(80, 24);
-    assert_eq!(model.parser.screen().size(), (24, 80)); // (rows, cols)
+    assert_eq!(model.screen_size(), (24, 80)); // (rows, cols)
     model.process(b"hello");
     let rev_before = model.revision;
 
     model.set_size(100, 40); // (cols, rows)
-    assert_eq!(model.parser.screen().size(), (40, 100));
+    assert_eq!(model.screen_size(), (40, 100));
     // Revision never resets or decreases on resize (it tracks output, not size).
     assert_eq!(model.revision, rev_before, "resize alone is not output");
 
@@ -3025,8 +3024,18 @@ fn parse_wait_args_parses_each_condition_and_timeout() {
     let parsed = parse_wait_args(&str_args(&["p", "--exit"])).unwrap();
     assert_eq!(parsed.condition, WaitCondition::Exit);
 
-    // Unknown flag and non-numeric idle/timeout are rejected (total parsing).
+    let parsed =
+        parse_wait_args(&str_args(&["p", "--attention", "needs_input,idle,idle"])).unwrap();
+    assert_eq!(
+        parsed.condition,
+        WaitCondition::Attention(vec![AgentAttention::NeedsInput, AgentAttention::Idle])
+    );
+
+    // Unknown flag, invalid attention state, conflicting conditions, and non-numeric idle/timeout are rejected.
     assert!(parse_wait_args(&str_args(&["p", "--bogus"])).is_err());
+    assert!(parse_wait_args(&str_args(&["p", "--attention", ""])).is_err());
+    assert!(parse_wait_args(&str_args(&["p", "--attention", "sleeping"])).is_err());
+    assert!(parse_wait_args(&str_args(&["p", "--attention", "idle", "--exit"])).is_err());
     assert!(parse_wait_args(&str_args(&["p", "--idle", "soon"])).is_err());
     assert!(parse_wait_args(&str_args(&["p", "--text", "X", "--timeout", "later"])).is_err());
 }
@@ -3283,6 +3292,65 @@ fn wait_unknown_pane_is_clean_error() {
         started.elapsed() < Duration::from_secs(2),
         "must not consume the timeout"
     );
+}
+
+#[test]
+fn wait_matches_attention_transition_and_dead_pane_resolves() {
+    let (server, _dir, _t) = wait_shared_server();
+    let pane = create_wait_pane(&server);
+    await_shell_ready(&server, &pane);
+
+    // Start in `Working`, then transition to `NeedsInput` on another thread.
+    server.router.apply_official_attention(
+        &pane,
+        "claude",
+        AgentAttention::Working,
+        Duration::from_secs(30),
+    );
+    let bg_server = Arc::clone(&server);
+    let bg_pane = pane.clone();
+    let trigger = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(80));
+        bg_server.router.apply_official_attention(
+            &bg_pane,
+            "claude",
+            AgentAttention::NeedsInput,
+            Duration::from_secs(30),
+        );
+    });
+
+    let outcome = wait_now(
+        &server,
+        &pane,
+        WaitCondition::Attention(vec![AgentAttention::NeedsInput, AgentAttention::Idle]),
+        Some(5_000),
+    )
+    .expect("attention wait ok");
+    trigger.join().expect("trigger joined");
+    assert_eq!(outcome["matched"], json!(true), "outcome={outcome}");
+    assert_eq!(outcome["reason"], json!("attention"));
+    assert_eq!(outcome["attention"], json!("needs_input"));
+
+    // Once the pane's process exits, an attention wait resolves promptly as
+    // unmatched timeout rather than hanging forever.
+    server
+        .handle(DaemonRequest::WriteToPane {
+            pane_id: pane.clone(),
+            data: "exit 0\r".to_string(),
+        })
+        .expect("write exit");
+    let _ = wait_now(&server, &pane, WaitCondition::Exit, Some(5_000)).expect("wait exit");
+    let dead_started = Instant::now();
+    let dead_outcome = wait_now(
+        &server,
+        &pane,
+        WaitCondition::Attention(vec![AgentAttention::Idle]),
+        None,
+    )
+    .expect("dead pane attention wait should resolve");
+    assert_eq!(dead_outcome["matched"], json!(false));
+    assert_eq!(dead_outcome["reason"], json!("timeout"));
+    assert!(dead_started.elapsed() < Duration::from_secs(2));
 }
 
 // ───── Persistence serialization (H1) ─────

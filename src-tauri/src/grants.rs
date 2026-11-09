@@ -30,6 +30,9 @@ pub(crate) const GRANT_WAIT_SLICE: Duration = Duration::from_millis(50);
 /// Grace window between `SIGTERM` and `SIGKILL` on `grant_kill` / `grant_release`.
 #[cfg(unix)]
 pub(crate) const GRANT_KILL_GRACE: Duration = Duration::from_millis(500);
+/// Bounded wait on `grant_kill` / `grant_release` for the PTY reader thread to
+/// flush final scrollback bytes and reap the child's exit status.
+pub(crate) const GRANT_REAP_WAIT_MAX: Duration = Duration::from_millis(2_000);
 
 /// Pure-Rust RFC 2104 HMAC-SHA256 over `sha2::Sha256`, encoded as lowercase hex.
 pub(crate) fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
@@ -174,10 +177,20 @@ pub(crate) struct ExecutionGrant {
     pub(crate) issued_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct GrantExitState {
     pub(crate) exited: bool,
     pub(crate) exit_code: Option<i32>,
+    pub(crate) signal: Option<String>,
+}
+
+impl GrantExitState {
+    pub(crate) fn to_exit_json(&self) -> Value {
+        json!({
+            "exit_code": self.exit_code,
+            "signal": self.signal,
+        })
+    }
 }
 
 pub(crate) struct GrantTerminal {
@@ -191,22 +204,36 @@ pub(crate) struct GrantTerminal {
 }
 
 impl GrantTerminal {
-    fn mark_exited(&self, exit_code: Option<i32>) {
+    /// Record exit once while enforcing `kranz_acp::terminal::ExitStatus`'s
+    /// strict XOR invariant (`exit_code.is_some() != signal.is_some()`).
+    fn mark_exited(&self, exit_code: Option<i32>, signal: Option<String>) {
+        let (norm_code, norm_sig) = match exit_code {
+            Some(code) => (Some(code), None),
+            None => (
+                None,
+                Some(
+                    signal
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "terminated".to_string()),
+                ),
+            ),
+        };
         if let Ok(mut state) = self.exit_state.lock() {
             if !state.exited {
                 state.exited = true;
-                state.exit_code = exit_code;
+                state.exit_code = norm_code;
+                state.signal = norm_sig;
             }
         }
         self.exit_cvar.notify_all();
     }
 
     fn snapshot_exit(&self) -> Option<Value> {
-        self.exit_state.lock().ok().and_then(|state| {
-            state
-                .exited
-                .then(|| json!({ "exit_code": state.exit_code }))
-        })
+        self.exit_state
+            .lock()
+            .ok()
+            .and_then(|state| state.exited.then(|| state.to_exit_json()))
     }
 }
 
@@ -361,7 +388,13 @@ impl GrantStore {
     }
 
     /// Called by the PTY reader thread when `(pane_id, generation)` finishes.
-    pub(crate) fn notify_pane_exit(&self, pane_id: &str, generation: u64, exit_code: Option<i32>) {
+    pub(crate) fn notify_pane_exit(
+        &self,
+        pane_id: &str,
+        generation: u64,
+        exit_code: Option<i32>,
+        signal: Option<String>,
+    ) {
         let matching: Vec<Arc<GrantTerminal>> = self
             .inner
             .lock()
@@ -375,7 +408,7 @@ impl GrantStore {
             })
             .unwrap_or_default();
         for term in matching {
-            term.mark_exited(exit_code);
+            term.mark_exited(exit_code, signal.clone());
         }
     }
 
@@ -394,7 +427,7 @@ impl GrantStore {
             })
             .unwrap_or_default();
         for term in matching {
-            term.mark_exited(None);
+            term.mark_exited(None, Some("superseded".to_string()));
         }
     }
 }
@@ -991,10 +1024,10 @@ impl DaemonServer {
             });
             self.grants.insert_terminal(Arc::clone(&term));
             // Close the fast-exit race if the child exited before insert_terminal.
-            let (already_ended, exit_code) =
+            let (already_ended, exit_code, exit_signal) =
                 terminals.generation_exit_snapshot(&pane_id, pty_generation);
             if already_ended {
-                term.mark_exited(exit_code);
+                term.mark_exited(exit_code, exit_signal);
             }
             term
         };
@@ -1068,7 +1101,8 @@ impl DaemonServer {
             "grant": term.grant_id,
             "output": output,
             "truncated": truncated,
-            "exit": exit,
+            "exit": exit.clone(),
+            "exit_status": exit,
         }))
     }
 
@@ -1107,6 +1141,7 @@ impl DaemonServer {
                             "exited": false,
                             "timed_out": true,
                             "exit": Value::Null,
+                            "exit_status": Value::Null,
                             "elapsed_ms": started.elapsed().as_millis() as u64,
                         }));
                     }
@@ -1120,7 +1155,7 @@ impl DaemonServer {
                 .map_err(|_| "grant terminal lock poisoned".to_string())?;
             state = guard;
         }
-        let exit_code = state.exit_code;
+        let exit_val = state.to_exit_json();
         drop(state);
 
         Ok(json!({
@@ -1128,35 +1163,81 @@ impl DaemonServer {
             "pane_id": term.pane_id,
             "exited": true,
             "timed_out": false,
-            "exit": { "exit_code": exit_code },
+            "exit": exit_val.clone(),
+            "exit_status": exit_val,
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }))
     }
 
-    pub(crate) fn handle_grant_kill(&self, terminal_id: &str) -> Result<Value, String> {
-        let term = self.grants.get_terminal(terminal_id)?;
+    /// Signal the grant's PTY generation (if still live) and wait up to
+    /// `GRANT_REAP_WAIT_MAX` for the PTY reader thread to drain final output
+    /// into scrollback and reap the child's exit status.
+    fn kill_and_reap_grant_terminal(
+        &self,
+        term: &GrantTerminal,
+    ) -> Result<(bool, bool, bool, Value), String> {
         let signalled = self
             .lock_terminals()?
             .kill_session_generation(&term.pane_id, term.generation);
+        let deadline = Instant::now() + GRANT_REAP_WAIT_MAX;
+        let mut state = term
+            .exit_state
+            .lock()
+            .map_err(|_| "grant terminal lock poisoned".to_string())?;
+        while !state.exited {
+            if self.should_shutdown() {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let slice = (deadline - now).min(GRANT_WAIT_SLICE);
+            let (guard, _) = term
+                .exit_cvar
+                .wait_timeout(state, slice)
+                .map_err(|_| "grant terminal lock poisoned".to_string())?;
+            state = guard;
+        }
+        if state.exited {
+            Ok((true, true, signalled, state.to_exit_json()))
+        } else {
+            Ok((false, false, signalled, Value::Null))
+        }
+    }
+
+    pub(crate) fn handle_grant_kill(&self, terminal_id: &str) -> Result<Value, String> {
+        let term = self.grants.get_terminal(terminal_id)?;
+        let (descendants_reaped, output_drained, signalled, exit_val) =
+            self.kill_and_reap_grant_terminal(&term)?;
         Ok(json!({
             "terminal_id": term.terminal_id,
             "pane_id": term.pane_id,
             "killed": signalled,
             "already_exited": !signalled,
+            "descendants_reaped": descendants_reaped,
+            "output_drained": output_drained,
+            "released": false,
+            "exit": exit_val.clone(),
+            "exit_status": exit_val,
         }))
     }
 
     pub(crate) fn handle_grant_release(&self, terminal_id: &str) -> Result<Value, String> {
-        let term = self.grants.remove_terminal(terminal_id)?;
-        // Per ACP `terminal/release`, releasing a handle whose child is still
-        // running terminates the child while keeping the Sgian pane + ledger.
-        let _ = self
-            .lock_terminals()
-            .map(|mut terminals| terminals.kill_session_generation(&term.pane_id, term.generation));
+        // Keep `term` registered in `self.grants` while terminating and waiting
+        // for the PTY reader thread's `notify_pane_exit`, then remove once.
+        let term = self.grants.get_terminal(terminal_id)?;
+        let (descendants_reaped, output_drained, _signalled, exit_val) =
+            self.kill_and_reap_grant_terminal(&term)?;
+        let _ = self.grants.remove_terminal(terminal_id)?;
         Ok(json!({
             "terminal_id": term.terminal_id,
             "pane_id": term.pane_id,
             "released": true,
+            "descendants_reaped": descendants_reaped,
+            "output_drained": output_drained,
+            "exit": exit_val.clone(),
+            "exit_status": exit_val,
         }))
     }
 }

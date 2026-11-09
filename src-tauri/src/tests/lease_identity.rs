@@ -2458,11 +2458,23 @@ fn parse_search_and_lines_args() {
     assert!(parse_search_args(&args(&["pane-1"])).is_err());
     assert!(parse_search_args(&args(&["pane-1", "-q", "x"])).is_err());
     let lines = parse_lines_args(&args(&["pane-1", "3:9"])).expect("range");
-    assert_eq!((lines.from, lines.to), (3, 9));
+    assert_eq!((lines.from, lines.to, lines.last), (3, 9, None));
     let single = parse_lines_args(&args(&["pane-1", "7"])).expect("single");
-    assert_eq!((single.from, single.to), (7, 7));
+    assert_eq!((single.from, single.to, single.last), (7, 7, None));
+    let tail_short = parse_lines_args(&args(&["pane-1", "-n", "25"])).expect("tail -n");
+    assert_eq!(
+        (tail_short.pane_ref.as_str(), tail_short.last),
+        ("pane-1", Some(25))
+    );
+    let tail_long = parse_lines_args(&args(&["--last", "10", "pane-1"])).expect("tail --last");
+    assert_eq!(
+        (tail_long.pane_ref.as_str(), tail_long.last),
+        ("pane-1", Some(10))
+    );
     assert!(parse_lines_args(&args(&["pane-1", "0:2"])).is_err());
     assert!(parse_lines_args(&args(&["pane-1", "5:2"])).is_err());
+    assert!(parse_lines_args(&args(&["pane-1", "-n", "0"])).is_err());
+    assert!(parse_lines_args(&args(&["pane-1", "1:5", "-n", "2"])).is_err());
     assert!(parse_lines_args(&args(&["pane-1"])).is_err());
 }
 
@@ -2527,11 +2539,25 @@ fn scrollback_search_and_lines_over_ipc() {
             pane_id: pane_id.clone(),
             from: needle_line,
             to: three_line,
+            last: None,
         })
         .expect("lines");
     assert_eq!(cited["lines"], json!(["row-needle", "row-three"]));
     assert_eq!(cited["from"], json!(needle_line));
-    assert!(cited["total_lines"].as_u64().unwrap_or(0) as usize >= three_line);
+    let total_lines = cited["total_lines"].as_u64().unwrap_or(0) as usize;
+    assert!(total_lines >= three_line);
+
+    let tailed: Value = client
+        .request(DaemonRequest::ScrollbackLines {
+            pane_id: pane_id.clone(),
+            from: 0,
+            to: 0,
+            last: Some(2),
+        })
+        .expect("tail lines");
+    assert_eq!(tailed["to"], json!(total_lines));
+    assert_eq!(tailed["from"], json!(total_lines.saturating_sub(2) + 1));
+    assert_eq!(tailed["lines"].as_array().map_or(0, Vec::len), 2);
 
     let empty = client
         .request::<Value>(DaemonRequest::SearchScrollback {
@@ -2547,6 +2573,7 @@ fn scrollback_search_and_lines_over_ipc() {
             pane_id: pane_id.clone(),
             from: 1,
             to: 5000,
+            last: None,
         })
         .expect_err("range too wide");
     assert!(bad.contains("at most"), "{bad}");

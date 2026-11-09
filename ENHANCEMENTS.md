@@ -243,8 +243,15 @@ Shipped (2026-09-16):
   `grant_kill`, and `grant_release` (plus `ctl grant`) verify HMAC-SHA256
   grants against `<repo>/.kranz/serve.grant.key` (`0600`), confine canonical
   `cwd` inside the bound repo, spawn verbatim `argv` in a PTY with strict
-  `env_allow` filtering under a `kranz:<run>` held lease, reject replays, and
-  record durable `grant.exec` / `grant.refused` ledger receipts.
+  `env_allow` filtering under a `kranz:<run>` held lease, reject replays,
+  report `exit_status: { exit_code, signal }` (strict XOR) and `CleanupReceipt`
+  fields (`descendants_reaped`, `output_drained`, `released`) aligned with
+  `kranz-acp`, and record durable `grant.exec` / `grant.refused` ledger
+  receipts.
+- **Agent-to-agent steering spike and `ctl` refinements**
+  (`docs/design/agent-steering-and-machines.md`, #117). Documented the
+  steering and saved-machine design and shipped `ctl lines <PANE> (-n|--last) N`
+  and `ctl wait <PANE> --attention <working|needs_input|idle[,...]>`.
 
 Open, in order:
 
@@ -258,8 +265,6 @@ Open, in order:
 - **Windows daemon as a remote target** (#116): an attach path (SSM or a
   loopback TCP listener, since a named pipe cannot be forwarded over SSH) and
   daemon lifetime without an interactive logon.
-- **Spike: agent-to-agent steering ergonomics and cross-machine pane
-  addressing** (#117): a design note, not code.
 - **Hands-on acceptance on a phone** (#83): the served view over `ssh -L` from
   a real device (the phone-width layout was checked in a desktop browser at
   375×812 only).
