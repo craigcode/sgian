@@ -198,9 +198,16 @@ what crosses a network:
      sgian ctl lines devbox/pane-2 -n 60
      ```
 
-     Native macOS and Windows desktop clients read the same global `machines`
-     list, display saved machines in the sidebar and command palette, and attach
-     through `sgian ctl --machine <name> --json ipc-endpoint`.
+     Tauri, native macOS, and native Windows desktop clients read the same global
+     `machines` list, display saved machines in the sidebar and command palette,
+     and attach through local client-owned tunnels. For private subnets without
+     inbound SSH (`#115`), save `--transport ssm --target <i-...>` (with
+     `"remote_loopback_port": 0` enabled on the remote workspace): Sgian captures
+     `aws ssm start-session` / `resume-session` WebSocket credentials via its
+     built-in `session-manager-plugin` shim, multiplexes binary `SGN2` streams
+     over `AWS-StartPortForwardingSession` (`smux` v1), records durable
+     `session.started` / `session.resumed` / `session.terminated` ledger entries,
+     and supports remote chain verification via `sgian ctl --machine <name> ledger [PANE] --verify`.
    - **Windows daemon as a remote target (#116):** Windows named pipes cannot be
      forwarded directly by OpenSSH `-L`. Setting `"remote_loopback_port": 0` (for
      an OS-assigned ephemeral port recorded in `daemon.loopback_port`) or an

@@ -897,10 +897,13 @@ pub(crate) fn run_control_cli_from_args(args: &[String]) -> Result<(), String> {
             if has_help_flag(&sub_args) {
                 return print_control_help();
             }
-            reject_remote("ledger")?;
             let parsed = parse_ledger_args(&sub_args)?;
-            let client = DaemonClient::connect_existing(options.workspace)?;
-            control_ledger(&client, parsed, options.json)
+            let client = connect_existing()?;
+            if effective_machine.is_some() || client.has_client_token() {
+                control_ledger_remote(&client, parsed, options.json)
+            } else {
+                control_ledger(&client, parsed, options.json)
+            }
         }
         "attach" => {
             if sub_args.len() > 1 {
@@ -2065,6 +2068,76 @@ pub(crate) fn control_ledger(
         };
     }
     let records = read_ledger_tail(&path, parsed.limit);
+    if json_output {
+        return write_json_stdout(&records);
+    }
+    let mut stdout = std::io::stdout();
+    for record in &records {
+        writeln!(stdout, "{record}").map_err(|error| format!("failed to write stdout: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Remote `ctl ledger` over `DaemonRequest::PaneLedger` (`--machine <name>` /
+/// `SGIAN_CLIENT_TOKEN`). When `--verify` is passed, the client ALSO independently
+/// re-computes the cryptographic SHA-256 hash chain over every returned record.
+pub(crate) fn control_ledger_remote(
+    client: &DaemonClient,
+    parsed: LedgerArgs,
+    json_output: bool,
+) -> Result<(), String> {
+    let pane_id = match resolve_pane_ref(client, &parsed.pane_ref) {
+        Ok(pane_id) => pane_id,
+        Err(error) => {
+            if parsed.pane_ref.starts_with("pane-") {
+                parsed.pane_ref.clone()
+            } else {
+                return Err(error);
+            }
+        }
+    };
+    let resp: Value = client.request(DaemonRequest::PaneLedger {
+        pane_id: pane_id.clone(),
+        limit: if parsed.verify { 0 } else { parsed.limit },
+        verify: parsed.verify,
+    })?;
+    if parsed.verify {
+        let items = resp["items"].as_array().cloned().unwrap_or_default();
+        let summary = ledger_verify_records(&items).map_err(|broken| {
+            format!(
+                "ledger break in {} at line {}{}: {}",
+                pane_id,
+                broken.line,
+                broken
+                    .seq
+                    .map(|seq| format!(" (seq {seq})"))
+                    .unwrap_or_default(),
+                broken.reason
+            )
+        })?;
+        if json_output {
+            return write_json_stdout(&json!({
+                "pane_id": pane_id,
+                "ok": true,
+                "records": summary.records,
+                "head": summary.head,
+            }));
+        }
+        let mut stdout = std::io::stdout();
+        return writeln!(
+            stdout,
+            "ok\t{}\t{} records\thead {}",
+            pane_id,
+            summary.records,
+            if summary.head.is_empty() {
+                "-"
+            } else {
+                summary.head.as_str()
+            }
+        )
+        .map_err(|error| format!("failed to write stdout: {error}"));
+    }
+    let records = resp["records"].as_array().cloned().unwrap_or_default();
     if json_output {
         return write_json_stdout(&records);
     }

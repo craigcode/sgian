@@ -266,14 +266,27 @@ Shipped (2026-09-16):
   `client_token` enforcement on loopback TCP handshakes, `"tcp_loopback"` client
   transport in Rust and `Sgian.Protocol`, and Task Scheduler S4U / Session 0
   ConPTY operational guidance (`docs/scripting-and-local-operation.md`).
+- **M5 AWS SSM Session Manager transport framing and mock MGS harness (part of #115).**
+  `src-tauri/src/ssm.rs` implements the AWS SSM `AgentMessage` binary wire codec
+  (`116..=4096`-byte big-endian header, half-swapped `[LSB_8 | MSB_8]` UUID wire
+  layout, SHA-256 `PayloadDigest`, `10 MiB` pre-allocation cap), reliable sequence
+  and EWMA-retransmit stream engine (`SsmStreamState`) with deferred-ACK
+  backpressure, `xtaci/smux` v1 multiplexing over `AWS-StartPortForwardingSession`,
+  synchronous `ws://`/`wss://` (`rustls`) MGS client, `ClientLeaseTracker`
+  (`Requested` / `Releasing`), `session-manager-plugin` capture shim, `ResumeSession`
+  blip recovery with durable `session.started` / `session.resumed` /
+  `session.terminated` ledger entries, remote `ctl --machine <name> ledger --verify`,
+  10,000-iteration PRNG frame fuzzing, and an in-process Mock MGS WebSocket
+  integration suite (`src-tauri/src/tests/ssm.rs`).
 
 Open, in order:
 
 - **Execution grants — Kranz `TerminalProvider` consumer**: wiring `kranz-acp`
   to Sgian's `grant_*` endpoints on the Kranz side.
-- **M5 SSM / ECS Exec target** (#115): `MachineEntry` schema supports
-  `transport: "ssm"` and `target`; live transport wiring awaits AWS Linux EC2
-  and Windows WorkSpace test hosts.
+- **M5 SSM / ECS Exec live AWS host sign-off** (#115): framing, `smux` port
+  forwarding, `ResumeSession`, and Mock MGS integration tests are in place; live
+  Linux EC2 + Windows WorkSpace sign-off and optional KMS `EncChallenge` session
+  encryption remain open.
 - **Hands-on acceptance on a phone** (#83): the served view over `ssh -L` from
   a real device (the phone-width layout was checked in a desktop browser at
   375×812 only).

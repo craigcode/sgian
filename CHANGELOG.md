@@ -72,6 +72,16 @@ follow SemVer once the first public tag exists.
   `--machine <name>` / `-m <name>` / `SGIAN_MACHINE` and `<machine>/<pane>`
   shorthand across `sgian ctl`, and saved machine switchers across Tauri
   (`ui/`), `apps/macos`, and `apps/windows`.
+- AWS SSM Session Manager remote transport (`transport: "ssm"`, part of #115):
+  binary `AgentMessage` wire codec (half-swapped `MessageId` UUIDs, SHA-256
+  `PayloadDigest`, `10 MiB` payload bound), deferred-ACK backpressure and EWMA
+  retransmit stream engine (`SsmStreamState`), `xtaci/smux` v1 multiplexing over
+  `AWS-StartPortForwardingSession`, `rustls`-backed `wss://` MGS WebSocket
+  client, `aws` CLI `session-manager-plugin` capture shim (no external plugin
+  install required), `ClientLeaseTracker` (`Requested` / `Releasing`),
+  `ResumeSession` WebSocket blip recovery with durable `session.started` /
+  `session.resumed` / `session.terminated` ledger entries, and remote
+  `ctl --machine <name> ledger --verify` (`src-tauri/src/ssm.rs`).
 - Windows daemon as a remote target (#116): opt-in `127.0.0.1` loopback TCP IPC
   listener (`remote_loopback_port` in `config.json` and `--listen-loopback <PORT>`,
   recording `daemon.loopback_port` and `ipc-endpoint.loopback_port`), mandatory
