@@ -346,6 +346,8 @@ function Toolbar({ state, controller }) {
       >
         <option value="claude">Claude</option>
         <option value="droid">Droid</option>
+        <option value="codex">Codex</option>
+        <option value="gemini">Gemini</option>
       </select>
       <input
         id="new-agent-model"

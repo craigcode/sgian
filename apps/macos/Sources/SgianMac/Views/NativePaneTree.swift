@@ -153,6 +153,8 @@ struct NativeCommandPalette: View {
             ("Split down", { model.createShell(direction: "column") }),
             ("New Claude agent", { model.createAgent(backend: .claude) }),
             ("New Factory Droid agent", { model.createAgent(backend: .droid) }),
+            ("New Codex agent", { model.createAgent(backend: .codex) }),
+            ("New Gemini agent", { model.createAgent(backend: .gemini) }),
             ("Zoom / Show all panes", { model.toggleZoom() }),
             ("Find in terminal", { model.showingSearch = true }),
             ("Open workspace…", { model.chooseWorkspace() }),

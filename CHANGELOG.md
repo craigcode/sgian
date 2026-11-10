@@ -56,6 +56,14 @@ follow SemVer once the first public tag exists.
 
 ### Agents
 
+- `Codex` and `Gemini` chat-native agent backends (`src-tauri/src/agent_stream.rs`):
+  `AgentBackendKind::Codex` (`codex exec --json` and `codex exec resume --json`)
+  and `AgentBackendKind::Gemini` (`gemini --output-format stream-json` and
+  `--resume`) join `Claude` and `Droid` across `sgian ctl new --agent --backend`,
+  Tauri, `apps/macos`, and `apps/windows`, with `agent_codex_bin` /
+  `agent_gemini_bin` (`SGIAN_CODEX_BIN` / `SGIAN_GEMINI_BIN`) overrides, per-turn
+  stdin prompt streaming, effective `unattended` mode badges (`workspace-write`,
+  `danger-full-access`, `yolo`), and interactive TUI screen classification.
 - Saved remote workspaces (`machines`, #114): user-global `machines` entries
   managed via `ctl machine add|list|remove` with `0600` non-symlinked client
   token storage (plus macOS login Keychain and Windows PasswordVault lookups),

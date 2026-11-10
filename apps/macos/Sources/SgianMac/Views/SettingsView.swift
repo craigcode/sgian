@@ -9,6 +9,8 @@ struct SettingsView: View {
     @State private var shellArguments = ""
     @State private var claudeBinary = ""
     @State private var droidBinary = ""
+    @State private var codexBinary = ""
+    @State private var geminiBinary = ""
     @State private var permissionMode = "manual"
     @State private var restorePolicy = "auto_respawn"
     @State private var profiles: [JSONValue] = []
@@ -38,7 +40,10 @@ struct SettingsView: View {
                 }
                 Section("New agent defaults") {
                     Picker("Provider", selection: $defaultAgentBackend) {
-                        Text("Claude Code").tag("claude"); Text("Factory Droid").tag("droid")
+                        Text("Claude Code").tag("claude")
+                        Text("Factory Droid").tag("droid")
+                        Text("Codex").tag("codex")
+                        Text("Gemini CLI").tag("gemini")
                     }
                     TextField("Model (provider default when empty)", text: $defaultAgentModel)
                     Text("Agents use the provider CLI’s existing installation and login on this Mac.")
@@ -49,6 +54,8 @@ struct SettingsView: View {
                     TextField("Shell arguments (one per line)", text: $shellArguments, axis: .vertical)
                     TextField("Claude executable (optional)", text: $claudeBinary)
                     TextField("Droid executable (optional)", text: $droidBinary)
+                    TextField("Codex executable (optional)", text: $codexBinary)
+                    TextField("Gemini executable (optional)", text: $geminiBinary)
                     Picker("Agent permissions", selection: $permissionMode) {
                         Text("Ask for approval").tag("manual")
                         Text("Automatic").tag("auto")
@@ -80,7 +87,10 @@ struct SettingsView: View {
                     }
                     if profileKind == "agent" {
                         Picker("Provider", selection: $profileBackend) {
-                            Text("Claude Code").tag("claude"); Text("Factory Droid").tag("droid")
+                            Text("Claude Code").tag("claude")
+                            Text("Factory Droid").tag("droid")
+                            Text("Codex").tag("codex")
+                            Text("Gemini CLI").tag("gemini")
                         }
                         TextField("Model (optional)", text: $profileModel)
                     }
@@ -144,6 +154,8 @@ struct SettingsView: View {
             shellArguments = (config["shell_args"]?.arrayValue ?? []).compactMap(\.stringValue).joined(separator: "\n")
             claudeBinary = config["agent_claude_bin"]?.stringValue ?? ""
             droidBinary = config["agent_droid_bin"]?.stringValue ?? ""
+            codexBinary = config["agent_codex_bin"]?.stringValue ?? ""
+            geminiBinary = config["agent_gemini_bin"]?.stringValue ?? ""
             permissionMode = config["agent_permission_mode"]?.stringValue ?? "manual"
             restorePolicy = config["restore_policy"]?.stringValue ?? "auto_respawn"
             profiles = config["profiles"]?.arrayValue ?? []
@@ -162,6 +174,8 @@ struct SettingsView: View {
         next["shell_args"] = .array(shellArguments.split(separator: "\n").map { .string(String($0)) })
         next["agent_claude_bin"] = claudeBinary.isEmpty ? .null : .string(claudeBinary)
         next["agent_droid_bin"] = droidBinary.isEmpty ? .null : .string(droidBinary)
+        next["agent_codex_bin"] = codexBinary.isEmpty ? .null : .string(codexBinary)
+        next["agent_gemini_bin"] = geminiBinary.isEmpty ? .null : .string(geminiBinary)
         next["agent_permission_mode"] = .string(permissionMode)
         next["restore_policy"] = .string(restorePolicy)
         next["profiles"] = .array(profiles)

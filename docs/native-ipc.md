@@ -219,8 +219,9 @@ agent's observed permission mode) and `unattended` (true when tools run
 without a person approving them); both are additive and clients must mark an
 unattended pane visibly. A current daemon always sends `unattended` on the
 event; a client talking to an older daemon should derive it from `mode`
-(`auto`, `bypass`, `bypassPermissions`, `dontAsk`) when the key is absent, so
-a live transition and the bootstrap snapshot agree.
+(`auto`, `bypass`, `bypassPermissions`, `dontAsk`, `yolo`,
+`danger-full-access`, `workspace-write`, `full-auto`, `never`) when the key is
+absent, so a live transition and the bootstrap snapshot agree.
 
 The bootstrap snapshot supplies the pane registry, active pane, scrollback,
 recorded PTY dimensions, runtime state, agent attention, provider/model specs

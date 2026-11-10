@@ -110,7 +110,9 @@ public sealed record AgentPaneInfo
 
     /// <summary>True when tools run without a person approving them (auto / bypass).</summary>
     /// <summary>Modes in which tools run without a person approving them; mirrors the daemon's list so a client can derive the flag from an older daemon's event.</summary>
-    public static bool IsUnattendedMode(string? mode) => mode is "auto" or "bypass" or "bypassPermissions" or "dontAsk";
+    public static bool IsUnattendedMode(string? mode) =>
+        mode is "auto" or "bypass" or "bypassPermissions" or "dontAsk"
+            or "yolo" or "danger-full-access" or "workspace-write" or "full-auto" or "never";
 
     [JsonPropertyName("unattended")]
     public bool Unattended { get; init; }

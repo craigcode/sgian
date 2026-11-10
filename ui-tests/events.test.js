@@ -632,6 +632,10 @@ describe("agent permission mode", () => {
     const callbacks = makeCallbacks();
     handleAgentState(state, { pane_id: "pane-1", agent: "claude", attention: "idle", mode: "auto" }, callbacks);
     expect(state.agentStates.get("pane-1").unattended).toBe(true);
+    handleAgentState(state, { pane_id: "pane-1", agent: "gemini", attention: "idle", mode: "yolo" }, callbacks);
+    expect(state.agentStates.get("pane-1").unattended).toBe(true);
+    handleAgentState(state, { pane_id: "pane-1", agent: "codex", attention: "idle", mode: "workspace-write" }, callbacks);
+    expect(state.agentStates.get("pane-1").unattended).toBe(true);
     handleAgentState(state, { pane_id: "pane-1", agent: "claude", attention: "idle", mode: "plan" }, callbacks);
     expect(state.agentStates.get("pane-1").unattended).toBeUndefined();
     // An explicit false from the daemon wins over the derived value.

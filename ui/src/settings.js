@@ -293,7 +293,10 @@ export function settingsPassthroughConfig(config) {
     "agent_permission_mode",
     "agent_claude_bin",
     "agent_droid_bin",
+    "agent_codex_bin",
+    "agent_gemini_bin",
     "profiles",
+    "remote_loopback_port",
   ]) {
     if (Object.prototype.hasOwnProperty.call(config, key)) {
       passthrough[key] = config[key];

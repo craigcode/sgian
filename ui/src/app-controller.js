@@ -1008,7 +1008,7 @@ export function createAppController({
   }
 
   function setNewAgentBackend(backend) {
-    if (!["claude", "droid"].includes(backend)) return;
+    if (!["claude", "droid", "codex", "gemini"].includes(backend)) return;
     state.newAgentBackend = backend;
     notify();
   }

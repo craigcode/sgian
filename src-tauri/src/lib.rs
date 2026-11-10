@@ -237,6 +237,8 @@ pub enum AgentBackendKind {
     #[default]
     Claude,
     Droid,
+    Codex,
+    Gemini,
 }
 
 impl AgentBackendKind {
@@ -244,6 +246,8 @@ impl AgentBackendKind {
         match self {
             Self::Claude => "claude",
             Self::Droid => "droid",
+            Self::Codex => "codex",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -251,6 +255,8 @@ impl AgentBackendKind {
         match name {
             "claude" => Some(Self::Claude),
             "droid" => Some(Self::Droid),
+            "codex" => Some(Self::Codex),
+            "gemini" => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -400,21 +406,40 @@ fn preserve_omitted_config_keys(incoming: &mut Value, config_path: &Path) {
 pub(crate) fn is_unattended_mode(mode: Option<&str>) -> bool {
     matches!(
         mode,
-        Some("auto") | Some("bypass") | Some("bypassPermissions") | Some("dontAsk")
+        Some(
+            "auto"
+                | "bypass"
+                | "bypassPermissions"
+                | "dontAsk"
+                | "yolo"
+                | "danger-full-access"
+                | "workspace-write"
+                | "full-auto"
+                | "never"
+        )
     )
 }
 
-/// Claude Code prints its permission mode in the input-box footer
-/// (`⏵⏵ auto mode on`, `⏵⏵ bypass permissions on`, `⏵⏵ accept edits on`,
-/// `⏸ plan mode on`). Reduce it to a short stable token.
+/// Agent TUIs print their permission/sandbox mode in the input-box footer
+/// (Claude Code: `⏵⏵ auto mode on`, `⏵⏵ bypass permissions on`,
+/// `⏵⏵ accept edits on`, `⏸ plan mode on`; Gemini CLI: `YOLO mode`,
+/// `Accepting edits`, `Plan mode`; Codex CLI: `danger-full-access`).
+/// Reduce it to a short stable token.
 fn classify_agent_mode(text: &str) -> Option<&'static str> {
     if text.contains("bypass permissions on") {
         Some("bypass")
+    } else if text.contains("danger-full-access") {
+        Some("danger-full-access")
+    } else if text.contains("YOLO mode") {
+        Some("yolo")
     } else if text.contains("auto mode on") {
         Some("auto")
-    } else if text.contains("accept edits on") || text.contains("auto-accept edits on") {
+    } else if text.contains("accept edits on")
+        || text.contains("auto-accept edits on")
+        || text.contains("Accepting edits")
+    {
         Some("accept-edits")
-    } else if text.contains("plan mode on") {
+    } else if text.contains("plan mode on") || text.contains("Plan mode") {
         Some("plan")
     } else {
         None
@@ -660,6 +685,14 @@ struct Config {
     /// PATH, with SGIAN_DROID_BIN as an operator-level escape hatch.
     #[serde(default)]
     agent_droid_bin: Option<String>,
+    /// Override for the OpenAI Codex CLI. Unset resolves `codex` through
+    /// PATH, with SGIAN_CODEX_BIN as an operator-level escape hatch.
+    #[serde(default)]
+    agent_codex_bin: Option<String>,
+    /// Override for the Google Gemini CLI. Unset resolves `gemini` through
+    /// PATH, with SGIAN_GEMINI_BIN as an operator-level escape hatch.
+    #[serde(default)]
+    agent_gemini_bin: Option<String>,
     /// Named shell/agent profiles selectable when creating a pane
     /// (ENHANCEMENTS §4). Empty by default; workspace overlays replace the
     /// global list when non-empty.
@@ -745,6 +778,8 @@ impl Config {
             agent_permission_mode: other.agent_permission_mode.or(self.agent_permission_mode),
             agent_claude_bin: other.agent_claude_bin.or(self.agent_claude_bin),
             agent_droid_bin: other.agent_droid_bin.or(self.agent_droid_bin),
+            agent_codex_bin: other.agent_codex_bin.or(self.agent_codex_bin),
+            agent_gemini_bin: other.agent_gemini_bin.or(self.agent_gemini_bin),
             // Absent-vs-empty cannot be distinguished on Vec; treat empty
             // overlay as inherit so a workspace file that omits `profiles`
             // keeps the global list.
@@ -853,6 +888,8 @@ impl Config {
         AgentSpawnConfig {
             claude_bin: self.agent_claude_bin.clone(),
             droid_bin: self.agent_droid_bin.clone(),
+            codex_bin: self.agent_codex_bin.clone(),
+            gemini_bin: self.agent_gemini_bin.clone(),
             permission_mode: self.agent_permission_mode_effective(),
         }
     }
@@ -914,9 +951,9 @@ impl Config {
                 }
             }
             if let Some(backend) = profile.agent_backend.as_deref() {
-                if backend != "claude" && backend != "droid" {
+                if AgentBackendKind::parse(backend).is_none() {
                     return Err(format!(
-                        "invalid profile agent_backend '{backend}' for '{name}': expected claude or droid"
+                        "invalid profile agent_backend '{backend}' for '{name}': expected claude, droid, codex, or gemini"
                     ));
                 }
             }
@@ -966,6 +1003,8 @@ impl Config {
             "agent_permission_mode": self.agent_permission_mode_effective(),
             "agent_claude_bin": self.agent_claude_bin,
             "agent_droid_bin": self.agent_droid_bin,
+            "agent_codex_bin": self.agent_codex_bin,
+            "agent_gemini_bin": self.agent_gemini_bin,
             "profiles": self.profiles,
             "remote_loopback_port": self.remote_loopback_port,
         })
@@ -1039,6 +1078,8 @@ impl Config {
             // The binary PATH/name only — never resolved env or secrets.
             "agent_claude_bin": self.agent_claude_bin,
             "agent_droid_bin": self.agent_droid_bin,
+            "agent_codex_bin": self.agent_codex_bin,
+            "agent_gemini_bin": self.agent_gemini_bin,
             "profiles": profiles,
             "remote_loopback_port": self.remote_loopback_port,
         })
@@ -1133,10 +1174,13 @@ fn load_config(data_dir: &Path) -> (Config, Vec<String>) {
 /// every pane it ever spawns, since it outlives the session. Pane shells are
 /// the operator's, not Claude's tools, so the marks are always dropped; an
 /// explicit `env` entry still wins.
-const INHERITED_SESSION_MARKERS: [&str; 3] = [
+const INHERITED_SESSION_MARKERS: [&str; 6] = [
     "CLAUDECODE",
     "CLAUDE_CODE_CHILD_SESSION",
     "CLAUDE_CODE_ENTRYPOINT",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "GEMINI_CLI_IDE_WORKSPACE_PATH",
 ];
 
 #[cfg(test)]
@@ -5374,11 +5418,12 @@ impl DaemonServer {
             if pane.kind != PaneKind::Agent {
                 continue;
             }
-            let backend = snapshot
+            let backend_kind = snapshot
                 .agent_specs
                 .get(&pane.id)
-                .map(|spec| spec.backend.as_str().to_string())
-                .unwrap_or_else(|| "claude".to_string());
+                .map(|spec| spec.backend)
+                .unwrap_or_default();
+            let backend = backend_kind.as_str().to_string();
             let entry = snapshot
                 .agent_states
                 .entry(pane.id.clone())
@@ -5386,10 +5431,16 @@ impl DaemonServer {
                     agent: Some(backend),
                     ..AgentPaneInfo::default()
                 });
-            let permission_mode = live_modes
-                .get(&pane.id)
-                .cloned()
-                .unwrap_or_else(|| configured_mode.clone());
+            let permission_mode = live_modes.get(&pane.id).cloned().unwrap_or_else(|| {
+                #[cfg(any(unix, windows))]
+                {
+                    (backend_kind.adapter().effective_permission_mode)(&configured_mode).to_string()
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    configured_mode.clone()
+                }
+            });
             entry.unattended = is_unattended_mode(Some(&permission_mode));
             entry.mode = Some(permission_mode);
         }
@@ -6056,6 +6107,15 @@ impl DaemonServer {
             server: self,
             pane_id: pane_id.to_string(),
         };
+        if plan.backend.adapter().per_turn_process {
+            verify_agent_bin_exists(&plan)?;
+            let mut terminals = self.lock_terminals()?;
+            if self.router.is_closed(pane_id) || self.should_shutdown() {
+                return Ok(());
+            }
+            terminals.commit_logical_agent_session(pane_id, &plan);
+            return Ok(());
+        }
         let prepared = execute_agent_spawn(&plan)?;
         let mut terminals = self.lock_terminals()?;
         // Closed/shutdown during the spawn window: kill + reap, commit nothing
@@ -6112,6 +6172,15 @@ impl DaemonServer {
             server: self,
             pane_id: pane_id.to_string(),
         };
+        if plan.backend.adapter().per_turn_process {
+            verify_agent_bin_exists(&plan)?;
+            let mut terminals = self.lock_terminals()?;
+            if self.router.is_closed(pane_id) || self.should_shutdown() {
+                return Ok(());
+            }
+            terminals.commit_logical_agent_session(pane_id, &plan);
+            return Ok(());
+        }
         let prepared = execute_agent_spawn(&plan)?;
         let mut terminals = self.lock_terminals()?;
         if self.router.is_closed(pane_id) || self.should_shutdown() {
@@ -6154,14 +6223,31 @@ impl DaemonServer {
             return Err("agent message id must contain 1 to 128 bytes".to_string());
         }
         self.ensure_agent_session(pane_id)?;
-        let (backend, input, shared, events) = {
+        let (backend, generation, input, killer_slot, shared, events, turn_plan, liveness, dirty) = {
             let terminals = self.lock_terminals()?;
             if !terminals.is_live(pane_id) {
                 return Err(format!("agent session not found: {pane_id}"));
             }
-            terminals
+            let (backend, generation, input, killer_slot, shared, events) = terminals
                 .agent_session_handles(pane_id)
-                .ok_or_else(|| format!("agent session not found: {pane_id}"))?
+                .ok_or_else(|| format!("agent session not found: {pane_id}"))?;
+            let turn_plan = backend
+                .adapter()
+                .per_turn_process
+                .then(|| terminals.plan_agent_spawn(pane_id));
+            let liveness = Arc::clone(&terminals.liveness);
+            let dirty = Arc::clone(&terminals.agent_dirty);
+            (
+                backend,
+                generation,
+                input,
+                killer_slot,
+                shared,
+                events,
+                turn_plan,
+                liveness,
+                dirty,
+            )
         };
         // One in-flight turn per pane (rejected, not queued — see
         // agent_try_begin_turn). The turn flag clears when the reader sees the
@@ -6171,6 +6257,52 @@ impl DaemonServer {
                 "agent turn already in progress: {pane_id} (wait for turn_complete or interrupt)"
             ));
         }
+
+        if let Some(plan) = turn_plan {
+            let prepared = match execute_per_turn_agent_spawn(&plan, text) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    agent_end_turn(&shared);
+                    return Err(error);
+                }
+            };
+            {
+                let mut events_guard = match events.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        let mut child = prepared.child;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        agent_end_turn(&shared);
+                        return Err("agent event log lock poisoned".to_string());
+                    }
+                };
+                events_guard.emit(
+                    &self.router,
+                    pane_id,
+                    json!({
+                        "kind": "user_message", "text": text, "message_id": message_id,
+                    }),
+                );
+            }
+            start_per_turn_agent_workers(
+                pane_id.to_string(),
+                generation,
+                prepared,
+                killer_slot,
+                shared,
+                liveness,
+                self.router.clone(),
+                events,
+                dirty,
+            );
+            return Ok(json!(CommandOk { ok: true }));
+        }
+
+        let Some(input) = input else {
+            agent_end_turn(&shared);
+            return Err(format!("agent session stdin unavailable: {pane_id}"));
+        };
         let seq = AGENT_INTERRUPT_SEQ.fetch_add(1, Ordering::SeqCst);
         let payload = (backend.adapter().encode_user_message)(seq, text);
         let line = serde_json::to_string(&payload)
@@ -6227,7 +6359,7 @@ impl DaemonServer {
         }
         let sender = {
             let terminals = self.lock_terminals()?;
-            let (_, _, shared, _) = terminals
+            let (_, _, _, _, shared, _) = terminals
                 .agent_session_handles(pane_id)
                 .ok_or_else(|| format!("agent session not found: {pane_id}"))?;
             let mut shared = shared
@@ -6262,16 +6394,13 @@ impl DaemonServer {
     }
 
     /// (T2) Interrupt the agent's current turn: write the CLI's `interrupt`
-    /// control request (probe f). When a turn is live the CLI ends it with an
-    /// error-subtype turn_complete; when the turn flag is STALE (the turn's
-    /// `result` line was lost — oversized/malformed) the CLI answers a
-    /// no-live-turn interrupt with a bare control_response, which normalizes
-    /// to nothing. The send path is therefore the recovery point (M2): the
-    /// flag clears here, and a later turn_complete just clears it again.
+    /// control request (probe f), or terminate the in-flight turn child for
+    /// per-turn providers (`codex`, `gemini`) while preserving the logical
+    /// session for subsequent messages.
     #[cfg(any(unix, windows))]
     fn handle_interrupt_agent(&self, pane_id: &str) -> Result<Value, String> {
         self.ensure_agent_pane(pane_id)?;
-        let (backend, input, shared, _) = {
+        let (backend, _, input, killer_slot, shared, _) = {
             let terminals = self.lock_terminals()?;
             if !terminals.is_live(pane_id) {
                 return Err(format!("agent session ended: {pane_id}"));
@@ -6279,6 +6408,23 @@ impl DaemonServer {
             terminals
                 .agent_session_handles(pane_id)
                 .ok_or_else(|| format!("agent session not found: {pane_id}"))?
+        };
+        if backend.adapter().per_turn_process {
+            if let Ok(mut guard) = shared.lock() {
+                if guard.turn_running {
+                    guard.interrupted = true;
+                    guard.turn_running = false;
+                }
+            }
+            if let Ok(mut guard) = killer_slot.lock() {
+                if let Some(killer) = guard.take() {
+                    killer.kill();
+                }
+            }
+            return Ok(json!(CommandOk { ok: true }));
+        }
+        let Some(input) = input else {
+            return Err(format!("agent session ended: {pane_id}"));
         };
         let seq = AGENT_INTERRUPT_SEQ.fetch_add(1, Ordering::SeqCst);
         let payload = (backend.adapter().encode_interrupt_request)(seq);

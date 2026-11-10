@@ -19,6 +19,8 @@ pub(crate) const AGENT_NAME_MAX_LEN: usize = 32;
 /// GROUP; a fourth group is a "❯" prompt combined with box-drawing chrome
 /// (checked separately, since it needs both halves). Case-sensitive.
 pub(crate) const AGENT_MARKERS: [&str; 3] = ["esc to interrupt", "⏵⏵", "Claude Code"];
+pub(crate) const GEMINI_MARKERS: [&str; 3] = ["Gemini CLI", "(esc to cancel,", "YOLO mode"];
+pub(crate) const CODEX_MARKERS: [&str; 2] = ["OpenAI Codex", "context left"];
 
 /// (T1) Box-drawing chrome the Claude Code TUI draws around its input box.
 pub(crate) const AGENT_CHROME_CHARS: [char; 10] =
@@ -33,9 +35,10 @@ pub(crate) const AGENT_NEEDS_INPUT: [&str; 3] = [
     "Press enter to continue",
 ];
 
-/// (T1) The agent is actively working. `"esc to interrupt"` doubles as a
-/// signature marker — Claude Code shows it in the footer while a turn runs.
-pub(crate) const AGENT_WORKING: [&str; 3] = ["esc to interrupt", "Thinking", "Working"];
+/// (T1) The agent is actively working. `"esc to interrupt"` (Claude/Codex) and
+/// `"(esc to cancel,"` (Gemini CLI) double as signature markers while a turn runs.
+pub(crate) const AGENT_WORKING: [&str; 4] =
+    ["esc to interrupt", "(esc to cancel,", "Thinking", "Working"];
 
 /// (T1) Braille spinner frames the Claude Code TUI animates while working.
 pub(crate) const AGENT_SPINNER_CHARS: [char; 10] =
@@ -60,6 +63,8 @@ pub(crate) fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
 pub(crate) fn agent_signature_candidate(bytes: &[u8]) -> bool {
     AGENT_MARKERS
         .iter()
+        .chain(GEMINI_MARKERS.iter())
+        .chain(CODEX_MARKERS.iter())
         .any(|marker| bytes_contain(bytes, marker.as_bytes()))
 }
 
@@ -89,6 +94,36 @@ pub(crate) fn agent_signature_groups(text: &str) -> usize {
 /// a nearly-empty grid) don't flap the state off and back on.
 pub(crate) fn detect_agent(text: &str, already_detected: bool) -> Option<String> {
     let threshold = if already_detected { 1 } else { 2 };
+    let has_chrome = AGENT_CHROME_CHARS
+        .iter()
+        .any(|chrome| text.contains(*chrome));
+    if !text.contains("Claude Code") {
+        let mut gemini_groups = GEMINI_MARKERS
+            .iter()
+            .filter(|marker| text.contains(**marker))
+            .count();
+        if has_chrome && (text.contains("> ") || text.contains('❯')) {
+            gemini_groups += 1;
+        }
+        if gemini_groups >= threshold && GEMINI_MARKERS.iter().any(|marker| text.contains(*marker))
+        {
+            return Some("gemini".to_string());
+        }
+
+        let mut codex_groups = CODEX_MARKERS
+            .iter()
+            .filter(|marker| text.contains(**marker))
+            .count();
+        if text.contains("esc to interrupt") {
+            codex_groups += 1;
+        }
+        if has_chrome && (text.contains('›') || text.contains('❯')) {
+            codex_groups += 1;
+        }
+        if codex_groups >= threshold && CODEX_MARKERS.iter().any(|marker| text.contains(*marker)) {
+            return Some("codex".to_string());
+        }
+    }
     (agent_signature_groups(text) >= threshold).then(|| "claude".to_string())
 }
 

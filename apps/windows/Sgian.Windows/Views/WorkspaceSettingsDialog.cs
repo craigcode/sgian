@@ -37,6 +37,8 @@ internal static class WorkspaceSettingsDialog
         panel.Children.Add(shellArgs);
         var claude = Field("Claude executable (optional)", "agent_claude_bin");
         var droid = Field("Droid executable (optional)", "agent_droid_bin");
+        var codex = Field("Codex executable (optional)", "agent_codex_bin");
+        var gemini = Field("Gemini executable (optional)", "agent_gemini_bin");
         panel.Children.Add(new TextBlock { Text = "Agents use the provider CLI’s existing installation and login. Changes apply to newly started sessions.", TextWrapping = TextWrapping.Wrap });
         var permissions = new ComboBox { Header = "Agent permission mode", ItemsSource = new[] { "manual", "auto", "dontAsk", "bypassPermissions" }, SelectedItem = config["agent_permission_mode"]?.GetValue<string>() ?? "manual", HorizontalAlignment = HorizontalAlignment.Stretch };
         panel.Children.Add(permissions);
@@ -64,7 +66,7 @@ internal static class WorkspaceSettingsDialog
         panel.Children.Add(new TextBlock { Text = "Profiles", FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
         panel.Children.Add(profileList); RefreshProfiles();
         var name = new TextBox { Header = "New profile name" };
-        var kind = new ComboBox { Header = "Profile type", ItemsSource = new[] { "shell", "claude", "droid" }, SelectedIndex = 0 };
+        var kind = new ComboBox { Header = "Profile type", ItemsSource = new[] { "shell", "claude", "droid", "codex", "gemini" }, SelectedIndex = 0 };
         var profileModel = new TextBox { Header = "Agent model (optional)" };
         panel.Children.Add(name); panel.Children.Add(kind); panel.Children.Add(profileModel);
         var message = new TextBlock { TextWrapping = TextWrapping.Wrap };
@@ -120,6 +122,8 @@ internal static class WorkspaceSettingsDialog
                 next["shell_args"] = new JsonArray(shellArgs.Text.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(value => (JsonNode?)JsonValue.Create(value.TrimEnd('\r'))).ToArray());
                 next["agent_claude_bin"] = string.IsNullOrWhiteSpace(claude.Text) ? null : claude.Text;
                 next["agent_droid_bin"] = string.IsNullOrWhiteSpace(droid.Text) ? null : droid.Text;
+                next["agent_codex_bin"] = string.IsNullOrWhiteSpace(codex.Text) ? null : codex.Text;
+                next["agent_gemini_bin"] = string.IsNullOrWhiteSpace(gemini.Text) ? null : gemini.Text;
                 next["agent_permission_mode"] = permissions.SelectedItem as string;
                 next["restore_policy"] = restore.SelectedItem as string;
                 next["profiles"] = profiles.DeepClone();

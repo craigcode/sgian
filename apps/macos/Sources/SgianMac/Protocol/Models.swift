@@ -19,6 +19,8 @@ enum AgentAttention: String, Codable, Sendable {
 enum AgentBackend: String, Codable, CaseIterable, Identifiable, Sendable {
     case claude
     case droid
+    case codex
+    case gemini
 
     var id: String { rawValue }
     var displayName: String { rawValue.capitalized }
@@ -63,8 +65,11 @@ struct AgentPaneInfo: Codable, Equatable, Sendable {
     /// daemon's event that lacks the key.
     static func isUnattendedMode(_ mode: String?) -> Bool {
         switch mode {
-        case "auto", "bypass", "bypassPermissions", "dontAsk": true
-        default: false
+        case "auto", "bypass", "bypassPermissions", "dontAsk",
+             "yolo", "danger-full-access", "workspace-write", "full-auto", "never":
+            true
+        default:
+            false
         }
     }
 

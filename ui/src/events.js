@@ -99,7 +99,17 @@ export function normalizeAgentState(entry) {
 
 /** Modes in which tools run without a person approving them (the daemon's list). */
 export function isUnattendedMode(mode) {
-  return mode === "auto" || mode === "bypass" || mode === "bypassPermissions" || mode === "dontAsk";
+  return (
+    mode === "auto" ||
+    mode === "bypass" ||
+    mode === "bypassPermissions" ||
+    mode === "dontAsk" ||
+    mode === "yolo" ||
+    mode === "danger-full-access" ||
+    mode === "workspace-write" ||
+    mode === "full-auto" ||
+    mode === "never"
+  );
 }
 
 /**

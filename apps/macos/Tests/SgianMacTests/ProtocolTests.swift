@@ -302,7 +302,11 @@ func daemonRoundTrip() async throws {
     #expect(AgentPaneInfo.apply(event: malformed, to: &states) == false)
     #expect(AgentPaneInfo.isUnattendedMode("bypassPermissions"))
     #expect(AgentPaneInfo.isUnattendedMode("dontAsk"))
+    #expect(AgentPaneInfo.isUnattendedMode("yolo"))
+    #expect(AgentPaneInfo.isUnattendedMode("workspace-write"))
+    #expect(AgentPaneInfo.isUnattendedMode("danger-full-access"))
     #expect(!AgentPaneInfo.isUnattendedMode("acceptEdits"))
+    #expect(!AgentPaneInfo.isUnattendedMode("read-only"))
     #expect(!AgentPaneInfo.isUnattendedMode(nil))
 }
 
@@ -311,6 +315,12 @@ func daemonRoundTrip() async throws {
     let droid = WorkspaceModel.agentSpec(forProfile: try profile(#"{"name":"reviewer","kind":"agent","agent_backend":"droid","agent_model":"m1"}"#))
     #expect(droid?.backend == .droid)
     #expect(droid?.model == "m1")
+    let codex = WorkspaceModel.agentSpec(forProfile: try profile(#"{"name":"coder","kind":"agent","agent_backend":"codex","agent_model":"gpt-5.4"}"#))
+    #expect(codex?.backend == .codex)
+    #expect(codex?.model == "gpt-5.4")
+    let gemini = WorkspaceModel.agentSpec(forProfile: try profile(#"{"name":"fast","kind":"agent","agent_backend":"gemini","agent_model":"gemini-2.5-pro"}"#))
+    #expect(gemini?.backend == .gemini)
+    #expect(gemini?.model == "gemini-2.5-pro")
     // `kind` may be omitted; an agent field makes it an agent profile.
     let inferred = WorkspaceModel.agentSpec(forProfile: try profile(#"{"name":"a","agent_model":"m2"}"#))
     #expect(inferred?.backend == .claude)

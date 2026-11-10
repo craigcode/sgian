@@ -3266,6 +3266,8 @@ fn agent_spawn_plan_is_provider_and_model_aware() {
     store.agent_config = AgentSpawnConfig {
         claude_bin: Some("/opt/claude/bin/claude".to_string()),
         droid_bin: Some("/opt/factory/bin/droid".to_string()),
+        codex_bin: Some("/opt/openai/bin/codex".to_string()),
+        gemini_bin: Some("/opt/google/bin/gemini".to_string()),
         permission_mode: "manual".to_string(),
     };
 
@@ -3514,4 +3516,355 @@ fn agent_backend_adapters_roundtrip_wire_protocol_seams() {
         .expect("droid.ask_user triggers immediate cancellation reply");
     assert_eq!(ask_reply["id"], json!("ask-7"));
     assert_eq!(ask_reply["result"]["cancelled"], json!(true));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn codex_and_gemini_adapters_normalize_streams_and_permission_modes() {
+    assert_eq!(
+        AgentBackendKind::parse("codex"),
+        Some(AgentBackendKind::Codex)
+    );
+    assert_eq!(
+        AgentBackendKind::parse("gemini"),
+        Some(AgentBackendKind::Gemini)
+    );
+
+    let codex = AgentBackendKind::Codex.adapter();
+    assert!(codex.per_turn_process);
+    assert_eq!((codex.effective_permission_mode)("manual"), "read-only");
+    assert!(!is_unattended_mode(Some(
+        (codex.effective_permission_mode)("manual")
+    )));
+    assert_eq!((codex.effective_permission_mode)("auto"), "workspace-write");
+    assert!(is_unattended_mode(Some((codex.effective_permission_mode)(
+        "auto"
+    ))));
+    assert_eq!(
+        (codex.effective_permission_mode)("bypassPermissions"),
+        "danger-full-access"
+    );
+    assert!(is_unattended_mode(Some((codex.effective_permission_mode)(
+        "bypassPermissions"
+    ))));
+
+    let codex_turn1 = (codex.per_turn_spawn_args.unwrap())(
+        Path::new("/tmp/ws with 'quote'"),
+        "auto",
+        Some("gpt-5.4"),
+        None,
+    );
+    assert_eq!(
+        &codex_turn1[0..3],
+        &["exec", "--json", "--skip-git-repo-check"]
+    );
+    assert!(codex_turn1
+        .windows(2)
+        .any(|w| w == ["-c", "sandbox_mode=\"workspace-write\""]));
+    assert!(codex_turn1.iter().any(
+        |a| a.starts_with("sandbox_workspace_write.writable_roots=[\"/tmp/ws with 'quote'\"]")
+    ));
+    assert!(codex_turn1.windows(2).any(|w| w == ["--model", "gpt-5.4"]));
+    assert_eq!(codex_turn1.last().map(String::as_str), Some("-"));
+
+    let codex_turn2 = (codex.per_turn_spawn_args.unwrap())(
+        Path::new("/tmp/ws"),
+        "bypassPermissions",
+        Some("--bad"),
+        Some("019f37c3-40a1-71b2-9f44-6738b5ad1760"),
+    );
+    assert_eq!(
+        &codex_turn2[0..4],
+        &["exec", "resume", "--json", "--skip-git-repo-check"]
+    );
+    assert!(codex_turn2
+        .iter()
+        .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+    assert!(!codex_turn2.iter().any(|a| a == "--model"));
+    assert_eq!(
+        &codex_turn2[codex_turn2.len() - 2..],
+        &["019f37c3-40a1-71b2-9f44-6738b5ad1760", "-"]
+    );
+
+    let thread_ev = normalize_codex_agent_event(&json!({
+        "type": "thread.started",
+        "thread_id": "019f37c3-40a1-71b2-9f44-6738b5ad1760"
+    }));
+    assert_eq!(
+        thread_ev,
+        vec![json!({
+            "kind": "session",
+            "session_id": "019f37c3-40a1-71b2-9f44-6738b5ad1760"
+        })]
+    );
+    let cmd_start = normalize_codex_agent_event(&json!({
+        "type": "item.started",
+        "item": {"id": "item_1", "type": "command_execution", "command": "cargo test"}
+    }));
+    assert_eq!(cmd_start[0]["kind"], json!("tool_use"));
+    assert_eq!(cmd_start[0]["name"], json!("command_execution"));
+    let cmd_done = normalize_codex_agent_event(&json!({
+        "type": "item.completed",
+        "item": {
+            "id": "item_1",
+            "type": "command_execution",
+            "aggregated_output": "ok",
+            "exit_code": 0,
+            "status": "completed"
+        }
+    }));
+    assert_eq!(cmd_done[0]["kind"], json!("tool_result"));
+    assert_eq!(cmd_done[0]["is_error"], json!(false));
+    let msg_done = normalize_codex_agent_event(&json!({
+        "type": "item.completed",
+        "item": {"id": "item_2", "type": "agent_message", "text": "All green."}
+    }));
+    assert_eq!(msg_done.len(), 3);
+    assert_eq!(
+        msg_done[1],
+        json!({"kind": "text_delta", "text": "All green."})
+    );
+    let turn_done = normalize_codex_agent_event(&json!({
+        "type": "turn.completed",
+        "usage": {"input_tokens": 100, "output_tokens": 25}
+    }));
+    assert_eq!(turn_done[0]["kind"], json!("turn_complete"));
+    assert_eq!(turn_done[0]["is_error"], json!(false));
+
+    let gemini = AgentBackendKind::Gemini.adapter();
+    assert!(gemini.per_turn_process);
+    assert_eq!((gemini.effective_permission_mode)("manual"), "manual");
+    assert!(!is_unattended_mode(Some((gemini
+        .effective_permission_mode)(
+        "manual"
+    ))));
+    assert_eq!((gemini.effective_permission_mode)("auto"), "yolo");
+    assert!(is_unattended_mode(Some(
+        (gemini.effective_permission_mode)("auto")
+    )));
+
+    let gemini_args =
+        (gemini.spawn_args)("acceptEdits", Some("gemini-2.5-pro"), Some("gem-sess-1"));
+    assert!(gemini_args
+        .windows(2)
+        .any(|w| w == ["--output-format", "stream-json"]));
+    assert!(gemini_args.iter().any(|a| a == "--skip-trust"));
+    assert!(gemini_args
+        .windows(2)
+        .any(|w| w == ["--approval-mode", "auto_edit"]));
+    assert!(gemini_args
+        .windows(2)
+        .any(|w| w == ["--model", "gemini-2.5-pro"]));
+    assert!(gemini_args
+        .windows(2)
+        .any(|w| w == ["--resume", "gem-sess-1"]));
+
+    // User message echo MUST be dropped so chat never renders duplicate user bubbles.
+    assert!(normalize_gemini_agent_event(&json!({
+        "type": "message",
+        "role": "user",
+        "content": "hello"
+    }))
+    .is_empty());
+    assert_eq!(
+        normalize_gemini_agent_event(&json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "Hi there",
+            "delta": true
+        })),
+        vec![json!({"kind": "text_delta", "text": "Hi there"})]
+    );
+    let gem_err = normalize_gemini_agent_event(&json!({
+        "type": "result",
+        "status": "error",
+        "error": {"type": "FatalAuthenticationError", "message": "API key missing"},
+        "stats": {"duration_ms": 42}
+    }));
+    assert_eq!(gem_err.len(), 2);
+    assert_eq!(
+        gem_err[0],
+        json!({"kind": "error", "message": "API key missing"})
+    );
+    assert_eq!(gem_err[1]["kind"], json!("turn_complete"));
+    assert_eq!(gem_err[1]["is_error"], json!(true));
+
+    // Screen classification recognizes Gemini CLI & OpenAI Codex TUIs alongside Claude Code.
+    assert_eq!(
+        detect_agent(
+            "Gemini CLI\n╭──────────╮\n│ >        │\n╰──────────╯\nYOLO mode\n",
+            false
+        ),
+        Some("gemini".to_string())
+    );
+    assert_eq!(classify_agent_mode("YOLO mode enabled"), Some("yolo"));
+    assert_eq!(
+        detect_agent("OpenAI Codex\nesc to interrupt · 94% context left\n", false),
+        Some("codex".to_string())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_and_gemini_per_turn_sessions_resume_interrupt_and_surface_exit_errors() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let codex_log = dir.path().join("codex.log");
+    let codex_bin = dir.path().join("fake-codex.sh");
+    fs::write(
+        &codex_bin,
+        format!(
+            r#"#!/bin/sh
+prompt="$(cat)"
+printf 'ARGS:%s|PROMPT:%s\n' "$*" "$prompt" >> "{}"
+case "$prompt" in
+  *SLEEP*)
+    printf '{{"type":"thread.started","thread_id":"codex-thread-99"}}\n'
+    sleep 30
+    exit 0
+    ;;
+esac
+printf '{{"type":"thread.started","thread_id":"codex-thread-99"}}\n'
+printf '{{"type":"item.completed","item":{{"id":"msg_1","type":"agent_message","text":"Codex echo: %s"}}}}\n' "$prompt"
+printf '{{"type":"turn.completed","usage":{{"input_tokens":12,"output_tokens":4}}}}\n'
+"#,
+            codex_log.display()
+        ),
+    )
+    .expect("write fake codex");
+    fs::set_permissions(&codex_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let gemini_bin = dir.path().join("fake-gemini.sh");
+    fs::write(
+        &gemini_bin,
+        r#"#!/bin/sh
+prompt="$(cat)"
+case "$prompt" in
+  *AUTH_FAIL*)
+    echo "Please set GEMINI_API_KEY before running headless" >&2
+    exit 41
+    ;;
+esac
+printf '{"type":"init","session_id":"gem-uuid-77","model":"gemini-2.5-pro"}\n'
+printf '{"type":"message","role":"user","content":"%s"}\n' "$prompt"
+printf '{"type":"message","role":"assistant","content":"Gemini answer","delta":true}\n'
+printf '{"type":"result","status":"success","stats":{"duration_ms":15,"total_tokens":20}}\n'
+"#,
+    )
+    .expect("write fake gemini");
+    fs::set_permissions(&gemini_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = Config {
+        shell: Some("/bin/cat".to_string()),
+        agent_codex_bin: Some(codex_bin.display().to_string()),
+        agent_gemini_bin: Some(gemini_bin.display().to_string()),
+        agent_permission_mode: Some("auto".to_string()),
+        ..Default::default()
+    };
+    let daemon = TestDaemon::spawn_with_cwd(config, dir.path().to_path_buf());
+    let client = daemon.client();
+    let mut events = subscribe_events(&client);
+
+    // 1. Create Codex pane: no process spawned while idle, effective mode is `workspace-write` (`unattended: true`).
+    let codex_pane: Pane = client
+        .request(DaemonRequest::CreateAgentPaneWithSpec {
+            title: Some("codex-worker".to_string()),
+            backend: Some(AgentBackendKind::Codex),
+            model: Some("gpt-5.4".to_string()),
+        })
+        .expect("create codex pane");
+    assert!(!codex_log.exists(), "idle creation must not spawn codex");
+
+    let snap: WorkspaceSnapshot = client
+        .request(DaemonRequest::BootstrapWorkspace)
+        .expect("bootstrap");
+    assert_eq!(
+        snap.agent_states[&codex_pane.id].mode.as_deref(),
+        Some("workspace-write")
+    );
+    assert!(snap.agent_states[&codex_pane.id].unattended);
+
+    // 2. Turn 1 -> captures thread_id `codex-thread-99`, completes without emitting `PaneEnded`.
+    let _: Value = client
+        .request(DaemonRequest::SendAgentMessage {
+            pane_id: codex_pane.id.clone(),
+            text: "first turn".to_string(),
+            message_id: Some("m1".to_string()),
+        })
+        .expect("send turn 1");
+    let _ = read_agent_event(&mut events, &codex_pane.id, "turn_complete");
+
+    // 3. Turn 2 -> automatically passes `exec resume ... codex-thread-99 -`.
+    let _: Value = client
+        .request(DaemonRequest::SendAgentMessage {
+            pane_id: codex_pane.id.clone(),
+            text: "second turn".to_string(),
+            message_id: Some("m2".to_string()),
+        })
+        .expect("send turn 2");
+    let _ = read_agent_event(&mut events, &codex_pane.id, "turn_complete");
+
+    let logged = fs::read_to_string(&codex_log).expect("read codex log");
+    let lines: Vec<&str> = logged.lines().collect();
+    assert_eq!(lines.len(), 2, "{logged}");
+    assert!(!lines[0].contains("resume"), "{logged}");
+    assert!(lines[1].contains("exec resume"), "{logged}");
+    assert!(lines[1].contains("codex-thread-99"), "{logged}");
+
+    // 4. Interrupting a slow turn kills the turn child, emits `interrupted`, and keeps pane live.
+    let _: Value = client
+        .request(DaemonRequest::SendAgentMessage {
+            pane_id: codex_pane.id.clone(),
+            text: "SLEEP".to_string(),
+            message_id: Some("m3".to_string()),
+        })
+        .expect("send sleeping turn");
+    let _ = read_agent_event(&mut events, &codex_pane.id, "session");
+    let _: Value = client
+        .request(DaemonRequest::InterruptAgent {
+            pane_id: codex_pane.id.clone(),
+        })
+        .expect("interrupt codex turn");
+    let interrupted = read_agent_event(&mut events, &codex_pane.id, "turn_complete");
+    assert_eq!(interrupted["subtype"], json!("interrupted"));
+
+    // 5. Gemini pane: user echo suppressed, exit 41 auth stderr surfaced cleanly.
+    let gemini_pane: Pane = client
+        .request(DaemonRequest::CreateAgentPaneWithSpec {
+            title: Some("gemini-worker".to_string()),
+            backend: Some(AgentBackendKind::Gemini),
+            model: Some("gemini-2.5-pro".to_string()),
+        })
+        .expect("create gemini pane");
+    let _: Value = client
+        .request(DaemonRequest::SendAgentMessage {
+            pane_id: gemini_pane.id.clone(),
+            text: "AUTH_FAIL".to_string(),
+            message_id: Some("g1".to_string()),
+        })
+        .expect("send gemini auth fail");
+    let err_ev = read_agent_event(&mut events, &gemini_pane.id, "error");
+    assert!(
+        err_ev["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("GEMINI_API_KEY"),
+        "{err_ev}"
+    );
+    let done_ev = read_agent_event(&mut events, &gemini_pane.id, "turn_complete");
+    assert_eq!(done_ev["is_error"], json!(true));
+
+    // Subsequent valid turn on the same Gemini pane succeeds without needing manual restart.
+    let _: Value = client
+        .request(DaemonRequest::SendAgentMessage {
+            pane_id: gemini_pane.id.clone(),
+            text: "hello gemini".to_string(),
+            message_id: Some("g2".to_string()),
+        })
+        .expect("send gemini ok turn");
+    let ok_done = read_agent_event(&mut events, &gemini_pane.id, "turn_complete");
+    assert_eq!(ok_done["is_error"], json!(false));
+
+    daemon.shutdown();
 }

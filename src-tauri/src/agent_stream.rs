@@ -78,6 +78,10 @@ pub(crate) const AGENT_PERMISSION_MODES: [&str; 6] = [
 pub(crate) const SGIAN_CLAUDE_BIN_ENV: &str = "SGIAN_CLAUDE_BIN";
 #[cfg(any(unix, windows))]
 pub(crate) const SGIAN_DROID_BIN_ENV: &str = "SGIAN_DROID_BIN";
+#[cfg(any(unix, windows))]
+pub(crate) const SGIAN_CODEX_BIN_ENV: &str = "SGIAN_CODEX_BIN";
+#[cfg(any(unix, windows))]
+pub(crate) const SGIAN_GEMINI_BIN_ENV: &str = "SGIAN_GEMINI_BIN";
 /// Per-pane conversation log lives at `<data_dir>/agents/<pane-id>.jsonl`.
 pub(crate) const AGENT_LOG_DIR: &str = "agents";
 /// Conversation log cap, trimmed to HALF on overflow (hysteresis, like
@@ -131,6 +135,8 @@ pub(crate) struct AgentSpawnConfig {
     /// SGIAN_*_BIN environment override and then PATH.
     pub(crate) claude_bin: Option<String>,
     pub(crate) droid_bin: Option<String>,
+    pub(crate) codex_bin: Option<String>,
+    pub(crate) gemini_bin: Option<String>,
     pub(crate) permission_mode: String,
 }
 
@@ -253,20 +259,38 @@ pub(crate) fn agent_command_argv(
 /// framing, immediate non-blocking protocol replies, and stdout event
 /// normalization — into one self-contained table per backend.
 #[cfg(any(unix, windows))]
+pub(crate) type PerTurnSpawnArgsFn = fn(
+    cwd: &Path,
+    permission_mode: &str,
+    model: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Vec<String>;
+
+#[cfg(any(unix, windows))]
 pub(crate) struct AgentBackendAdapter {
     pub(crate) kind: AgentBackendKind,
     pub(crate) default_bin: &'static str,
     pub(crate) env_override: &'static str,
+    /// True when the CLI runs one OS process per user turn (`codex exec --json`,
+    /// `gemini --output-format stream-json`), reading the prompt from stdin
+    /// until EOF and resuming Turn 2+ via `--resume` / `exec resume`.
+    pub(crate) per_turn_process: bool,
     /// True when the CLI emits an initial idle notification before any user
     /// turn is sent (Droid JSON-RPC), which must not surface an empty
     /// `turn_complete` event.
     pub(crate) suppress_idle_turn_complete: bool,
     pub(crate) configured_bin: fn(&AgentSpawnConfig) -> Option<&str>,
+    /// Effective permission/sandbox mode surfaced on `AgentPaneInfo.mode` (and
+    /// evaluated by `is_unattended_mode`) when spawned under `permission_mode`.
+    pub(crate) effective_permission_mode: fn(&str) -> &'static str,
     pub(crate) spawn_args: fn(
         permission_mode: &str,
         model: Option<&str>,
         resume_session_id: Option<&str>,
     ) -> Vec<String>,
+    /// Optional cwd-aware argv builder for per-turn providers (Codex pins
+    /// `sandbox_workspace_write.writable_roots=[cwd]` when writable).
+    pub(crate) per_turn_spawn_args: Option<PerTurnSpawnArgsFn>,
     pub(crate) initial_stdin: fn(
         pane_id: &str,
         cwd: &Path,
@@ -510,13 +534,214 @@ fn droid_immediate_reply(raw: &Value) -> Option<Value> {
 }
 
 #[cfg(any(unix, windows))]
+fn claude_effective_permission_mode(permission_mode: &str) -> &'static str {
+    match permission_mode {
+        "acceptEdits" => "acceptEdits",
+        "auto" => "auto",
+        "bypassPermissions" => "bypassPermissions",
+        "dontAsk" => "dontAsk",
+        "plan" => "plan",
+        _ => "manual",
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn droid_effective_permission_mode(_permission_mode: &str) -> &'static str {
+    // Droid runs with `autonomyLevel: "off"` and routes tool approvals over JSON-RPC.
+    "manual"
+}
+
+#[cfg(any(unix, windows))]
+fn codex_configured_bin(config: &AgentSpawnConfig) -> Option<&str> {
+    config.codex_bin.as_deref()
+}
+
+#[cfg(any(unix, windows))]
+fn codex_effective_permission_mode(permission_mode: &str) -> &'static str {
+    match permission_mode {
+        "bypassPermissions" | "bypass" | "yolo" | "danger-full-access" => "danger-full-access",
+        "auto" | "dontAsk" | "acceptEdits" | "workspace-write" => "workspace-write",
+        "plan" => "plan",
+        _ => "read-only",
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn toml_basic_string(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(any(unix, windows))]
+fn codex_build_args(
+    cwd: Option<&Path>,
+    permission_mode: &str,
+    model: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Vec<String> {
+    let resume = resume_session_id.filter(|id| is_safe_cli_token(id));
+    let mut args = vec!["exec".to_string()];
+    if resume.is_some() {
+        args.push("resume".to_string());
+    }
+    args.push("--json".to_string());
+    args.push("--skip-git-repo-check".to_string());
+    match codex_effective_permission_mode(permission_mode) {
+        "danger-full-access" => {
+            args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        }
+        "workspace-write" => {
+            args.push("-c".to_string());
+            args.push("sandbox_mode=\"workspace-write\"".to_string());
+            if let Some(cwd) = cwd {
+                let root = toml_basic_string(&cwd.to_string_lossy());
+                args.push("-c".to_string());
+                args.push(format!("sandbox_workspace_write.writable_roots=[{root}]"));
+            }
+        }
+        _ => {
+            args.push("-c".to_string());
+            args.push("sandbox_mode=\"read-only\"".to_string());
+        }
+    }
+    if let Some(model) = model.filter(|m| is_safe_cli_token(m)) {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if let Some(session_id) = resume {
+        args.push(session_id.to_string());
+    }
+    // Read user prompt from stdin until EOF so prompts never sit on argv / `ps`.
+    args.push("-".to_string());
+    args
+}
+
+#[cfg(any(unix, windows))]
+fn codex_spawn_args(
+    permission_mode: &str,
+    model: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Vec<String> {
+    codex_build_args(None, permission_mode, model, resume_session_id)
+}
+
+#[cfg(any(unix, windows))]
+fn codex_per_turn_spawn_args(
+    cwd: &Path,
+    permission_mode: &str,
+    model: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Vec<String> {
+    codex_build_args(Some(cwd), permission_mode, model, resume_session_id)
+}
+
+#[cfg(any(unix, windows))]
+fn gemini_configured_bin(config: &AgentSpawnConfig) -> Option<&str> {
+    config.gemini_bin.as_deref()
+}
+
+#[cfg(any(unix, windows))]
+fn gemini_effective_permission_mode(permission_mode: &str) -> &'static str {
+    match permission_mode {
+        "auto" | "dontAsk" | "bypassPermissions" | "bypass" | "yolo" => "yolo",
+        "acceptEdits" | "auto_edit" => "acceptEdits",
+        "plan" => "plan",
+        _ => "manual",
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn gemini_spawn_args(
+    permission_mode: &str,
+    model: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec!["--output-format".to_string(), "stream-json".to_string()];
+    match gemini_effective_permission_mode(permission_mode) {
+        "yolo" => {
+            args.push("--skip-trust".to_string());
+            args.push("--approval-mode".to_string());
+            args.push("yolo".to_string());
+        }
+        "acceptEdits" => {
+            args.push("--skip-trust".to_string());
+            args.push("--approval-mode".to_string());
+            args.push("auto_edit".to_string());
+        }
+        "plan" => {
+            args.push("--skip-trust".to_string());
+            args.push("--approval-mode".to_string());
+            args.push("plan".to_string());
+        }
+        _ => {
+            args.push("--approval-mode".to_string());
+            args.push("default".to_string());
+        }
+    }
+    if let Some(model) = model.filter(|m| is_safe_cli_token(m)) {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    if let Some(session_id) = resume_session_id.filter(|id| is_safe_cli_token(id)) {
+        args.push("--resume".to_string());
+        args.push(session_id.to_string());
+    }
+    args
+}
+
+#[cfg(any(unix, windows))]
+fn gemini_per_turn_spawn_args(
+    _cwd: &Path,
+    permission_mode: &str,
+    model: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Vec<String> {
+    gemini_spawn_args(permission_mode, model, resume_session_id)
+}
+
+#[cfg(any(unix, windows))]
+fn noop_encode_user_message(_seq: u64, text: &str) -> Value {
+    json!({"type": "stdin_prompt", "text": text})
+}
+
+#[cfg(any(unix, windows))]
+fn noop_encode_approval_response(
+    request_id: &str,
+    _tool_input: Option<Value>,
+    allow: bool,
+    message: Option<String>,
+) -> Value {
+    json!({"request_id": request_id, "allow": allow, "message": message})
+}
+
+#[cfg(any(unix, windows))]
+fn noop_encode_interrupt_request(seq: u64) -> Value {
+    json!({"id": format!("sgian-interrupt-{seq}"), "type": "process_signal"})
+}
+
+#[cfg(any(unix, windows))]
 pub(crate) static CLAUDE_BACKEND_ADAPTER: AgentBackendAdapter = AgentBackendAdapter {
     kind: AgentBackendKind::Claude,
     default_bin: "claude",
     env_override: SGIAN_CLAUDE_BIN_ENV,
+    per_turn_process: false,
     suppress_idle_turn_complete: false,
     configured_bin: claude_configured_bin,
+    effective_permission_mode: claude_effective_permission_mode,
     spawn_args: claude_spawn_args,
+    per_turn_spawn_args: None,
     initial_stdin: claude_initial_stdin,
     encode_user_message: claude_encode_user_message,
     encode_approval_response: claude_encode_approval_response,
@@ -530,9 +755,12 @@ pub(crate) static DROID_BACKEND_ADAPTER: AgentBackendAdapter = AgentBackendAdapt
     kind: AgentBackendKind::Droid,
     default_bin: "droid",
     env_override: SGIAN_DROID_BIN_ENV,
+    per_turn_process: false,
     suppress_idle_turn_complete: true,
     configured_bin: droid_configured_bin,
+    effective_permission_mode: droid_effective_permission_mode,
     spawn_args: droid_spawn_args,
+    per_turn_spawn_args: None,
     initial_stdin: droid_initial_stdin,
     encode_user_message: droid_encode_user_message,
     encode_approval_response: droid_encode_approval_response,
@@ -542,10 +770,50 @@ pub(crate) static DROID_BACKEND_ADAPTER: AgentBackendAdapter = AgentBackendAdapt
 };
 
 #[cfg(any(unix, windows))]
+pub(crate) static CODEX_BACKEND_ADAPTER: AgentBackendAdapter = AgentBackendAdapter {
+    kind: AgentBackendKind::Codex,
+    default_bin: "codex",
+    env_override: SGIAN_CODEX_BIN_ENV,
+    per_turn_process: true,
+    suppress_idle_turn_complete: false,
+    configured_bin: codex_configured_bin,
+    effective_permission_mode: codex_effective_permission_mode,
+    spawn_args: codex_spawn_args,
+    per_turn_spawn_args: Some(codex_per_turn_spawn_args),
+    initial_stdin: claude_initial_stdin,
+    encode_user_message: noop_encode_user_message,
+    encode_approval_response: noop_encode_approval_response,
+    encode_interrupt_request: noop_encode_interrupt_request,
+    immediate_reply: claude_immediate_reply,
+    normalize_event: normalize_codex_agent_event,
+};
+
+#[cfg(any(unix, windows))]
+pub(crate) static GEMINI_BACKEND_ADAPTER: AgentBackendAdapter = AgentBackendAdapter {
+    kind: AgentBackendKind::Gemini,
+    default_bin: "gemini",
+    env_override: SGIAN_GEMINI_BIN_ENV,
+    per_turn_process: true,
+    suppress_idle_turn_complete: false,
+    configured_bin: gemini_configured_bin,
+    effective_permission_mode: gemini_effective_permission_mode,
+    spawn_args: gemini_spawn_args,
+    per_turn_spawn_args: Some(gemini_per_turn_spawn_args),
+    initial_stdin: claude_initial_stdin,
+    encode_user_message: noop_encode_user_message,
+    encode_approval_response: noop_encode_approval_response,
+    encode_interrupt_request: noop_encode_interrupt_request,
+    immediate_reply: claude_immediate_reply,
+    normalize_event: normalize_gemini_agent_event,
+};
+
+#[cfg(any(unix, windows))]
 pub(crate) fn agent_backend_adapter(backend: AgentBackendKind) -> &'static AgentBackendAdapter {
     match backend {
         AgentBackendKind::Claude => &CLAUDE_BACKEND_ADAPTER,
         AgentBackendKind::Droid => &DROID_BACKEND_ADAPTER,
+        AgentBackendKind::Codex => &CODEX_BACKEND_ADAPTER,
+        AgentBackendKind::Gemini => &GEMINI_BACKEND_ADAPTER,
     }
 }
 
@@ -594,6 +862,9 @@ pub(crate) struct AgentShared {
     /// reader sees the turn's `result`, when the process exits, or when an
     /// interrupt is sent (M2 — a lost `result` line must not wedge the pane).
     pub(crate) turn_running: bool,
+    /// Set by `InterruptAgent` on per-turn providers so the turn reader emits
+    /// `subtype: "interrupted"` rather than surfacing SIGTERM exit as a crash.
+    pub(crate) interrupted: bool,
 }
 
 /// (T2) The daemon's answer to a permission request.
@@ -642,6 +913,7 @@ pub(crate) fn agent_try_begin_turn(shared: &Arc<Mutex<AgentShared>>) -> bool {
                 false
             } else {
                 shared.turn_running = true;
+                shared.interrupted = false;
                 true
             }
         })
@@ -662,11 +934,14 @@ pub(crate) fn agent_end_turn(shared: &Arc<Mutex<AgentShared>>) -> bool {
 /// `TerminalSession::killer`. The child itself is shared with the reader
 /// thread (which reaps it), so kills go through the pid; the `reaped` flag
 /// keeps a stale kill from signalling a REUSED pid after the child was
-/// already reaped.
+/// already reaped. When `process_group` is true (per-turn spawns created with
+/// `process_group(0)`), signals target `-pid` so wrapper scripts (`codex.js`)
+/// and their vendor binaries terminate together.
 #[cfg(unix)]
 pub(crate) struct AgentChildKiller {
     pub(crate) pid: u32,
     pub(crate) reaped: Arc<AtomicBool>,
+    pub(crate) process_group: bool,
 }
 
 #[cfg(unix)]
@@ -675,16 +950,20 @@ impl AgentChildKiller {
         if self.reaped.load(Ordering::SeqCst) {
             return;
         }
+        let target = if self.process_group {
+            -(self.pid as libc::pid_t)
+        } else {
+            self.pid as libc::pid_t
+        };
         unsafe {
-            libc::kill(self.pid as libc::pid_t, libc::SIGTERM);
+            libc::kill(target, libc::SIGTERM);
         }
-        let pid = self.pid;
         let reaped = Arc::clone(&self.reaped);
         thread::spawn(move || {
             thread::sleep(AGENT_KILL_GRACE);
             if !reaped.load(Ordering::SeqCst) {
                 unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    libc::kill(target, libc::SIGKILL);
                 }
             }
         });
@@ -710,20 +989,20 @@ impl AgentChildKiller {
     }
 }
 
-/// (T2) A live agent session: the stdin writer queue (same writer-thread
-/// pattern as PTY input — no blocking pipe write under the store lock), the
-/// child killer, and the shared state. Dropping it (close/restart/shutdown)
-/// denies pending approvals and kills the CLI (SIGTERM→SIGKILL on unix,
-/// TerminateProcess plus Job Object on Windows).
+/// (T2) A live agent session: the stdin writer queue (for persistent stdio
+/// providers) or active per-turn child killer (for per-turn providers like
+/// Codex and Gemini), plus the shared state and conversation log. Dropping it
+/// (close/restart/shutdown) denies pending approvals and kills any live CLI.
 #[cfg(any(unix, windows))]
 pub(crate) struct AgentSession {
     pub(crate) backend: AgentBackendKind,
-    /// The permission mode this CLI was started with. A config reload
-    /// changes future spawns, not this process, and the badge must say what
-    /// is actually running (S9 of the 2026-09-20 review).
+    pub(crate) generation: u64,
+    /// The effective permission mode this CLI session runs under. A config
+    /// reload changes future spawns, not this session, and the badge must say
+    /// what is actually active (S9 of the 2026-09-20 review).
     pub(crate) permission_mode: String,
-    pub(crate) input: SyncSender<Vec<u8>>,
-    pub(crate) killer: AgentChildKiller,
+    pub(crate) input: Option<SyncSender<Vec<u8>>>,
+    pub(crate) killer: Arc<Mutex<Option<AgentChildKiller>>>,
     pub(crate) shared: Arc<Mutex<AgentShared>>,
     pub(crate) events: Arc<Mutex<AgentEventLog>>,
 }
@@ -731,7 +1010,11 @@ pub(crate) struct AgentSession {
 #[cfg(any(unix, windows))]
 impl AgentSession {
     pub(crate) fn kill(&self) {
-        self.killer.kill();
+        if let Ok(mut guard) = self.killer.lock() {
+            if let Some(killer) = guard.take() {
+                killer.kill();
+            }
+        }
     }
 }
 
@@ -739,7 +1022,7 @@ impl AgentSession {
 impl Drop for AgentSession {
     fn drop(&mut self) {
         deny_agent_pending(&self.shared, "closed");
-        self.killer.kill();
+        self.kill();
     }
 }
 
@@ -1007,6 +1290,266 @@ pub(crate) fn normalize_droid_agent_event(raw: &Value) -> Vec<Value> {
             if notification.get("newState").and_then(Value::as_str) == Some("idle") =>
         {
             vec![json!({"kind": "turn_complete", "subtype": "success"})]
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) fn normalize_codex_agent_event(raw: &Value) -> Vec<Value> {
+    let Some(event_type) = raw.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    match event_type {
+        "thread.started" => {
+            let mut event = json!({"kind": "session"});
+            if let Some(thread_id) = raw.get("thread_id").and_then(Value::as_str) {
+                event["session_id"] = json!(thread_id);
+            }
+            if let Some(model) = raw.get("model").and_then(Value::as_str) {
+                event["model"] = json!(model);
+            }
+            vec![event]
+        }
+        "item.started" => {
+            let Some(item) = raw.get("item") else {
+                return Vec::new();
+            };
+            let id = item.get("id").cloned().unwrap_or(Value::Null);
+            match item.get("type").and_then(Value::as_str) {
+                Some("command_execution") => vec![json!({
+                    "kind": "tool_use",
+                    "id": id,
+                    "name": "command_execution",
+                    "input": {"command": item.get("command").cloned().unwrap_or_else(|| json!(""))},
+                })],
+                Some("mcp_tool_call") => {
+                    let server = item.get("server").and_then(Value::as_str).unwrap_or("");
+                    let tool = item
+                        .get("tool")
+                        .and_then(Value::as_str)
+                        .unwrap_or("mcp_tool");
+                    let name = if server.is_empty() {
+                        tool.to_string()
+                    } else {
+                        format!("{server}:{tool}")
+                    };
+                    vec![json!({
+                        "kind": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": item.get("arguments").cloned().unwrap_or(Value::Null),
+                    })]
+                }
+                Some("file_change") => vec![json!({
+                    "kind": "tool_use",
+                    "id": id,
+                    "name": "file_change",
+                    "input": {"changes": item.get("changes").cloned().unwrap_or_else(|| json!([]))},
+                })],
+                Some("web_search") => vec![json!({
+                    "kind": "tool_use",
+                    "id": id,
+                    "name": "web_search",
+                    "input": {"query": item.get("query").cloned().unwrap_or_else(|| json!(""))},
+                })],
+                Some("collab_tool_call") => vec![json!({
+                    "kind": "tool_use",
+                    "id": id,
+                    "name": item.get("tool").cloned().unwrap_or_else(|| json!("collab_tool")),
+                    "input": {"prompt": item.get("prompt").cloned().unwrap_or(Value::Null)},
+                })],
+                _ => Vec::new(),
+            }
+        }
+        "item.completed" => {
+            let Some(item) = raw.get("item") else {
+                return Vec::new();
+            };
+            let id = item.get("id").cloned().unwrap_or(Value::Null);
+            let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+            match item.get("type").and_then(Value::as_str) {
+                Some("agent_message") => {
+                    let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                    if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![
+                            json!({"kind": "message_start", "role": "assistant"}),
+                            json!({"kind": "text_delta", "text": text}),
+                            json!({"kind": "message_complete"}),
+                        ]
+                    }
+                }
+                Some("command_execution") => {
+                    let exit_code = item.get("exit_code").and_then(Value::as_i64);
+                    let is_error = matches!(status, "failed" | "declined")
+                        || exit_code.is_some_and(|code| code != 0);
+                    vec![json!({
+                        "kind": "tool_result",
+                        "tool_use_id": id,
+                        "content": item.get("aggregated_output").cloned().unwrap_or(Value::Null),
+                        "is_error": is_error,
+                    })]
+                }
+                Some("mcp_tool_call") => {
+                    let is_error = status == "failed"
+                        || item.get("error").is_some_and(|error| !error.is_null());
+                    let content = item
+                        .pointer("/error/message")
+                        .or_else(|| item.pointer("/result/content"))
+                        .or_else(|| item.get("result"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    vec![json!({
+                        "kind": "tool_result",
+                        "tool_use_id": id,
+                        "content": content,
+                        "is_error": is_error,
+                    })]
+                }
+                Some("file_change") => vec![json!({
+                    "kind": "tool_result",
+                    "tool_use_id": id,
+                    "content": item.get("changes").cloned().unwrap_or_else(|| json!([])),
+                    "is_error": status == "failed",
+                })],
+                Some("web_search") => vec![json!({
+                    "kind": "tool_result",
+                    "tool_use_id": id,
+                    "content": item.get("query").cloned().unwrap_or(Value::Null),
+                    "is_error": false,
+                })],
+                Some("collab_tool_call") => vec![json!({
+                    "kind": "tool_result",
+                    "tool_use_id": id,
+                    "content": item.get("agents_states").cloned().unwrap_or(Value::Null),
+                    "is_error": status == "failed",
+                })],
+                Some("error") => vec![json!({
+                    "kind": "error",
+                    "message": item.get("message").cloned().unwrap_or_else(|| json!("Codex item error")),
+                })],
+                _ => Vec::new(),
+            }
+        }
+        "turn.completed" => {
+            let mut event = json!({
+                "kind": "turn_complete",
+                "subtype": "success",
+                "is_error": false,
+            });
+            if let Some(usage) = raw.get("usage") {
+                event["usage"] = usage.clone();
+            }
+            vec![event]
+        }
+        "turn.failed" => {
+            let message = raw
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("Codex turn failed");
+            vec![
+                json!({"kind": "error", "message": message}),
+                json!({"kind": "turn_complete", "subtype": "error_during_execution", "is_error": true}),
+            ]
+        }
+        "error" => {
+            let message = raw
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Codex error");
+            vec![json!({"kind": "error", "message": message})]
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) fn normalize_gemini_agent_event(raw: &Value) -> Vec<Value> {
+    let Some(event_type) = raw.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    match event_type {
+        "init" => {
+            let mut event = json!({"kind": "session"});
+            if let Some(session_id) = raw.get("session_id").and_then(Value::as_str) {
+                event["session_id"] = json!(session_id);
+            }
+            if let Some(model) = raw.get("model").and_then(Value::as_str) {
+                event["model"] = json!(model);
+            }
+            vec![event]
+        }
+        "message" => {
+            if raw.get("role").and_then(Value::as_str) != Some("assistant") {
+                return Vec::new();
+            }
+            let content = raw.get("content").and_then(Value::as_str).unwrap_or("");
+            if content.is_empty() {
+                return Vec::new();
+            }
+            if raw.get("delta").and_then(Value::as_bool) == Some(true) {
+                vec![json!({"kind": "text_delta", "text": content})]
+            } else {
+                vec![
+                    json!({"kind": "message_start", "role": "assistant"}),
+                    json!({"kind": "text_delta", "text": content}),
+                    json!({"kind": "message_complete"}),
+                ]
+            }
+        }
+        "tool_use" => vec![json!({
+            "kind": "tool_use",
+            "id": raw.get("tool_id").cloned().unwrap_or(Value::Null),
+            "name": raw.get("tool_name").cloned().unwrap_or_else(|| json!("tool")),
+            "input": raw.get("parameters").cloned().unwrap_or(Value::Null),
+        })],
+        "tool_result" => {
+            let is_error = raw.get("status").and_then(Value::as_str) == Some("error");
+            let content = if is_error {
+                raw.pointer("/error/message")
+                    .or_else(|| raw.get("output"))
+                    .cloned()
+                    .unwrap_or_else(|| json!("Tool error"))
+            } else {
+                raw.get("output").cloned().unwrap_or(Value::Null)
+            };
+            vec![json!({
+                "kind": "tool_result",
+                "tool_use_id": raw.get("tool_id").cloned().unwrap_or(Value::Null),
+                "content": content,
+                "is_error": is_error,
+            })]
+        }
+        "error" => {
+            let message = raw
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Gemini error");
+            vec![json!({"kind": "error", "message": message})]
+        }
+        "result" => {
+            let is_error = raw.get("status").and_then(Value::as_str) == Some("error");
+            let mut out = Vec::new();
+            if is_error {
+                if let Some(message) = raw.pointer("/error/message").and_then(Value::as_str) {
+                    out.push(json!({"kind": "error", "message": message}));
+                }
+            }
+            let mut complete = json!({
+                "kind": "turn_complete",
+                "subtype": if is_error { "error_during_execution" } else { "success" },
+                "is_error": is_error,
+            });
+            if let Some(stats) = raw.get("stats") {
+                if let Some(duration_ms) = stats.get("duration_ms").and_then(Value::as_u64) {
+                    complete["duration_ms"] = json!(duration_ms);
+                }
+                complete["usage"] = stats.clone();
+            }
+            out.push(complete);
+            out
         }
         _ => Vec::new(),
     }
@@ -1772,12 +2315,458 @@ pub(crate) fn is_safe_cli_token(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '@' | '/'))
 }
 
-/// (T2) A live session's stdin queue + shared state, cloned out from under
-/// the store lock for request handlers.
+#[cfg(any(unix, windows))]
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        (meta.permissions().mode() & 0o111) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Validate that a per-turn provider's CLI binary resolves to an executable
+/// file without spawning an idle process at pane creation / bootstrap time.
+#[cfg(any(unix, windows))]
+pub(crate) fn verify_agent_bin_exists(plan: &AgentSpawnPlan) -> Result<(), String> {
+    let provider = plan.backend.as_str();
+    match &plan.bin {
+        AgentBinPlan::NotFound => Err(format!(
+            "{provider} CLI not found on PATH (configure its agent binary override)"
+        )),
+        AgentBinPlan::ViaCmd(script) => {
+            if script.is_file() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{provider} CLI not found: '{}' is not executable or not on PATH",
+                    script.display()
+                ))
+            }
+        }
+        AgentBinPlan::Direct(bin) => {
+            if bin.contains('/') || bin.contains('\\') {
+                if is_executable_file(Path::new(bin)) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{provider} CLI not found: '{bin}' is not executable or not on PATH"
+                    ))
+                }
+            } else {
+                let effective_path = if let Some(explicit) = plan.env.get("PATH") {
+                    Some(std::ffi::OsString::from(explicit))
+                } else if plan.scrub_env.iter().any(|k| k == "PATH") {
+                    None
+                } else {
+                    std::env::var_os("PATH")
+                };
+                let found = effective_path.is_some_and(|path_var| {
+                    std::env::split_paths(&path_var).any(|dir| is_executable_file(&dir.join(bin)))
+                });
+                if found {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{provider} CLI not found: '{bin}' is not executable or not on PATH"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) struct PreparedPerTurnSpawn {
+    pub(crate) backend: AgentBackendKind,
+    pub(crate) child: std::process::Child,
+    #[cfg(windows)]
+    pub(crate) job: KillOnCloseJob,
+    pub(crate) stdout: std::process::ChildStdout,
+    pub(crate) stderr: std::process::ChildStderr,
+}
+
+/// Spawn one turn of a per-turn provider (`codex exec`, `gemini`), streaming
+/// `prompt` into `stdin` on a helper thread and closing `stdin` (`EOF`)
+/// immediately so even 256 KiB prompts never block pipe buffers.
+#[cfg(any(unix, windows))]
+pub(crate) fn execute_per_turn_agent_spawn(
+    plan: &AgentSpawnPlan,
+    prompt: &str,
+) -> Result<PreparedPerTurnSpawn, String> {
+    let provider = plan.backend.as_str();
+    let Some((program, argv)) = agent_command_argv(&plan.bin, &plan.args) else {
+        return Err(format!(
+            "{provider} CLI not found on PATH (configure its agent binary override)"
+        ));
+    };
+    let mut command = Command::new(&program);
+    command.args(&argv);
+    command.current_dir(&plan.cwd);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    for key in INHERITED_SESSION_MARKERS {
+        command.env_remove(key);
+    }
+    for key in &plan.scrub_env {
+        command.env_remove(key);
+    }
+    for (key, value) in &plan.env {
+        command.env(key, value);
+    }
+    #[cfg(windows)]
+    let spawned = KillOnCloseJob::spawn(&mut command);
+    #[cfg(unix)]
+    let spawned = command.spawn();
+    let spawned = spawned.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("{provider} CLI not found: '{program}' is not executable or not on PATH")
+        } else {
+            format!("failed to spawn agent CLI '{program}': {error}")
+        }
+    })?;
+    #[cfg(windows)]
+    let (mut child, job) = spawned;
+    #[cfg(unix)]
+    let mut child = spawned;
+    let (mut stdin, stdout, stderr) =
+        match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
+            (Some(stdin), Some(stdout), Some(stderr)) => (stdin, stdout, stderr),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("failed to open agent CLI pipes".to_string());
+            }
+        };
+    let mut payload = prompt.as_bytes().to_vec();
+    if !payload.ends_with(b"\n") {
+        payload.push(b'\n');
+    }
+    thread::spawn(move || {
+        let _ = std::io::Write::write_all(&mut stdin, &payload);
+        let _ = std::io::Write::flush(&mut stdin);
+        // Dropping `stdin` closes the pipe so the per-turn CLI sees EOF.
+    });
+    Ok(PreparedPerTurnSpawn {
+        backend: plan.backend,
+        child,
+        #[cfg(windows)]
+        job,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(any(unix, windows))]
+struct PerTurnReaderCtx {
+    pane_id: String,
+    backend: AgentBackendKind,
+    generation: u64,
+    child: Arc<Mutex<std::process::Child>>,
+    stdout: std::process::ChildStdout,
+    stderr_handle: thread::JoinHandle<String>,
+    killer_slot: Arc<Mutex<Option<AgentChildKiller>>>,
+    shared: Arc<Mutex<AgentShared>>,
+    liveness: Arc<Mutex<HashMap<String, PaneLiveness>>>,
+    router: OutputRouter,
+    events: Arc<Mutex<AgentEventLog>>,
+    reaped: Arc<AtomicBool>,
+    dirty: Arc<AtomicBool>,
+}
+
+#[cfg(any(unix, windows))]
+fn per_turn_agent_reader_main(ctx: PerTurnReaderCtx) {
+    let PerTurnReaderCtx {
+        pane_id,
+        backend,
+        generation,
+        child,
+        stdout,
+        stderr_handle,
+        killer_slot,
+        shared,
+        liveness,
+        router,
+        events,
+        reaped,
+        dirty,
+    } = ctx;
+
+    let owns_session = || {
+        liveness
+            .lock()
+            .ok()
+            .map(|map| {
+                map.get(&pane_id)
+                    .is_some_and(|entry| entry.generation == generation && !entry.ended)
+            })
+            .unwrap_or(false)
+    };
+
+    let mut saw_turn_complete = false;
+    let mut saw_error_event = false;
+    let mut reader = BufReader::new(stdout);
+    let mut buffer = Vec::new();
+    loop {
+        let truncated = match read_capped_line(&mut reader, &mut buffer, AGENT_OUTPUT_LINE_MAX) {
+            Ok(Some(truncated)) => truncated,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+        if !owns_session() {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.wait();
+            }
+            reaped.store(true, Ordering::SeqCst);
+            let _ = stderr_handle.join();
+            return;
+        }
+        if truncated {
+            saw_error_event = true;
+            append_and_emit_agent_event(
+                &router,
+                &events,
+                &pane_id,
+                json!({"kind": "error", "message": "oversized agent output line dropped"}),
+            );
+            continue;
+        }
+        let line = String::from_utf8_lossy(&buffer);
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let raw: Value = match serde_json::from_str(line) {
+            Ok(raw) => raw,
+            Err(error) => {
+                tracing::warn!(
+                    pane_id = %pane_id,
+                    event = "agent_line_malformed",
+                    %error,
+                    "malformed agent output line: {}",
+                    &line[..line.len().min(200)]
+                );
+                continue;
+            }
+        };
+        for event in normalize_provider_agent_event(backend, &raw) {
+            match event.get("kind").and_then(Value::as_str).unwrap_or("") {
+                "session" => {
+                    if let Some(session_id) = event
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| is_safe_cli_token(id))
+                    {
+                        let mut changed = false;
+                        if let Ok(mut shared) = shared.lock() {
+                            if shared.session_id.as_deref() != Some(session_id) {
+                                shared.session_id = Some(session_id.to_string());
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            dirty.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+                "error" => {
+                    saw_error_event = true;
+                }
+                "turn_complete" => {
+                    saw_turn_complete = true;
+                    agent_end_turn(&shared);
+                }
+                _ => {}
+            }
+            append_and_emit_agent_event(&router, &events, &pane_id, event);
+        }
+    }
+
+    let exit_code = child
+        .lock()
+        .ok()
+        .and_then(|mut child| child.wait().ok())
+        .and_then(|status| status.code());
+    reaped.store(true, Ordering::SeqCst);
+    if let Ok(mut guard) = killer_slot.lock() {
+        *guard = None;
+    }
+    let stderr_tail = stderr_handle.join().unwrap_or_default();
+    let was_interrupted = shared
+        .lock()
+        .map(|mut s| {
+            s.turn_running = false;
+            std::mem::replace(&mut s.interrupted, false)
+        })
+        .unwrap_or(false);
+
+    if !owns_session() {
+        return;
+    }
+
+    if !saw_turn_complete {
+        if was_interrupted {
+            append_and_emit_agent_event(
+                &router,
+                &events,
+                &pane_id,
+                json!({
+                    "kind": "turn_complete",
+                    "subtype": "interrupted",
+                    "is_error": true,
+                }),
+            );
+        } else {
+            let trimmed_stderr = stderr_tail.trim();
+            if !saw_error_event {
+                let message = if !trimmed_stderr.is_empty() {
+                    trimmed_stderr.to_string()
+                } else if let Some(code) = exit_code {
+                    format!("{} CLI exited with code {code}", backend.as_str())
+                } else {
+                    format!("{} CLI terminated before completing turn", backend.as_str())
+                };
+                append_and_emit_agent_event(
+                    &router,
+                    &events,
+                    &pane_id,
+                    json!({"kind": "error", "message": message}),
+                );
+            }
+            append_and_emit_agent_event(
+                &router,
+                &events,
+                &pane_id,
+                json!({
+                    "kind": "turn_complete",
+                    "subtype": "error_during_execution",
+                    "is_error": true,
+                }),
+            );
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_per_turn_agent_workers(
+    pane_id: String,
+    generation: u64,
+    prepared: PreparedPerTurnSpawn,
+    killer_slot: Arc<Mutex<Option<AgentChildKiller>>>,
+    shared: Arc<Mutex<AgentShared>>,
+    liveness: Arc<Mutex<HashMap<String, PaneLiveness>>>,
+    router: OutputRouter,
+    events: Arc<Mutex<AgentEventLog>>,
+    dirty: Arc<AtomicBool>,
+) {
+    let PreparedPerTurnSpawn {
+        backend,
+        child,
+        #[cfg(windows)]
+        job,
+        stdout,
+        stderr,
+    } = prepared;
+
+    #[cfg(unix)]
+    let pid = child.id();
+    let reaped = Arc::new(AtomicBool::new(false));
+    let child = Arc::new(Mutex::new(child));
+
+    #[cfg(unix)]
+    let turn_killer = AgentChildKiller {
+        pid,
+        reaped: Arc::clone(&reaped),
+        process_group: true,
+    };
+    #[cfg(windows)]
+    let turn_killer = AgentChildKiller {
+        child: Arc::clone(&child),
+        job,
+    };
+    if let Ok(mut guard) = killer_slot.lock() {
+        *guard = Some(turn_killer);
+    }
+
+    let stderr_router = router.clone();
+    let stderr_pane_id = pane_id.clone();
+    let stderr_handle = thread::spawn(move || {
+        let _log_guard = stderr_router.log_guard();
+        let mut reader = BufReader::new(stderr);
+        let mut line = Vec::new();
+        let mut tail = String::new();
+        while let Ok(Some(truncated)) =
+            read_capped_line(&mut reader, &mut line, AGENT_OUTPUT_LINE_MAX)
+        {
+            let text = String::from_utf8_lossy(&line);
+            let trimmed = text.trim_end();
+            tracing::warn!(
+                pane_id = %stderr_pane_id,
+                event = "agent_stderr",
+                truncated,
+                "agent CLI stderr: {}",
+                trimmed
+            );
+            if !trimmed.is_empty() {
+                if !tail.is_empty() {
+                    tail.push('\n');
+                }
+                tail.push_str(trimmed);
+                if tail.chars().count() > 1024 {
+                    let chars: Vec<char> = tail.chars().collect();
+                    tail = chars[chars.len() - 1024..].iter().collect();
+                }
+            }
+        }
+        tail
+    });
+
+    let ctx = PerTurnReaderCtx {
+        pane_id,
+        backend,
+        generation,
+        child,
+        stdout,
+        stderr_handle,
+        killer_slot,
+        shared,
+        liveness,
+        router: router.clone(),
+        events,
+        reaped,
+        dirty,
+    };
+    thread::spawn(move || {
+        let _log_guard = router.log_guard();
+        per_turn_agent_reader_main(ctx);
+    });
+}
+
+/// (T2) A live session's handles, cloned out from under the store lock for
+/// request handlers.
 #[cfg(any(unix, windows))]
 pub(crate) type AgentSessionHandles = (
     AgentBackendKind,
-    SyncSender<Vec<u8>>,
+    u64,
+    Option<SyncSender<Vec<u8>>>,
+    Arc<Mutex<Option<AgentChildKiller>>>,
     Arc<Mutex<AgentShared>>,
     Arc<Mutex<AgentEventLog>>,
 );
@@ -1785,8 +2774,8 @@ pub(crate) type AgentSessionHandles = (
 #[cfg(any(unix, windows))]
 impl TerminalStore {
     /// (T2) The cheap half of an agent spawn, read under the store lock (M7).
-    /// The CLI session to resume comes from the previous (ended) session when
-    /// there is one, else the persisted `agents_v2` seed.
+    /// The CLI session to resume comes from the previous (or active per-turn)
+    /// session when there is one, else the persisted `agents_v2` seed.
     pub(crate) fn plan_agent_spawn(&self, pane_id: &str) -> AgentSpawnPlan {
         let spec = self.agent_specs.get(pane_id).cloned().unwrap_or_default();
         let adapter = spec.backend.adapter();
@@ -1803,11 +2792,20 @@ impl TerminalStore {
             })
             .or_else(|| self.agent_resume.get(pane_id).cloned())
             .filter(|id| is_safe_cli_token(id));
-        let args = (adapter.spawn_args)(
-            &self.agent_config.permission_mode,
-            spec.model.as_deref(),
-            resume_session_id.as_deref(),
-        );
+        let args = if let Some(per_turn_args) = adapter.per_turn_spawn_args {
+            per_turn_args(
+                &self.cwd,
+                &self.agent_config.permission_mode,
+                spec.model.as_deref(),
+                resume_session_id.as_deref(),
+            )
+        } else {
+            (adapter.spawn_args)(
+                &self.agent_config.permission_mode,
+                spec.model.as_deref(),
+                resume_session_id.as_deref(),
+            )
+        };
         let command_str = format!("{} {}", agent_bin_display(&bin), args.join(" "));
         let initial_input = (adapter.initial_stdin)(
             pane_id,
@@ -1826,6 +2824,58 @@ impl TerminalStore {
             cwd_str: self.cwd.to_string_lossy().to_string(),
             initial_input,
         }
+    }
+
+    /// Commit a logical session for a per-turn provider (`codex`, `gemini`):
+    /// bumps generation, marks the pane live, seeds `session_id` from any
+    /// persisted `agent_resume` entry, and opens the durable event log without
+    /// spawning an idle OS process before the first user prompt.
+    pub(crate) fn commit_logical_agent_session(&mut self, pane_id: &str, plan: &AgentSpawnPlan) {
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        if let Ok(mut liveness) = self.liveness.lock() {
+            liveness.insert(
+                pane_id.to_string(),
+                PaneLiveness {
+                    generation,
+                    ended: false,
+                    command: Some(plan.command_str.clone()),
+                    cwd: Some(plan.cwd_str.clone()),
+                    exit_code: None,
+                    exit_signal: None,
+                    pid: None,
+                },
+            );
+        }
+        let resume_seed = self
+            .agent_resume
+            .get(pane_id)
+            .cloned()
+            .filter(|id| is_safe_cli_token(id));
+        let shared = Arc::new(Mutex::new(AgentShared {
+            session_id: resume_seed,
+            ..Default::default()
+        }));
+        let events = Arc::new(Mutex::new(AgentEventLog {
+            log: AgentLogWriter::open(&self.agents_dir, pane_id),
+            next_seq: agent_log_last_seq(&self.agents_dir, pane_id),
+            pending_escape: String::new(),
+        }));
+        let effective_mode =
+            (plan.backend.adapter().effective_permission_mode)(&self.agent_config.permission_mode)
+                .to_string();
+        self.agent_sessions.insert(
+            pane_id.to_string(),
+            AgentSession {
+                backend: plan.backend,
+                generation,
+                permission_mode: effective_mode,
+                input: None,
+                killer: Arc::new(Mutex::new(None)),
+                shared,
+                events,
+            },
+        );
     }
 
     /// (T2) Commit an agent spawn under the store lock (M7): generation bump,
@@ -1937,16 +2987,24 @@ impl TerminalStore {
         // already-reaped child — on unix the killer checks the reaped flag;
         // on Windows TerminateProcess on an exited handle simply fails).
         #[cfg(unix)]
-        let killer = AgentChildKiller { pid, reaped };
+        let killer = AgentChildKiller {
+            pid,
+            reaped,
+            process_group: false,
+        };
         #[cfg(windows)]
         let killer = AgentChildKiller { child, job };
+        let effective_mode =
+            (backend.adapter().effective_permission_mode)(&self.agent_config.permission_mode)
+                .to_string();
         self.agent_sessions.insert(
             pane_id.to_string(),
             AgentSession {
                 backend,
-                permission_mode: self.agent_config.permission_mode.clone(),
-                input,
-                killer,
+                generation,
+                permission_mode: effective_mode,
+                input: Some(input),
+                killer: Arc::new(Mutex::new(Some(killer))),
                 shared,
                 events,
             },
@@ -1984,7 +3042,9 @@ impl TerminalStore {
         self.agent_sessions.get(pane_id).map(|session| {
             (
                 session.backend,
+                session.generation,
                 session.input.clone(),
+                Arc::clone(&session.killer),
                 Arc::clone(&session.shared),
                 Arc::clone(&session.events),
             )

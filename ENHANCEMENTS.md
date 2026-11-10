@@ -346,12 +346,14 @@ above and the current acceptance work determine what remains to build.
   streams `agent_state` (working / needs_input / idle / mode / unattended),
   `lease_state`, `pane_ended`, `output_warning`, and `project_notes_changed`
   transitions over the event subscription without polling.
-- **Additional agent backends.** `AgentBackendAdapter`
+- **Additional agent backends.** Shipped: `AgentBackendAdapter`
   (`src-tauri/src/agent_stream.rs`, documented in
-  `docs/scripting-and-local-operation.md` §3) consolidates the provider wire
-  seams for `Claude` and `Droid`. Qualifying Codex and Gemini CLI adapters
-  behind the normalized event stream remains sequenced behind the platform
-  acceptance work in §1.
+  `docs/scripting-and-local-operation.md` §3) implements `Claude`, `Droid`,
+  `Codex` (`codex exec --json` / `codex exec resume --json`), and `Gemini`
+  (`gemini --output-format stream-json` / `--resume`) across `sgian ctl`, Tauri,
+  `apps/macos`, and `apps/windows`, with per-turn stdin prompt streaming,
+  process-group/Job-Object containment, effective sandbox/approval `unattended`
+  badges, and TUI screen classification.
 
 ## Prioritization note
 

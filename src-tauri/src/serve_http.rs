@@ -153,7 +153,7 @@ pub(crate) fn frontend_command(
                 .as_str()
                 .map(|value| serde_json::from_value(Value::String(value.to_string())))
                 .transpose()
-                .map_err(|_| "backend must be claude or droid".to_string())?,
+                .map_err(|_| "backend must be claude, droid, codex, or gemini".to_string())?,
             model: opt_text(args, "model"),
         },
         "send_agent_message" => DaemonRequest::SendAgentMessage {

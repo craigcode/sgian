@@ -353,6 +353,8 @@ public sealed partial class MainWindow : Window
             ("Split down", () => ViewModel.CreateShellAsync("column")),
             ("New Claude agent", () => ViewModel.CreateAgentAsync("claude")),
             ("New Factory Droid agent", () => ViewModel.CreateAgentAsync("droid")),
+            ("New Codex agent", () => ViewModel.CreateAgentAsync("codex")),
+            ("New Gemini agent", () => ViewModel.CreateAgentAsync("gemini")),
             ("Zoom / Show all panes", () => { ViewModel.ToggleZoom(); return Task.CompletedTask; }),
             ("Reconnect", () => ViewModel.StartAsync()),
             ("Take keyboard for active pane", TakeLeaseAsync),
