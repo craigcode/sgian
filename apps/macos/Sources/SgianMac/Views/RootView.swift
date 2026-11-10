@@ -64,6 +64,8 @@ struct RootView: View {
             Menu {
                 Button("Claude") { model.createAgent(backend: .claude) }
                 Button("Factory Droid") { model.createAgent(backend: .droid) }
+                Button("Codex") { model.createAgent(backend: .codex) }
+                Button("Gemini") { model.createAgent(backend: .gemini) }
                 if !model.profiles.isEmpty {
                     Divider()
                     ForEach(model.profiles, id: \.prettyPrinted) { profile in

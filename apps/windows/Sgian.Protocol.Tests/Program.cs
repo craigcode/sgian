@@ -181,7 +181,11 @@ static void AgentPermissionMode()
     Equal(true, AgentPaneInfo.IsUnattendedMode("auto"));
     Equal(true, AgentPaneInfo.IsUnattendedMode("bypassPermissions"));
     Equal(true, AgentPaneInfo.IsUnattendedMode("dontAsk"));
+    Equal(true, AgentPaneInfo.IsUnattendedMode("yolo"));
+    Equal(true, AgentPaneInfo.IsUnattendedMode("workspace-write"));
+    Equal(true, AgentPaneInfo.IsUnattendedMode("danger-full-access"));
     Equal(false, AgentPaneInfo.IsUnattendedMode("plan"));
+    Equal(false, AgentPaneInfo.IsUnattendedMode("read-only"));
     Equal(false, AgentPaneInfo.IsUnattendedMode(null));
 }
 
@@ -204,6 +208,8 @@ static void WorkspaceStartupResolution()
     Equal(@"C:\w\alive", WorkspaceStartup.Resolve(null, @"C:\w\alive", null, @"C:\Windows\System32", @"C:\", @"C:\Users\me", exists, nowhere));
 
     Equal(true, WorkspaceStartup.IsAgentProfile("agent", "droid", null));
+    Equal(true, WorkspaceStartup.IsAgentProfile("agent", "codex", "gpt-5.4"));
+    Equal(true, WorkspaceStartup.IsAgentProfile(null, "gemini", null));
     Equal(true, WorkspaceStartup.IsAgentProfile(null, null, "m1"));
     Equal(true, WorkspaceStartup.IsAgentProfile(null, "claude", null));
     Equal(false, WorkspaceStartup.IsAgentProfile("shell", "claude", "m1"));

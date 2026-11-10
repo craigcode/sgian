@@ -1458,11 +1458,13 @@ pub(crate) fn parse_new_pane_args_with_spec(args: &[String]) -> Result<ParsedNew
                 if backend.is_some() {
                     return Err("--backend given more than once".to_string());
                 }
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "--backend requires claude or droid".to_string())?;
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--backend requires claude, droid, codex, or gemini".to_string()
+                })?;
                 backend = Some(AgentBackendKind::parse(value).ok_or_else(|| {
-                    format!("unknown agent backend '{value}': expected claude or droid")
+                    format!(
+                        "unknown agent backend '{value}': expected claude, droid, codex, or gemini"
+                    )
                 })?);
                 agent = true;
                 index += 2;
@@ -1616,7 +1618,7 @@ pub(crate) fn format_status_verbose_human(status: &VerboseStatus) -> String {
     let env_keys = env_key_names_csv(&cfg["env"]);
     let _ = writeln!(
         out,
-        "config\tshell={}\tshell_args={}\tenv={}\tscrub_env={}\tfont_family={}\tfont_size={}\ttheme={}\tidle_shutdown_secs={}\trestore_policy={}\tagent_permission_mode={}\tagent_claude_bin={}\tagent_droid_bin={}",
+        "config\tshell={}\tshell_args={}\tenv={}\tscrub_env={}\tfont_family={}\tfont_size={}\ttheme={}\tidle_shutdown_secs={}\trestore_policy={}\tagent_permission_mode={}\tagent_claude_bin={}\tagent_droid_bin={}\tagent_codex_bin={}\tagent_gemini_bin={}",
         cfg["shell"],
         cfg["shell_args"],
         env_keys,
@@ -1629,6 +1631,8 @@ pub(crate) fn format_status_verbose_human(status: &VerboseStatus) -> String {
         cfg["agent_permission_mode"],
         cfg["agent_claude_bin"],
         cfg["agent_droid_bin"],
+        cfg["agent_codex_bin"],
+        cfg["agent_gemini_bin"],
     );
     out
 }
@@ -4899,6 +4903,9 @@ pub(crate) fn parse_agent_args(args: &[String]) -> Result<AgentArgs, String> {
     let mark = match args.get(op_index).map(String::as_str) {
         None => None,
         Some("on") => Some(Some("claude".to_string())),
+        Some(provider @ ("claude" | "droid" | "codex" | "gemini")) => {
+            Some(Some(provider.to_string()))
+        }
         Some("off") => Some(None),
         Some(other) => return Err(format!("unexpected argument for agent: {other}")),
     };
@@ -6077,7 +6084,7 @@ Commands (PANE is a pane id or title; defaults to the active pane):
   ipc-endpoint                  Start/locate the daemon and print native-client
                                 IPC discovery metadata (never prints the token)
   panes | list                  List panes in the workspace
-  new [--agent] [--backend claude|droid] [--model ID] [--profile NAME] [--project NAME] [--name NAME]
+  new [--agent] [--backend claude|droid|codex|gemini] [--model ID] [--profile NAME] [--project NAME] [--name NAME]
                                 Create a pane (alias: pane new).
                                   --agent defaults to Claude
                                   --backend selects the agent CLI

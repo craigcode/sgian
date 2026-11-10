@@ -58,6 +58,8 @@
                             <MenuFlyout>
                                 <MenuFlyoutItem Text="Claude" Tag="claude" Click="NewAgent_Click" />
                                 <MenuFlyoutItem Text="Factory Droid" Tag="droid" Click="NewAgent_Click" />
+                                <MenuFlyoutItem Text="Codex" Tag="codex" Click="NewAgent_Click" />
+                                <MenuFlyoutItem Text="Gemini" Tag="gemini" Click="NewAgent_Click" />
                             </MenuFlyout>
                         </Button.Flyout>
                     </Button>

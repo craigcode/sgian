@@ -18,7 +18,7 @@ API: the wire contract is the JSON in `docs/native-ipc.md`.
 | `router.rs` | 1,436 | Agent screen classification, `AgentTracker`, `OutputRouter`: scrollback append, output-guard hook, attention and usage state, subscriber fan-out. |
 | `terminals.rs` | 800 | `TerminalStore`: PTY spawn, liveness, generation-scoped grant hooks, input queues, kill. |
 | `grants.rs` | 1,162 | Kranz execution grants (`docs/design/execution-grants.md`): RFC 2104 HMAC-SHA256 verification, `.kranz/serve.grant.key` (`0600`) loader, canonical `cwd` confinement, `PATH`-only bare binary resolution, strict `env_allow` PTY spawn, `GrantStore`, and `grant_exec`/`grant_output`/`grant_wait`/`grant_kill`/`grant_release`. |
-| `agent_stream.rs` | 2,359 | Chat-native agent panes: `AgentBackendAdapter` (`Claude`, `Droid`), spawn planning, sessions and approvals, stream-json/JSON-RPC normalization, the conversation log, the reader thread. |
+| `agent_stream.rs` | 2,900 | Chat-native agent panes: `AgentBackendAdapter` (`Claude`, `Droid`, `Codex`, `Gemini`), persistent + per-turn spawn planning, sessions and approvals, stream-json/JSON-RPC normalization, the conversation log, the reader threads. |
 | `output_guard.rs` | 597 | `OutputTricks` and the scanner for output that hides something from a person. |
 | `ledger.rs` | 469 | Keyboard leases (`LeasePolicy`, `HeldLease`, predicates), the hash-chained ledger writer and verifier, `AgentUsage` from the status line. |
 | `notes.rs` | 538 | Per-project shared context notes under `<repo>/.sgian/projects/<name>/notes/`: ledgered writes, scrub on read, the `project_notes_changed` watch. |

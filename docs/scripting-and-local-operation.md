@@ -241,9 +241,12 @@ what crosses a network:
 ## 3. Agent backend adapter contract
 
 Chat-native agent panes isolate provider wire differences inside
-`AgentBackendAdapter` (`src-tauri/src/agent_stream.rs`), currently implemented
-by `CLAUDE_BACKEND_ADAPTER` (Claude Code `stream-json`) and
-`DROID_BACKEND_ADAPTER` (Factory Droid `stream-jsonrpc`).
+`AgentBackendAdapter` (`src-tauri/src/agent_stream.rs`), implemented by:
+
+- `CLAUDE_BACKEND_ADAPTER` (Claude Code `stream-json`, persistent stdio),
+- `DROID_BACKEND_ADAPTER` (Factory Droid `stream-jsonrpc`, persistent stdio),
+- `CODEX_BACKEND_ADAPTER` (OpenAI Codex `codex exec --json` / `codex exec resume --json`, per-turn stdin), and
+- `GEMINI_BACKEND_ADAPTER` (Google Gemini CLI `gemini --output-format stream-json` / `--resume`, per-turn stdin).
 
 Every adapter defines:
 

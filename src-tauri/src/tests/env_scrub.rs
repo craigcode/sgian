@@ -177,6 +177,8 @@ fn config_rejects_unknown_keys_but_accepts_full_round_trip() {
         agent_permission_mode: Some("manual".to_string()),
         agent_claude_bin: Some("/opt/claude/bin/claude".to_string()),
         agent_droid_bin: Some("/opt/factory/bin/droid".to_string()),
+        agent_codex_bin: Some("/opt/openai/bin/codex".to_string()),
+        agent_gemini_bin: Some("/opt/google/bin/gemini".to_string()),
         profiles: Vec::new(),
         remote_loopback_port: Some(0),
         machines: Vec::new(),

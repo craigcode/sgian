@@ -379,7 +379,10 @@ describe("settingsPassthroughConfig", () => {
         scrub_env: ["TOKEN"],
         agent_permission_mode: "plan",
         agent_claude_bin: "C:\\tools\\claude.exe",
+        agent_codex_bin: "/opt/openai/codex",
+        agent_gemini_bin: "/opt/google/gemini",
         profiles: [{ name: "dev", kind: "shell" }],
+        remote_loopback_port: 0,
         font_size: 15,
         env: { FOO: "bar" },
       }),
@@ -387,7 +390,10 @@ describe("settingsPassthroughConfig", () => {
       scrub_env: ["TOKEN"],
       agent_permission_mode: "plan",
       agent_claude_bin: "C:\\tools\\claude.exe",
+      agent_codex_bin: "/opt/openai/codex",
+      agent_gemini_bin: "/opt/google/gemini",
       profiles: [{ name: "dev", kind: "shell" }],
+      remote_loopback_port: 0,
     });
   });
 
