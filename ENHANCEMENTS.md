@@ -278,11 +278,21 @@ Shipped (2026-09-16):
   `session.terminated` ledger entries, remote `ctl --machine <name> ledger --verify`,
   10,000-iteration PRNG frame fuzzing, and an in-process Mock MGS WebSocket
   integration suite (`src-tauri/src/tests/ssm.rs`).
+- **Execution grants — Kranz `TerminalProvider` consumer.** Kranz provisions and
+  rotates `<repo>/.kranz/serve.grant.key` (`0600`, non-symlink, authority-denied
+  and scrubbed) and implements `SgianTerminalProvider`
+  (`kranz_acp::terminal::TerminalProvider`) behind
+  `AcpBackend::with_sgian_terminals` for explicitly opted-in uncontained host
+  sessions (`sandbox.enforce: off`, never combined with contained profiles),
+  minting RFC 2104 HMAC-SHA256-signed canonical JSON `ExecutionGrant`s and
+  routing `terminal/create|output|wait_for_exit|kill|release` through
+  `sgian ctl --workspace <repo> --json grant exec|output|wait|kill|release` with
+  full one-call consent, scope/generation fencing, lifetime/retention budgets,
+  verified `PaneObservation` projection, and fail-closed `CleanupReceipt`
+  confirmation (`docs/design/execution-grants.md`).
 
 Open, in order:
 
-- **Execution grants — Kranz `TerminalProvider` consumer**: wiring `kranz-acp`
-  to Sgian's `grant_*` endpoints on the Kranz side.
 - **M5 SSM / ECS Exec live AWS host sign-off** (#115): framing, `smux` port
   forwarding, `ResumeSession`, and Mock MGS integration tests are in place; live
   Linux EC2 + Windows WorkSpace sign-off and optional KMS `EncChallenge` session
