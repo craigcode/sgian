@@ -67,10 +67,11 @@ follow SemVer once the first public tag exists.
 - Saved remote workspaces (`machines`, #114): user-global `machines` entries
   managed via `ctl machine add|list|remove` with `0600` non-symlinked client
   token storage (plus macOS login Keychain and Windows PasswordVault lookups),
-  client-owned `ssh -N -L` tunnel lifecycle (`src-tauri/src/machines.rs`),
+  client-owned `ssh -N -L` tunnel lifecycle with automatic tunnel-drop recovery
+  (`src-tauri/src/machines.rs`, `src-tauri/src/agent_stream.rs`),
   `--machine <name>` / `-m <name>` / `SGIAN_MACHINE` and `<machine>/<pane>`
-  shorthand across `sgian ctl`, and saved machine switchers in the native macOS
-  and Windows desktop clients.
+  shorthand across `sgian ctl`, and saved machine switchers across Tauri
+  (`ui/`), `apps/macos`, and `apps/windows`.
 - Windows daemon as a remote target (#116): opt-in `127.0.0.1` loopback TCP IPC
   listener (`remote_loopback_port` in `config.json` and `--listen-loopback <PORT>`,
   recording `daemon.loopback_port` and `ipc-endpoint.loopback_port`), mandatory

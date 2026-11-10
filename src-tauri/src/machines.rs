@@ -444,6 +444,120 @@ fn discover_remote_forward_target(entry: &MachineEntry, ssh_bin: &str) -> Result
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MachineReconnectSpec {
+    pub(crate) app_dir: PathBuf,
+    pub(crate) machine_name: String,
+    pub(crate) ssh_bin_override: Option<String>,
+}
+
+impl MachineReconnectSpec {
+    pub(crate) fn reconnect(&self) -> Result<DaemonClient, String> {
+        let (client, _) = ensure_machine_client_with_ssh_in(
+            &self.app_dir,
+            &self.machine_name,
+            self.ssh_bin_override.as_deref(),
+        )?;
+        Ok(client)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedMachineStatus {
+    pub name: String,
+    pub transport: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    pub workspace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<String>,
+    pub token_configured: bool,
+    pub tunnel_present: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceTargetsSnapshot {
+    pub local_workspace: String,
+    pub active_machine: Option<String>,
+    pub credential_from_env: bool,
+    pub machines: Vec<SavedMachineStatus>,
+}
+
+pub(crate) fn list_saved_machine_statuses_in(
+    app_dir: &Path,
+) -> Result<Vec<SavedMachineStatus>, String> {
+    let entries = load_global_machines_in(app_dir)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let token_path = entry
+                .token_file
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| machine_default_token_path_in(app_dir, &entry.name));
+            let token_configured = read_token(&token_path).ok().flatten().is_some();
+            let runtime_dir = machine_runtime_dir_in(app_dir, &entry.name);
+            #[cfg(unix)]
+            let tunnel_present = runtime_dir.join(SOCKET_FILE).exists();
+            #[cfg(windows)]
+            let tunnel_present = runtime_dir.join(TUNNEL_PORT_FILE).exists();
+            SavedMachineStatus {
+                name: entry.name,
+                transport: entry.transport,
+                host: entry.host,
+                port: entry.port,
+                workspace: entry.workspace,
+                target: entry.target,
+                token_file: entry.token_file,
+                token_configured,
+                tunnel_present,
+            }
+        })
+        .collect())
+}
+
+pub(crate) fn set_or_clear_machine_token_in(
+    app_dir: &Path,
+    machine_name: &str,
+    token: Option<&str>,
+) -> Result<(), String> {
+    let name = validate_machine_name(machine_name)?;
+    let machines = load_global_machines_in(app_dir)?;
+    let entry = machines
+        .into_iter()
+        .find(|m| m.name == name)
+        .ok_or_else(|| format!("unknown machine '{name}'"))?;
+    if entry.token_file.is_some() {
+        return Err(format!(
+            "machine '{name}' uses an external token_file; update that file directly or re-add without --token-file"
+        ));
+    }
+    let trimmed = token.map(str::trim).filter(|t| !t.is_empty());
+    if let Some(secret) = trimmed {
+        write_machine_token_in(app_dir, &name, secret).map(|_| ())
+    } else {
+        let path = machine_default_token_path_in(app_dir, &name);
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing to remove directory at token path {}",
+                    path.display()
+                ));
+            }
+            if let Err(error) = fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!("failed to remove {}: {error}", path.display()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn build_machine_client_and_endpoint(
     entry: &MachineEntry,
     runtime_dir: &Path,
@@ -451,6 +565,7 @@ fn build_machine_client_and_endpoint(
     tcp_endpoint: Option<std::net::SocketAddr>,
     client_token: Option<String>,
     token_path: PathBuf,
+    reconnect: MachineReconnectSpec,
 ) -> (DaemonClient, NativeIpcEndpoint) {
     let (transport_name, endpoint_str) = match tcp_endpoint {
         Some(addr) => ("tcp_loopback".to_string(), addr.to_string()),
@@ -477,6 +592,7 @@ fn build_machine_client_and_endpoint(
         auto_spawn: false,
         client_token,
         tcp_endpoint,
+        machine_reconnect: Some(reconnect),
     };
     (client, endpoint)
 }
@@ -547,6 +663,12 @@ pub(crate) fn ensure_machine_client_with_ssh_in(
     let _lock =
         acquire_advisory_lock_bounded(&runtime_dir.join(TUNNEL_LOCK_FILE), TUNNEL_LOCK_WAIT)?;
 
+    let reconnect_spec = MachineReconnectSpec {
+        app_dir: app_dir.to_path_buf(),
+        machine_name: name.clone(),
+        ssh_bin_override: ssh_bin_override.map(str::to_string),
+    };
+
     let local_sock = runtime_dir.join(SOCKET_FILE);
 
     // 1. Reuse an already-live tunnel if it responds to an authenticated Ping.
@@ -559,6 +681,7 @@ pub(crate) fn ensure_machine_client_with_ssh_in(
             None,
             client_token.clone(),
             token_path.clone(),
+            reconnect_spec.clone(),
         );
         match probe_machine_client(&candidate, &name) {
             TunnelProbe::Ready => return Ok((candidate, endpoint)),
@@ -579,6 +702,7 @@ pub(crate) fn ensure_machine_client_with_ssh_in(
                     Some(addr),
                     client_token.clone(),
                     token_path.clone(),
+                    reconnect_spec.clone(),
                 );
                 match probe_machine_client(&candidate, &name) {
                     TunnelProbe::Ready => return Ok((candidate, endpoint)),
@@ -696,6 +820,7 @@ pub(crate) fn ensure_machine_client_with_ssh_in(
         tcp_endpoint,
         client_token,
         token_path,
+        reconnect_spec,
     );
 
     let mut last_error = "tunnel socket not yet ready".to_string();

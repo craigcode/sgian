@@ -81,9 +81,11 @@ import {
 } from "./zoom.js";
 import { getTauriInvoke, getTauriListen, withTimeout } from "./tauri.js";
 import { capBufferedOutput, createTerminalController } from "./terminal-controller.js";
+import { normalizeWorkspaceTargets } from "./machines.js";
 
 const LEASE_TOAST_MS = 3000;
 const BOOTSTRAP_TIMEOUT_MS = 15_000;
+const CONNECT_MACHINE_TIMEOUT_MS = 45_000;
 const SEND_AGENT_MESSAGE_TIMEOUT_MS = 60_000;
 const RESYNC_INTERVAL_MS = 30_000;
 const LAYOUT_PERSIST_FAILURE_NOTICE = 3;
@@ -166,6 +168,13 @@ function initialState() {
     search: createSearchState(),
     zoom: createZoomState(),
     updateVersion: null,
+    localWorkspace: null,
+    savedMachines: [],
+    activeMachine: null,
+    credentialFromEnv: false,
+    switchingTarget: null,
+    targetError: null,
+    machineTokenStatus: "",
     renamingPaneId: null,
     dragging: false,
     drag: null,
@@ -287,6 +296,24 @@ export function createAppController({
     if (command === "write_to_pane") terminals.append(args.paneId, args.data);
     if (command === "get_config") return null;
     if (command === "client_holder") return "you";
+    if (command === "list_saved_machines") {
+      return {
+        local_workspace: window.location.pathname,
+        active_machine: null,
+        credential_from_env: false,
+        machines: [],
+      };
+    }
+    if (command === "connect_local_workspace") {
+      if (fallbackPanes.size === 0) fallbackPane("term-1");
+      const panes = Array.from(fallbackPanes.values());
+      return {
+        panes,
+        active_pane_id: panes[0]?.id ?? null,
+        cwd: args.workspace || window.location.pathname,
+      };
+    }
+    if (command === "set_machine_client_token") return { ok: true };
     if (command === "take_lease") {
       return { pane_id: args.paneId, holder: "you", since_ms: Date.now() };
     }
@@ -762,6 +789,7 @@ export function createAppController({
     state.booted = true;
     await loadAppearanceConfig();
     void loadClientHolder();
+    void refreshWorkspaceTargets();
     if (landing === "overview" && !state.overviewOpen) openOverview();
     notify();
     void persistWorkspaceLayout();
@@ -823,6 +851,7 @@ export function createAppController({
       state.layout = leaf(pane.id);
     }
     state.cwd = `workspace unavailable — ${formatError(error)}`;
+    state.targetError = formatError(error);
     state.ready = "error";
     state.bootStatus = "error";
     terminals.append(
@@ -830,6 +859,208 @@ export function createAppController({
       `\r\n[sgian] failed to load workspace: ${formatError(error)}\r\n`,
     );
     notify();
+    void refreshWorkspaceTargets();
+  }
+
+  let targetSwitchSeq = 0;
+
+  async function refreshWorkspaceTargets() {
+    try {
+      const payload = await invokeWithTimeout("list_saved_machines", {});
+      if (stopped) return;
+      const normalized = normalizeWorkspaceTargets(payload);
+      if (normalized.localWorkspace) {
+        state.localWorkspace = normalized.localWorkspace;
+      } else if (!state.localWorkspace && !state.activeMachine && state.cwd !== "starting workspace") {
+        state.localWorkspace = state.cwd;
+      }
+      if (!state.switchingTarget) {
+        state.activeMachine = normalized.activeMachine;
+      }
+      state.credentialFromEnv = normalized.credentialFromEnv;
+      state.savedMachines = normalized.machines;
+      notify();
+    } catch {
+      // Older bridges or custom test harnesses without list_saved_machines remain functional.
+    }
+  }
+
+  function resetWorkspaceViewForSwitch() {
+    if (reconcileTimer) window.clearTimeout(reconcileTimer);
+    reconcileTimer = null;
+    if (leaseToastTimer) window.clearTimeout(leaseToastTimer);
+    leaseToastTimer = null;
+    for (const frame of chatRenderFrames.values()) window.cancelAnimationFrame(frame);
+    chatRenderFrames.clear();
+    terminals.disposeAll();
+    state.panes = new Map();
+    state.paneStates = new Map();
+    state.agentStates = new Map();
+    state.leases = new Map();
+    state.leaseToast = null;
+    state.leaseDialog = null;
+    state.outputWarnings = new Map();
+    state.agentUsage = new Map();
+    state.projects = new Map();
+    state.notes = new Map();
+    state.agentSpecs = new Map();
+    state.profiles = [];
+    state.selectedProfile = null;
+    state.activePaneId = null;
+    state.layout = null;
+    state.terminalBuffers = new Map();
+    state.terminalSizes = new Map();
+    state.terminalResizeSyncs = new Map();
+    state.terminalViews = new Map();
+    state.chats = new Map();
+    state.chatViews = new Map();
+    state.chatDrafts = new Map();
+    state.lastActivityMs = new Map();
+    state.search = createSearchState();
+    state.zoom = createZoomState();
+    state.renamingPaneId = null;
+  }
+
+  async function applySwitchedSnapshot(snapshot, activeMachineName) {
+    resetWorkspaceViewForSwitch();
+    state.activeMachine = activeMachineName;
+    state.switchingTarget = null;
+    state.targetError = null;
+    if (!activeMachineName && snapshot?.cwd) {
+      state.localWorkspace = snapshot.cwd;
+    }
+    applyWorkspaceSnapshot(snapshot, new Set(), { initial: true });
+    for (const pane of snapshot.panes || []) {
+      if (pane.kind === "agent") continue;
+      const text = bridgeInvoke
+        ? snapshot.scrollback?.[pane.id] || ""
+        : `$ ${pane.title} attached\r\n$ browser preview only\r\n`;
+      terminals.setText(pane.id, text);
+    }
+    state.ready = "true";
+    state.bootStatus = state.terminalEngineAvailable
+      ? bridgeInvoke
+        ? "native"
+        : "browser"
+      : "terminal engine unavailable";
+    state.booted = true;
+    notify();
+    await loadAppearanceConfig();
+    void loadClientHolder();
+    void refreshWorkspaceTargets();
+    void persistWorkspaceLayout();
+    for (const pane of snapshot.panes || []) {
+      if (pane.kind !== "agent") void ensurePaneTerminal(pane.id);
+    }
+    notify();
+  }
+
+  function applySwitchedError(error, activeMachineName) {
+    resetWorkspaceViewForSwitch();
+    const pane = {
+      id: "pane-1",
+      title: "term-1",
+      kind: "shell",
+      created_at_ms: Date.now(),
+    };
+    state.panes = new Map([[pane.id, pane]]);
+    state.paneStates = new Map([[pane.id, "ended"]]);
+    state.activePaneId = pane.id;
+    state.layout = leaf(pane.id);
+    state.activeMachine = activeMachineName;
+    state.switchingTarget = null;
+    const formatted = formatError(error);
+    state.targetError = formatted;
+    state.cwd = activeMachineName
+      ? `${activeMachineName} unavailable — ${formatted}`
+      : `workspace unavailable — ${formatted}`;
+    state.ready = "error";
+    state.bootStatus = "error";
+    terminals.setText(pane.id, `[sgian] failed to attach workspace: ${formatted}\r\n`);
+    notify();
+    void refreshWorkspaceTargets();
+  }
+
+  async function connectMachine(name) {
+    const trimmed = String(name || "").trim();
+    if (!trimmed) return false;
+    targetSwitchSeq += 1;
+    const seq = targetSwitchSeq;
+    state.switchingTarget = trimmed;
+    state.targetError = null;
+    state.bootStatus = "connecting";
+    notify();
+    try {
+      const snapshot = await invokeWithTimeout(
+        "connect_machine",
+        { name: trimmed },
+        CONNECT_MACHINE_TIMEOUT_MS,
+      );
+      if (stopped || seq !== targetSwitchSeq) return false;
+      await applySwitchedSnapshot(snapshot, trimmed);
+      return true;
+    } catch (error) {
+      if (stopped || seq !== targetSwitchSeq) return false;
+      applySwitchedError(error, trimmed);
+      return false;
+    }
+  }
+
+  async function connectLocalWorkspace(workspace = null) {
+    targetSwitchSeq += 1;
+    const seq = targetSwitchSeq;
+    state.switchingTarget = "local";
+    state.targetError = null;
+    state.bootStatus = "connecting";
+    notify();
+    try {
+      const args = workspace ? { workspace: String(workspace) } : {};
+      const snapshot = await invokeWithTimeout(
+        "connect_local_workspace",
+        args,
+        BOOTSTRAP_TIMEOUT_MS,
+      );
+      if (stopped || seq !== targetSwitchSeq) return false;
+      await applySwitchedSnapshot(snapshot, null);
+      return true;
+    } catch (error) {
+      if (stopped || seq !== targetSwitchSeq) return false;
+      applySwitchedError(error, null);
+      return false;
+    }
+  }
+
+  async function retryTarget() {
+    if (state.activeMachine) {
+      return connectMachine(state.activeMachine);
+    }
+    return connectLocalWorkspace();
+  }
+
+  async function saveMachineClientToken(name, rawToken) {
+    const trimmedName = String(name || "").trim();
+    if (!trimmedName) return false;
+    const trimmedToken = typeof rawToken === "string" ? rawToken.trim() : "";
+    try {
+      await invokeWithTimeout("set_machine_client_token", {
+        name: trimmedName,
+        token: trimmedToken || null,
+      });
+      state.machineTokenStatus = trimmedToken
+        ? `Saved credential for ${trimmedName}.`
+        : `Cleared credential for ${trimmedName}.`;
+      await refreshWorkspaceTargets();
+      if (state.activeMachine === trimmedName) {
+        await connectMachine(trimmedName);
+      } else {
+        notify();
+      }
+      return true;
+    } catch (error) {
+      state.machineTokenStatus = `Failed to update credential: ${formatError(error)}`;
+      notify();
+      return false;
+    }
   }
 
   function startPeriodicResync() {
@@ -846,6 +1077,8 @@ export function createAppController({
   async function resyncWorkspace() {
     if (resyncInFlight || pendingLocalCreates > 0) return;
     if (
+      state.switchingTarget ||
+      state.targetError ||
       state.settingsModalOpen ||
       state.paletteOpen ||
       state.overviewOpen ||
@@ -1329,6 +1562,7 @@ export function createAppController({
     state.paletteFocusRestore = document.activeElement;
     state.paletteOpen = true;
     notify();
+    void refreshWorkspaceTargets();
   }
 
   function closePalette() {
@@ -1344,6 +1578,7 @@ export function createAppController({
     state.overviewFocusRestore = document.activeElement;
     state.overviewOpen = true;
     notify();
+    void refreshWorkspaceTargets();
   }
 
   function closeOverview() {
@@ -1366,12 +1601,14 @@ export function createAppController({
     state.settingsTouched = new Set();
     state.settingsErrors = {};
     state.settingsError = "";
+    state.machineTokenStatus = "";
     // Do not expose values from the previous open while the fresh full config
     // request is in flight; otherwise a fast submit can pair stale form data
     // with stale passthrough fields.
     state.settingsValues = populateFormFromConfig(null);
     state.settingsPassthroughConfig = {};
     notify();
+    void refreshWorkspaceTargets();
     void loadAppearanceConfig().then(loadSettingsConfig);
   }
 
@@ -1836,6 +2073,11 @@ export function createAppController({
     searchPrevious,
     installUpdate,
     dismissUpdate,
+    refreshWorkspaceTargets,
+    connectMachine,
+    connectLocalWorkspace,
+    retryTarget,
+    saveMachineClientToken,
     handleGlobalKey,
     focusActiveSurface,
     handleGlobalError,

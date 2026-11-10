@@ -9,6 +9,10 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "bootstrap_workspace",
+            "list_saved_machines",
+            "connect_machine",
+            "connect_local_workspace",
+            "set_machine_client_token",
             "create_pane",
             "close_pane",
             "rename_pane",

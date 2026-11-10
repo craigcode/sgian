@@ -71,6 +71,7 @@ impl TestDaemon {
             auto_spawn: false,
             client_token: None,
             tcp_endpoint: None,
+            machine_reconnect: None,
         }
     }
 

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-saved-machines"
+description = "Enables the list_saved_machines command without any pre-configured scope."
+commands.allow = ["list_saved_machines"]
+
+[[permission]]
+identifier = "deny-list-saved-machines"
+description = "Denies the list_saved_machines command without any pre-configured scope."
+commands.deny = ["list_saved_machines"]

@@ -374,6 +374,7 @@ fn catchup_delivers_every_ended_pane_above_queue_limit() {
         auto_spawn: false,
         client_token: None,
         tcp_endpoint: None,
+        machine_reconnect: None,
     };
 
     // Subscribe — the catch-up should push a PaneEnded for every ended pane.
@@ -628,6 +629,7 @@ fn concurrent_cold_start_yields_one_socket_owner() {
         auto_spawn: false,
         client_token: None,
         tcp_endpoint: None,
+        machine_reconnect: None,
     };
     let ok: CommandOk = client
         .request(DaemonRequest::Ping)
@@ -712,6 +714,7 @@ fn clean_shutdown_releases_daemon_lock() {
         auto_spawn: false,
         client_token: None,
         tcp_endpoint: None,
+        machine_reconnect: None,
     };
     let _: CommandOk = client
         .request(DaemonRequest::Shutdown)
@@ -813,6 +816,7 @@ fn respawn_after_shutdown_waits_for_lock_then_binds() {
         auto_spawn: false,
         client_token: None,
         tcp_endpoint: None,
+        machine_reconnect: None,
     };
     let ok: CommandOk = client
         .request(DaemonRequest::Ping)
@@ -1015,6 +1019,7 @@ fn ensure_daemon_refuses_to_unlink_wedged_daemon_socket() {
         auto_spawn: true,
         client_token: None,
         tcp_endpoint: None,
+        machine_reconnect: None,
     };
     let error = client
         .ensure_daemon()
@@ -1049,6 +1054,7 @@ fn ensure_daemon_removes_stale_socket_when_lock_is_free() {
         auto_spawn: true,
         client_token: None,
         tcp_endpoint: None,
+        machine_reconnect: None,
     };
     let error = client
         .ensure_daemon()
@@ -1629,6 +1635,7 @@ fn corrupt_workspace_json_handled_gracefully() {
         auto_spawn: false,
         client_token: None,
         tcp_endpoint: None,
+        machine_reconnect: None,
     };
     let _: Pane = client
         .request(DaemonRequest::CreatePane {
@@ -1669,6 +1676,7 @@ fn corrupt_workspace_json_handled_gracefully() {
         auto_spawn: false,
         client_token: None,
         tcp_endpoint: None,
+        machine_reconnect: None,
     };
 
     // Bootstrap should succeed (reseed to fresh workspace).

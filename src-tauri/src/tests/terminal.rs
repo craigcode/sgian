@@ -1379,6 +1379,7 @@ fn native_ipc_discovery_exposes_location_but_never_token() {
         auto_spawn: false,
         client_token: None,
         tcp_endpoint: None,
+        machine_reconnect: None,
     };
 
     let info = native_ipc_endpoint(&client).expect("discovery metadata");
