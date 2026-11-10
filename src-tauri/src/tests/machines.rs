@@ -408,6 +408,7 @@ fn loopback_tcp_listener_requires_client_token_and_serves_framed_ipc() {
         auto_spawn: false,
         client_token: Some(client_token.clone()),
         tcp_endpoint: Some(addr),
+        machine_reconnect: None,
     };
 
     let whoami: Value = tcp_client
@@ -699,5 +700,351 @@ fn ssh_tunnel_manager_attaches_to_remote_windows_loopback_daemon_and_reuses_tunn
         true,
     );
     let _ = bridge_thread2.join();
+    daemon.shutdown();
+}
+
+#[test]
+fn gui_startup_target_resolution_covers_flags_env_smoke_and_conflicts() {
+    let default_ws = PathBuf::from("/work/default");
+
+    let (local, target, err) =
+        resolve_gui_startup_target_from(&["sgian".into()], None, default_ws.clone(), false);
+    assert_eq!(local, default_ws);
+    assert_eq!(target, WorkspaceTarget::Local(default_ws.clone()));
+    assert!(err.is_none());
+
+    let (local, target, err) = resolve_gui_startup_target_from(
+        &["sgian".into(), "--machine".into(), "gpu-box".into()],
+        None,
+        default_ws.clone(),
+        false,
+    );
+    assert_eq!(local, default_ws);
+    assert_eq!(target, WorkspaceTarget::Machine("gpu-box".to_string()));
+    assert!(err.is_none());
+
+    let (local, target, err) = resolve_gui_startup_target_from(
+        &["sgian".into(), "--workspace=/work/other".into()],
+        Some("gpu-box"),
+        default_ws.clone(),
+        false,
+    );
+    assert_eq!(local, PathBuf::from("/work/other"));
+    assert_eq!(target, WorkspaceTarget::Local(PathBuf::from("/work/other")));
+    assert!(err.is_none());
+
+    // SGIAN_MACHINE applies when no CLI target is given, EXCEPT under UI smoke!
+    let (_, target, err) = resolve_gui_startup_target_from(
+        &["sgian".into()],
+        Some("gpu-box"),
+        default_ws.clone(),
+        false,
+    );
+    assert_eq!(target, WorkspaceTarget::Machine("gpu-box".to_string()));
+    assert!(err.is_none());
+
+    let (_, smoke_target, smoke_err) = resolve_gui_startup_target_from(
+        &["sgian".into()],
+        Some("gpu-box"),
+        default_ws.clone(),
+        true,
+    );
+    assert_eq!(smoke_target, WorkspaceTarget::Local(default_ws.clone()));
+    assert!(smoke_err.is_none());
+
+    let (_, _, conflict_err) = resolve_gui_startup_target_from(
+        &[
+            "sgian".into(),
+            "--workspace".into(),
+            "/work/other".into(),
+            "-m".into(),
+            "gpu-box".into(),
+        ],
+        None,
+        default_ws,
+        false,
+    );
+    assert!(conflict_err
+        .as_deref()
+        .unwrap_or("")
+        .contains("cannot be used together"));
+}
+
+#[test]
+fn machine_token_gui_helper_writes_clears_and_refuses_external_token_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let app_dir = dir.path();
+
+    let add_managed = parse_machine_args(&[
+        "add".into(),
+        "gpu".into(),
+        "--host".into(),
+        "op@gpu.example".into(),
+        "--workspace".into(),
+        "/srv/gpu".into(),
+    ])
+    .unwrap();
+    control_machine_in(app_dir, add_managed, std::io::empty(), true).unwrap();
+
+    let add_ext = parse_machine_args(&[
+        "add".into(),
+        "ext".into(),
+        "--host".into(),
+        "op@ext.example".into(),
+        "--workspace".into(),
+        "/srv/ext".into(),
+        "--token-file".into(),
+        "/etc/sgian/ext.tok".into(),
+    ])
+    .unwrap();
+    control_machine_in(app_dir, add_ext, std::io::empty(), true).unwrap();
+
+    let statuses = list_saved_machine_statuses_in(app_dir).unwrap();
+    assert_eq!(statuses.len(), 2);
+    assert!(
+        !statuses
+            .iter()
+            .find(|s| s.name == "gpu")
+            .unwrap()
+            .token_configured
+    );
+
+    let issued_val = format!("sgc_{}", "c".repeat(64));
+    set_or_clear_machine_token_in(app_dir, "gpu", Some(&issued_val)).unwrap();
+    let statuses = list_saved_machine_statuses_in(app_dir).unwrap();
+    assert!(
+        statuses
+            .iter()
+            .find(|s| s.name == "gpu")
+            .unwrap()
+            .token_configured
+    );
+
+    set_or_clear_machine_token_in(app_dir, "gpu", Some("   ")).unwrap();
+    let statuses = list_saved_machine_statuses_in(app_dir).unwrap();
+    assert!(
+        !statuses
+            .iter()
+            .find(|s| s.name == "gpu")
+            .unwrap()
+            .token_configured
+    );
+
+    let ext_err = set_or_clear_machine_token_in(app_dir, "ext", Some(&issued_val)).unwrap_err();
+    assert!(ext_err.contains("external token_file"));
+
+    let unknown_err =
+        set_or_clear_machine_token_in(app_dir, "missing", Some(&issued_val)).unwrap_err();
+    assert!(unknown_err.contains("unknown machine"));
+}
+
+#[test]
+fn subscription_handle_cancel_wakes_parked_subscriber_and_exits_worker() {
+    let daemon = TestDaemon::spawn(Config {
+        shell: Some("/bin/cat".to_string()),
+        ..Default::default()
+    });
+    let client = daemon.client();
+
+    let received = Arc::new(AtomicUsize::new(0));
+    let received_sink = Arc::clone(&received);
+    let worker_alive = Arc::new(());
+    let worker_alive_closure = Arc::clone(&worker_alive);
+    let handle = client.start_subscription_with_sink(move |_event| {
+        let _keep = &worker_alive_closure;
+        received_sink.fetch_add(1, Ordering::SeqCst);
+    });
+
+    // Trigger panes until the subscriber is live and has observed at least 1 event.
+    let event_deadline = Instant::now() + Duration::from_secs(3);
+    let mut seq = 0usize;
+    while received.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < event_deadline,
+            "subscriber did not receive PaneCreated event"
+        );
+        seq += 1;
+        let _: Value = client
+            .request(DaemonRequest::CreatePane {
+                title: Some(format!("sub-test-{seq}")),
+                profile: None,
+            })
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(Arc::strong_count(&worker_alive), 2);
+
+    // Cancelling shuts down the parked socket and exits the background worker thread,
+    // dropping the closure (`strong_count == 1`).
+    handle.cancel();
+    let exit_deadline = Instant::now() + Duration::from_secs(3);
+    while Arc::strong_count(&worker_alive) > 1 {
+        assert!(
+            Instant::now() < exit_deadline,
+            "subscription worker thread did not exit promptly after cancel()"
+        );
+        thread::sleep(Duration::from_millis(15));
+    }
+
+    let after_cancel = received.load(Ordering::SeqCst);
+    let _: Value = client
+        .request(DaemonRequest::CreatePane {
+            title: Some("post-cancel".to_string()),
+            profile: None,
+        })
+        .unwrap();
+    thread::sleep(Duration::from_millis(40));
+    assert_eq!(received.load(Ordering::SeqCst), after_cancel);
+    daemon.shutdown();
+}
+
+#[test]
+fn serve_http_hides_saved_machines_and_refuses_desktop_switch_commands() {
+    assert_eq!(
+        serve_http::frontend_command("list_saved_machines", &json!({}), "op@host").unwrap(),
+        serve_http::FrontendCall::SavedMachinesEmpty
+    );
+    for cmd in [
+        "connect_machine",
+        "connect_local_workspace",
+        "set_machine_client_token",
+    ] {
+        assert!(matches!(
+            serve_http::frontend_command(cmd, &json!({}), "op@host").unwrap(),
+            serve_http::FrontendCall::Unsupported(_)
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_client_machine_reconnect_recovers_after_tunnel_drop() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let daemon = TestDaemon::spawn(Config {
+        shell: Some("/bin/cat".to_string()),
+        remote_loopback_port: Some(0),
+        ..Default::default()
+    });
+    let local_admin = daemon.client();
+    let loopback_port = native_ipc_endpoint(&local_admin)
+        .expect("endpoint")
+        .loopback_port
+        .expect("loopback_port");
+
+    let issued: Value = local_admin
+        .request(DaemonRequest::IdentityIssue {
+            holder: "reconnect-op".to_string(),
+            scopes: vec!["read".to_string(), "write".to_string()],
+        })
+        .expect("issue credential");
+    let credential_val = issued["token"].as_str().unwrap().to_string();
+
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let app_dir = root.path().join("app");
+    fs::create_dir_all(&app_dir).unwrap();
+
+    let ssh_log = root.path().join("ssh.log");
+    let tunnel_req_path = root.path().join("tunnel.req");
+    let keepalive_path = root.path().join("keepalive");
+    fs::write(&keepalive_path, "1").unwrap();
+
+    let endpoint_json_path = root.path().join("endpoint.json");
+    fs::write(
+        &endpoint_json_path,
+        serde_json::to_vec(&json!({
+            "transport": "named_pipe",
+            "endpoint": "\\\\.\\pipe\\sgian2-reconnect-0001",
+            "token_path": "C:\\Users\\op\\AppData\\Roaming\\Sgian\\workspaces\\w\\daemon.token",
+            "workspace": "C:\\Users\\op\\repo",
+            "workspace_key": "ws-reconnect",
+            "protocol_version": PROTOCOL_VERSION,
+            "capabilities": ["subscribe-ack"],
+            "loopback_port": loopback_port,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let fake_ssh = root.path().join("fake-ssh.sh");
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$@\" >> \"{}\"\n\
+         case \"$*\" in\n\
+           *ipc-endpoint*)\n\
+             cat \"{}\"\n\
+             exit 0\n\
+             ;;\n\
+         esac\n\
+         prev=\"\"\n\
+         spec=\"\"\n\
+         for arg in \"$@\"; do\n\
+           if [ \"$prev\" = \"-L\" ]; then spec=\"$arg\"; break; fi\n\
+           prev=\"$arg\"\n\
+         done\n\
+         printf '%s' \"$spec\" > \"{}.tmp\"\n\
+         mv \"{}.tmp\" \"{}\"\n\
+         while [ -f \"{}\" ]; do sleep 0.05; done\n",
+        ssh_log.display(),
+        endpoint_json_path.display(),
+        tunnel_req_path.display(),
+        tunnel_req_path.display(),
+        tunnel_req_path.display(),
+        keepalive_path.display(),
+    );
+    fs::write(&fake_ssh, script).unwrap();
+    fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let add_cmd = parse_machine_args(&[
+        "add".into(),
+        "reconn".into(),
+        "--host".into(),
+        "dev@reconn.example".into(),
+        "--workspace".into(),
+        "/srv/reconn".into(),
+    ])
+    .unwrap();
+    control_machine_in(&app_dir, add_cmd, std::io::empty(), true).unwrap();
+    write_machine_token_in(&app_dir, "reconn", &credential_val).unwrap();
+
+    let stop_bridge1 = Arc::new(AtomicBool::new(false));
+    let bridge1 = spawn_test_unix_to_tcp_bridge(tunnel_req_path.clone(), Arc::clone(&stop_bridge1));
+
+    let (remote_client, local_ep) =
+        ensure_machine_client_with_ssh_in(&app_dir, "reconn", Some(fake_ssh.to_str().unwrap()))
+            .expect("initial tunnel should connect");
+    let ok: CommandOk = remote_client.request(DaemonRequest::Ping).unwrap();
+    assert!(ok.ok);
+
+    // Simulate a dropped SSH tunnel: stop the first bridge, remove the forwarded
+    // unix socket, terminate the first fake-ssh process, and arm a fresh bridge watcher
+    // for the re-spawned tunnel.
+    stop_bridge1.store(true, Ordering::SeqCst);
+    let _ = bridge1.join();
+    let _ = fs::remove_file(&keepalive_path);
+    thread::sleep(Duration::from_millis(100));
+    let _ = fs::remove_file(&local_ep.endpoint);
+    let _ = fs::remove_file(&tunnel_req_path);
+    fs::write(&keepalive_path, "1").unwrap();
+
+    let stop_bridge2 = Arc::new(AtomicBool::new(false));
+    let bridge2 = spawn_test_unix_to_tcp_bridge(tunnel_req_path.clone(), Arc::clone(&stop_bridge2));
+
+    // `remote_client.request(Ping)` must automatically invoke `machine_reconnect`
+    // and succeed over the newly spawned tunnel!
+    let ok2: CommandOk = remote_client
+        .request(DaemonRequest::Ping)
+        .expect("DaemonClient with machine_reconnect should auto-recover dropped SSH tunnel");
+    assert!(ok2.ok);
+
+    let log_lines = fs::read_to_string(&ssh_log).unwrap();
+    assert!(
+        log_lines.lines().count() >= 4,
+        "expected second discovery + tunnel spawn on reconnect, got:\n{log_lines}"
+    );
+
+    let _ = fs::remove_file(&keepalive_path);
+    stop_bridge2.store(true, Ordering::SeqCst);
+    let _ = bridge2.join();
     daemon.shutdown();
 }

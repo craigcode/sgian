@@ -21,6 +21,7 @@ import {
   notesSummaryText,
 } from "./projects.js";
 import { buildPaletteCommands, filterPaletteCommands } from "./palette.js";
+import { formatMachineSubtitle, workspaceBasename } from "./machines.js";
 
 function paneLabel(pane, index) {
   return pane?.title?.trim() || `pane-${index + 1}`;
@@ -403,6 +404,65 @@ function Toolbar({ state, controller }) {
           {attentionPaneIds.length === 1 ? "s" : ""} input
         </button>
       )}
+    </div>
+  );
+}
+
+function MachineTargets({ state, controller }) {
+  const machines = state.savedMachines || [];
+  if (machines.length === 0 && state.activeMachine === null) return null;
+  const switching = Boolean(state.switchingTarget);
+  const localPath = state.localWorkspace || (!state.activeMachine ? state.cwd : "") || "workspace";
+  return (
+    <div id="machine-targets" className="machine-targets" role="group" aria-label="Workspace targets">
+      <div className="machine-targets-header">Machines</div>
+      <button
+        id="machine-target-local"
+        type="button"
+        className="machine-target-btn"
+        data-active={state.activeMachine === null}
+        disabled={switching}
+        title={localPath}
+        onClick={() => {
+          if (state.activeMachine !== null) void controller.connectLocalWorkspace();
+        }}
+      >
+        <span className="machine-target-dot machine-target-dot-local" aria-hidden="true" />
+        <span className="machine-target-copy">
+          <strong className="machine-target-name">{workspaceBasename(localPath)}</strong>
+          <span className="machine-target-sub">Local</span>
+        </span>
+      </button>
+      {machines.map((machine) => {
+        const active = state.activeMachine === machine.name;
+        const subtitle = formatMachineSubtitle(machine);
+        const dotClass =
+          active || machine.tunnel_present
+            ? "machine-target-dot-live"
+            : machine.token_configured || state.credentialFromEnv
+              ? "machine-target-dot-ready"
+              : "machine-target-dot-idle";
+        return (
+          <button
+            key={machine.name}
+            type="button"
+            className="machine-target-btn"
+            data-machine={machine.name}
+            data-active={active}
+            disabled={switching}
+            title={subtitle ? `${machine.name} — ${subtitle}` : machine.name}
+            onClick={() => {
+              if (!active || state.targetError) void controller.connectMachine(machine.name);
+            }}
+          >
+            <span className={`machine-target-dot ${dotClass}`} aria-hidden="true" />
+            <span className="machine-target-copy">
+              <strong className="machine-target-name">{machine.name}</strong>
+              {subtitle ? <span className="machine-target-sub">{subtitle}</span> : null}
+            </span>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -1336,6 +1396,15 @@ function SessionOverview({ state, controller }) {
           </button>
         </header>
         <div className="overview-body">
+          {((state.savedMachines && state.savedMachines.length > 0) || state.activeMachine !== null) && (
+            <div className="overview-target-bar">
+              <span>
+                Target:{" "}
+                <strong>{state.activeMachine ? `⇄ ${state.activeMachine}` : "Local"}</strong>{" "}
+                ({state.cwd})
+              </span>
+            </div>
+          )}
           {panes.length === 0 ? (
             <p className="overview-empty">No panes in this workspace.</p>
           ) : (
@@ -1412,6 +1481,147 @@ function SessionOverview({ state, controller }) {
   );
 }
 
+function MachineSettingsSection({ state, controller }) {
+  const machines = state.savedMachines || [];
+  const hasRemoteContext = machines.length > 0 || state.activeMachine !== null;
+  const [selectedName, setSelectedName] = useState(
+    () => state.activeMachine || machines[0]?.name || "",
+  );
+  const [tokenDraft, setTokenDraft] = useState("");
+
+  useEffect(() => {
+    if (!state.settingsModalOpen) {
+      setTokenDraft("");
+      return;
+    }
+    if (state.activeMachine) {
+      setSelectedName(state.activeMachine);
+    } else if (machines.length > 0 && !machines.some((m) => m.name === selectedName)) {
+      setSelectedName(machines[0].name);
+    }
+  }, [state.settingsModalOpen, state.activeMachine, machines, selectedName]);
+
+  if (!hasRemoteContext) return null;
+
+  const effectiveName =
+    (machines.some((m) => m.name === selectedName) && selectedName) ||
+    state.activeMachine ||
+    machines[0]?.name ||
+    "";
+  const selectedMachine = machines.find((m) => m.name === effectiveName) || null;
+  const trimmedToken = tokenDraft.trim();
+
+  let tokenHint = "No per-machine credential stored yet.";
+  if (state.credentialFromEnv) {
+    tokenHint =
+      "SGIAN_CLIENT_TOKEN is set in the environment and overrides stored per-machine tokens.";
+  } else if (selectedMachine?.token_file) {
+    tokenHint = `Reads external token_file: ${selectedMachine.token_file}`;
+  } else if (selectedMachine?.token_configured) {
+    tokenHint = "Per-machine credential stored (0600).";
+  }
+
+  return (
+    <section className="settings-machines-section" aria-label="Remote machines">
+      <div className="settings-machines-header">
+        <h3 className="settings-machines-title">Remote machines</h3>
+        {state.activeMachine ? (
+          <button
+            id="settings-switch-local"
+            type="button"
+            className="modal-button"
+            disabled={Boolean(state.switchingTarget)}
+            onClick={() => void controller.connectLocalWorkspace()}
+          >
+            Switch to local workspace
+          </button>
+        ) : null}
+      </div>
+      <p className="settings-machines-meta">
+        Acting as <strong>{state.holder || "default"}</strong> · Active target:{" "}
+        <strong>{state.activeMachine || "local workspace"}</strong>
+      </p>
+      {machines.length > 0 ? (
+        <>
+          <div className="form-field">
+            <label className="form-label" htmlFor="settings-machine-select">
+              Saved machine
+            </label>
+            <select
+              id="settings-machine-select"
+              value={effectiveName}
+              onChange={(event) => {
+                setSelectedName(event.target.value);
+                setTokenDraft("");
+              }}
+            >
+              {machines.map((machine) => {
+                const sub = formatMachineSubtitle(machine);
+                return (
+                  <option key={machine.name} value={machine.name}>
+                    {sub ? `${machine.name} (${sub})` : machine.name}
+                  </option>
+                );
+              })}
+            </select>
+          </div>
+          <p className="settings-machines-hint">{tokenHint}</p>
+          {!selectedMachine?.token_file ? (
+            <div className="form-field">
+              <label className="form-label" htmlFor="settings-machine-token">
+                Client token for {effectiveName}
+              </label>
+              <div className="settings-machine-token-row">
+                <input
+                  id="settings-machine-token"
+                  type="password"
+                  placeholder="sgc_…"
+                  autoComplete="off"
+                  value={tokenDraft}
+                  onChange={(event) => setTokenDraft(event.target.value)}
+                />
+                <button
+                  id="settings-machine-token-save"
+                  type="button"
+                  className="modal-button primary"
+                  disabled={!effectiveName || !trimmedToken}
+                  onClick={() => {
+                    void controller
+                      .saveMachineClientToken(effectiveName, trimmedToken)
+                      .then((ok) => {
+                        if (ok) setTokenDraft("");
+                      });
+                  }}
+                >
+                  Save token
+                </button>
+                <button
+                  id="settings-machine-token-clear"
+                  type="button"
+                  className="modal-button"
+                  disabled={!effectiveName || !selectedMachine?.token_configured}
+                  onClick={() => {
+                    void controller.saveMachineClientToken(effectiveName, "").then((ok) => {
+                      if (ok) setTokenDraft("");
+                    });
+                  }}
+                >
+                  Forget token
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {state.machineTokenStatus ? (
+            <p id="settings-machine-token-status" className="settings-machine-status">
+              {state.machineTokenStatus}
+            </p>
+          ) : null}
+        </>
+      ) : null}
+    </section>
+  );
+}
+
 function SettingsDialog({ state, controller }) {
   const modalRef = useRef(null);
   useLayoutEffect(() => {
@@ -1478,60 +1688,63 @@ function SettingsDialog({ state, controller }) {
             ×
           </button>
         </header>
-        <form
-          id="settings-form"
-          className="modal-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void controller.saveSettings(formValues(event.currentTarget));
-          }}
-        >
-          <SettingsField name="shell" label="Shell" error={state.settingsErrors.shell}>
-            <input id="cfg-shell" name="shell" type="text" placeholder="/bin/bash" autoComplete="off" value={values.shell} onChange={update("shell")} />
-          </SettingsField>
-          <SettingsField name="shell_args" label="Shell args (one per line)" error={state.settingsErrors.shell_args}>
-            <textarea id="cfg-shell-args" name="shell_args" rows={2} placeholder="-l" value={values.shell_args} onChange={update("shell_args")} />
-          </SettingsField>
-          <SettingsField name="env" label="Environment (KEY=VALUE per line)" error={state.settingsErrors.env}>
-            <textarea id="cfg-env" name="env" rows={3} placeholder="FOO=bar" value={values.env} onChange={update("env")} />
-          </SettingsField>
-          <SettingsField name="font_family" label="Font family" error={state.settingsErrors.font_family}>
-            <input id="cfg-font-family" name="font_family" type="text" placeholder="Menlo" autoComplete="off" value={values.font_family} onChange={update("font_family")} />
-          </SettingsField>
-          <SettingsField name="font_size" label="Font size" error={state.settingsErrors.font_size}>
-            <input id="cfg-font-size" name="font_size" type="number" min="1" placeholder="12" autoComplete="off" value={values.font_size} onChange={update("font_size")} />
-          </SettingsField>
-          <SettingsField name="theme" label="Theme (JSON object)" error={state.settingsErrors.theme}>
-            <textarea id="cfg-theme" name="theme" rows={4} placeholder='{"background":"#000"}' value={values.theme} onChange={update("theme")} />
-          </SettingsField>
-          <SettingsField name="profiles" label="Profiles (JSON array)" error={state.settingsErrors.profiles}>
-            <textarea
-              id="cfg-profiles"
-              name="profiles"
-              rows={4}
-              placeholder='[{"name":"dev","kind":"shell","shell":"/bin/bash"}]'
-              value={values.profiles}
-              onChange={update("profiles")}
-            />
-          </SettingsField>
-          <SettingsField name="idle_shutdown_secs" label="Idle shutdown (seconds, 0 = disabled)" error={state.settingsErrors.idle_shutdown_secs}>
-            <input id="cfg-idle-shutdown" name="idle_shutdown_secs" type="number" min="0" placeholder="0" autoComplete="off" value={values.idle_shutdown_secs} onChange={update("idle_shutdown_secs")} />
-          </SettingsField>
-          <SettingsField name="restore_policy" label="Restore policy" error={state.settingsErrors.restore_policy}>
-            <select id="cfg-restore-policy" name="restore_policy" value={values.restore_policy} onChange={update("restore_policy")}>
-              <option value="">(default)</option>
-              <option value="auto_respawn">auto_respawn</option>
-              <option value="restore_on_demand">restore_on_demand</option>
-            </select>
-          </SettingsField>
-          <div id="settings-error" className="modal-error" role="alert" hidden={!state.settingsError}>
-            {state.settingsError}
-          </div>
-          <footer className="modal-footer">
-            <button id="settings-cancel" className="modal-button" type="button" onClick={controller.closeSettingsModal}>Cancel</button>
-            <button id="settings-save" className="modal-button primary" type="submit" disabled={state.settingsLoadFailed || !state.settingsLoaded}>Save</button>
-          </footer>
-        </form>
+        <div className="settings-scroll-body">
+          <form
+            id="settings-form"
+            className="modal-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void controller.saveSettings(formValues(event.currentTarget));
+            }}
+          >
+            <SettingsField name="shell" label="Shell" error={state.settingsErrors.shell}>
+              <input id="cfg-shell" name="shell" type="text" placeholder="/bin/bash" autoComplete="off" value={values.shell} onChange={update("shell")} />
+            </SettingsField>
+            <SettingsField name="shell_args" label="Shell args (one per line)" error={state.settingsErrors.shell_args}>
+              <textarea id="cfg-shell-args" name="shell_args" rows={2} placeholder="-l" value={values.shell_args} onChange={update("shell_args")} />
+            </SettingsField>
+            <SettingsField name="env" label="Environment (KEY=VALUE per line)" error={state.settingsErrors.env}>
+              <textarea id="cfg-env" name="env" rows={3} placeholder="FOO=bar" value={values.env} onChange={update("env")} />
+            </SettingsField>
+            <SettingsField name="font_family" label="Font family" error={state.settingsErrors.font_family}>
+              <input id="cfg-font-family" name="font_family" type="text" placeholder="Menlo" autoComplete="off" value={values.font_family} onChange={update("font_family")} />
+            </SettingsField>
+            <SettingsField name="font_size" label="Font size" error={state.settingsErrors.font_size}>
+              <input id="cfg-font-size" name="font_size" type="number" min="1" placeholder="12" autoComplete="off" value={values.font_size} onChange={update("font_size")} />
+            </SettingsField>
+            <SettingsField name="theme" label="Theme (JSON object)" error={state.settingsErrors.theme}>
+              <textarea id="cfg-theme" name="theme" rows={4} placeholder='{"background":"#000"}' value={values.theme} onChange={update("theme")} />
+            </SettingsField>
+            <SettingsField name="profiles" label="Profiles (JSON array)" error={state.settingsErrors.profiles}>
+              <textarea
+                id="cfg-profiles"
+                name="profiles"
+                rows={4}
+                placeholder='[{"name":"dev","kind":"shell","shell":"/bin/bash"}]'
+                value={values.profiles}
+                onChange={update("profiles")}
+              />
+            </SettingsField>
+            <SettingsField name="idle_shutdown_secs" label="Idle shutdown (seconds, 0 = disabled)" error={state.settingsErrors.idle_shutdown_secs}>
+              <input id="cfg-idle-shutdown" name="idle_shutdown_secs" type="number" min="0" placeholder="0" autoComplete="off" value={values.idle_shutdown_secs} onChange={update("idle_shutdown_secs")} />
+            </SettingsField>
+            <SettingsField name="restore_policy" label="Restore policy" error={state.settingsErrors.restore_policy}>
+              <select id="cfg-restore-policy" name="restore_policy" value={values.restore_policy} onChange={update("restore_policy")}>
+                <option value="">(default)</option>
+                <option value="auto_respawn">auto_respawn</option>
+                <option value="restore_on_demand">restore_on_demand</option>
+              </select>
+            </SettingsField>
+            <div id="settings-error" className="modal-error" role="alert" hidden={!state.settingsError}>
+              {state.settingsError}
+            </div>
+            <footer className="modal-footer">
+              <button id="settings-cancel" className="modal-button" type="button" onClick={controller.closeSettingsModal}>Cancel</button>
+              <button id="settings-save" className="modal-button primary" type="submit" disabled={state.settingsLoadFailed || !state.settingsLoaded}>Save</button>
+            </footer>
+          </form>
+          <MachineSettingsSection state={state} controller={controller} />
+        </div>
       </div>
     </div>
   );
@@ -1593,16 +1806,65 @@ export function App({ controller }) {
           <div className="brand">
             <div className="brand-mark" aria-hidden="true">S2</div>
             <div>
-              <h1>Sgian</h1>
+              <div className="brand-title-row">
+                <h1>Sgian</h1>
+                {state.activeMachine ? (
+                  <span
+                    id="active-machine-badge"
+                    className="machine-badge"
+                    title={`Attached to remote machine ${state.activeMachine}`}
+                  >
+                    ⇄ {state.activeMachine}
+                  </span>
+                ) : null}
+              </div>
               <p id="workspace-cwd">{state.cwd}</p>
             </div>
           </div>
           <Toolbar state={state} controller={controller} />
         </header>
         <aside className="rail" aria-label="Panes">
+          <MachineTargets state={state} controller={controller} />
           <PaneTabs state={state} controller={controller} />
         </aside>
         <section className="workbench" aria-label="Pane workbench">
+          {state.targetError ? (
+            <div id="target-error-banner" className="target-error-banner" role="alert">
+              <span className="target-error-text">{state.targetError}</span>
+              <div className="target-error-actions">
+                <button
+                  id="target-error-retry"
+                  type="button"
+                  className="target-error-btn"
+                  disabled={Boolean(state.switchingTarget)}
+                  onClick={() => void controller.retryTarget()}
+                >
+                  Retry
+                </button>
+                {state.activeMachine ? (
+                  <button
+                    id="target-error-set-token"
+                    type="button"
+                    className="target-error-btn"
+                    onClick={() => controller.openSettingsModal()}
+                  >
+                    Set token…
+                  </button>
+                ) : null}
+                {state.activeMachine ? (
+                  <button
+                    id="target-error-switch-local"
+                    type="button"
+                    className="target-error-btn"
+                    disabled={Boolean(state.switchingTarget)}
+                    onClick={() => void controller.connectLocalWorkspace()}
+                  >
+                    Switch to local workspace
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
           <div id="layout-root" className="layout-root" data-zoom={zoom}>
             {state.layout && (
               <SplitNode node={state.layout} state={state} controller={controller} />

@@ -8,8 +8,19 @@ function createController({
   updateVersion = null,
   focusNextAttentionPane = true,
   profiles = [],
+  savedMachines = [],
+  activeMachine = null,
+  localWorkspace = "/work/local",
 } = {}) {
-  const state = { activePaneId: "pane-1", updateVersion, profiles };
+  const state = {
+    activePaneId: "pane-1",
+    updateVersion,
+    profiles,
+    savedMachines,
+    activeMachine,
+    localWorkspace,
+    cwd: activeMachine ? "/remote/repo" : localWorkspace,
+  };
   const controller = {
     state,
     splitActive: vi.fn(),
@@ -26,6 +37,9 @@ function createController({
     takeLease: vi.fn(),
     openReleaseDialog: vi.fn(),
     toggleScreenReaderMode: vi.fn(),
+    connectMachine: vi.fn(),
+    connectLocalWorkspace: vi.fn(),
+    refreshWorkspaceTargets: vi.fn(),
   };
   if (focusNextAttentionPane) {
     controller.focusNextAttentionPane = vi.fn();
@@ -175,5 +189,31 @@ describe("keyboard lease palette commands", () => {
     expect(controller.takeLease).toHaveBeenCalledWith("pane-1");
     commands.find((command) => command.id === "lease-release").run();
     expect(controller.openReleaseDialog).toHaveBeenCalledWith("pane-1");
+  });
+});
+
+describe("saved machine palette commands", () => {
+  it("exposes switch-machine, switch-local-workspace, and reload-saved-machines", () => {
+    const controller = createController({
+      savedMachines: [
+        { name: "gpu", transport: "ssh", host: "op@gpu", workspace: "/srv/gpu" },
+      ],
+      activeMachine: "gpu",
+      localWorkspace: "/Users/op/sgian",
+    });
+    const commands = buildPaletteCommands(controller);
+    const switchRemote = commands.find((command) => command.id === "switch-machine-gpu");
+    expect(switchRemote?.label).toContain("gpu");
+    switchRemote.run();
+    expect(controller.connectMachine).toHaveBeenCalledWith("gpu");
+
+    const switchLocal = commands.find((command) => command.id === "switch-local-workspace");
+    expect(switchLocal?.label).toContain("sgian");
+    switchLocal.run();
+    expect(controller.connectLocalWorkspace).toHaveBeenCalledTimes(1);
+
+    const reload = commands.find((command) => command.id === "reload-saved-machines");
+    reload.run();
+    expect(controller.refreshWorkspaceTargets).toHaveBeenCalledTimes(1);
   });
 });

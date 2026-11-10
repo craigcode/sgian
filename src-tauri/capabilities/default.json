@@ -6,6 +6,10 @@
   "permissions": [
     "core:default",
     "allow-bootstrap-workspace",
+    "allow-list-saved-machines",
+    "allow-connect-machine",
+    "allow-connect-local-workspace",
+    "allow-set-machine-client-token",
     "allow-create-pane",
     "allow-close-pane",
     "allow-rename-pane",

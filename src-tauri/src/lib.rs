@@ -6634,58 +6634,340 @@ impl DaemonServer {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkspaceTarget {
+    Local(PathBuf),
+    Machine(String),
+}
+
+pub(crate) fn resolve_gui_startup_target_from(
+    args: &[String],
+    env_machine: Option<&str>,
+    default_local_cwd: PathBuf,
+    ui_smoke: bool,
+) -> (PathBuf, WorkspaceTarget, Option<String>) {
+    let mut cli_workspace: Option<PathBuf> = None;
+    let mut cli_machine: Option<String> = None;
+    let mut startup_error: Option<String> = None;
+    let mut idx = 1usize;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if let Some(eq_val) = arg.strip_prefix("--workspace=") {
+            if !eq_val.trim().is_empty() {
+                cli_workspace = Some(PathBuf::from(eq_val));
+            } else {
+                startup_error = Some("--workspace requires a directory path".to_string());
+            }
+            idx += 1;
+            continue;
+        }
+        if let Some(eq_val) = arg.strip_prefix("--machine=") {
+            if !eq_val.trim().is_empty() {
+                cli_machine = Some(eq_val.to_string());
+            } else {
+                startup_error = Some("--machine requires a saved machine name".to_string());
+            }
+            idx += 1;
+            continue;
+        }
+        match arg {
+            "--workspace" | "-w" => {
+                if let Some(val) = args.get(idx + 1).filter(|v| !v.trim().is_empty()) {
+                    cli_workspace = Some(PathBuf::from(val));
+                    idx += 2;
+                    continue;
+                }
+                startup_error = Some("--workspace requires a directory path".to_string());
+            }
+            "--machine" | "-m" => {
+                if let Some(val) = args.get(idx + 1).filter(|v| !v.trim().is_empty()) {
+                    cli_machine = Some(val.clone());
+                    idx += 2;
+                    continue;
+                }
+                startup_error = Some("--machine requires a saved machine name".to_string());
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    let local_cwd = cli_workspace
+        .clone()
+        .unwrap_or_else(|| default_local_cwd.clone());
+
+    if startup_error.is_some() {
+        return (
+            local_cwd.clone(),
+            WorkspaceTarget::Local(local_cwd),
+            startup_error,
+        );
+    }
+    if cli_workspace.is_some() && cli_machine.is_some() {
+        return (
+            local_cwd.clone(),
+            WorkspaceTarget::Local(local_cwd),
+            Some("--workspace and --machine cannot be used together".to_string()),
+        );
+    }
+    if let Some(raw_machine) = cli_machine {
+        return match validate_machine_name(&raw_machine) {
+            Ok(valid) => (local_cwd, WorkspaceTarget::Machine(valid), None),
+            Err(err) => (
+                local_cwd.clone(),
+                WorkspaceTarget::Local(local_cwd),
+                Some(err),
+            ),
+        };
+    }
+    if let Some(ws) = cli_workspace {
+        return (local_cwd, WorkspaceTarget::Local(ws), None);
+    }
+    if !ui_smoke {
+        if let Some(raw_env) = env_machine.map(str::trim).filter(|s| !s.is_empty()) {
+            return match validate_machine_name(raw_env) {
+                Ok(valid) => (local_cwd, WorkspaceTarget::Machine(valid), None),
+                Err(err) => (
+                    local_cwd.clone(),
+                    WorkspaceTarget::Local(local_cwd),
+                    Some(err),
+                ),
+            };
+        }
+    }
+    (local_cwd.clone(), WorkspaceTarget::Local(local_cwd), None)
+}
+
+struct ActiveSession {
+    target: WorkspaceTarget,
+    client: Option<DaemonClient>,
+    subscription: Option<SubscriptionHandle>,
+}
+
 pub struct AppState {
-    cwd: PathBuf,
-    daemon: Mutex<Option<DaemonClient>>,
-    subscription_started: Mutex<bool>,
+    local_cwd: Mutex<PathBuf>,
+    startup_error: Mutex<Option<String>>,
+    generation: AtomicU64,
+    session: Mutex<ActiveSession>,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn from_args(args: &[String]) -> Self {
+        let env_machine = std::env::var("SGIAN_MACHINE").ok();
+        let (local_cwd, target, startup_error) = resolve_gui_startup_target_from(
+            args,
+            env_machine.as_deref(),
+            resolve_workspace_dir(),
+            ui_smoke_env_enabled(),
+        );
         Self {
-            cwd: resolve_workspace_dir(),
-            daemon: Mutex::new(None),
-            subscription_started: Mutex::new(false),
+            local_cwd: Mutex::new(local_cwd),
+            startup_error: Mutex::new(startup_error),
+            generation: AtomicU64::new(1),
+            session: Mutex::new(ActiveSession {
+                target,
+                client: None,
+                subscription: None,
+            }),
         }
     }
 
-    /// Connect to (or spawn) the daemon lazily, caching the client. A failure is
-    /// returned to the calling command — which the frontend surfaces as a boot
-    /// error — instead of panicking the GUI process during startup.
+    fn connect_for_target(target: &WorkspaceTarget) -> Result<DaemonClient, String> {
+        match target {
+            WorkspaceTarget::Local(cwd) => DaemonClient::connect_or_spawn(cwd.clone()),
+            WorkspaceTarget::Machine(name) => DaemonClient::connect_machine(name),
+        }
+    }
+
+    /// Connect to (or spawn) the active target's daemon lazily off-lock, caching
+    /// the client only if the target generation did not advance meanwhile.
     fn client(&self) -> Result<DaemonClient, String> {
+        if let Ok(err_guard) = self.startup_error.lock() {
+            if let Some(ref err) = *err_guard {
+                return Err(err.clone());
+            }
+        }
+        let (target, generation) = {
+            let guard = self
+                .session
+                .lock()
+                .map_err(|_| "daemon state lock poisoned".to_string())?;
+            if let Some(ref client) = guard.client {
+                return Ok(client.clone());
+            }
+            (guard.target.clone(), self.generation.load(Ordering::SeqCst))
+        };
+        let client = Self::connect_for_target(&target)?;
         let mut guard = self
-            .daemon
+            .session
             .lock()
             .map_err(|_| "daemon state lock poisoned".to_string())?;
-        if let Some(client) = guard.as_ref() {
-            return Ok(client.clone());
+        if self.generation.load(Ordering::SeqCst) == generation && guard.target == target {
+            if let Some(ref existing) = guard.client {
+                return Ok(existing.clone());
+            }
+            guard.client = Some(client.clone());
         }
-        let client = DaemonClient::connect_or_spawn(self.cwd.clone())?;
-        *guard = Some(client.clone());
         Ok(client)
     }
 
     fn ensure_subscription(&self, app: AppHandle, client: &DaemonClient) {
-        let Ok(mut started) = self.subscription_started.lock() else {
+        let Ok(mut guard) = self.session.lock() else {
             return;
         };
-        if *started {
+        if guard.subscription.is_some() {
             return;
         }
-        client.start_subscription(app);
-        *started = true;
+        guard.subscription = Some(client.start_subscription(app));
+    }
+
+    fn switch_target(
+        &self,
+        app: AppHandle,
+        next: WorkspaceTarget,
+    ) -> Result<WorkspaceSnapshot, String> {
+        let next_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut err_guard) = self.startup_error.lock() {
+            *err_guard = None;
+        }
+        {
+            let mut guard = self
+                .session
+                .lock()
+                .map_err(|_| "daemon state lock poisoned".to_string())?;
+            if let Some(prev_sub) = guard.subscription.take() {
+                prev_sub.cancel();
+            }
+            guard.target = next.clone();
+            guard.client = None;
+        }
+        let client = Self::connect_for_target(&next)?;
+        let snapshot: WorkspaceSnapshot = client.request(DaemonRequest::BootstrapWorkspace)?;
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|_| "daemon state lock poisoned".to_string())?;
+        if self.generation.load(Ordering::SeqCst) != next_gen || guard.target != next {
+            return Err("workspace switch superseded by a newer request".to_string());
+        }
+        let sub = client.start_subscription(app);
+        guard.client = Some(client);
+        guard.subscription = Some(sub);
+        Ok(snapshot)
+    }
+
+    fn targets_snapshot(&self) -> Result<WorkspaceTargetsSnapshot, String> {
+        let local_workspace = self
+            .local_cwd
+            .lock()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let active_machine = self
+            .session
+            .lock()
+            .ok()
+            .and_then(|guard| match &guard.target {
+                WorkspaceTarget::Local(_) => None,
+                WorkspaceTarget::Machine(name) => Some(name.clone()),
+            });
+        let machines = list_saved_machine_statuses_in(&machines_support_dir())?;
+        Ok(WorkspaceTargetsSnapshot {
+            local_workspace,
+            active_machine,
+            credential_from_env: client_token_from_env().is_some(),
+            machines,
+        })
     }
 }
 
 #[tauri::command]
-fn bootstrap_workspace(
+async fn bootstrap_workspace(app: AppHandle) -> Result<WorkspaceSnapshot, String> {
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_clone.state::<AppState>();
+        let client = state.client()?;
+        let snapshot = client.request(DaemonRequest::BootstrapWorkspace)?;
+        state.ensure_subscription(app_clone.clone(), &client);
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|error| format!("bootstrap task failed: {error}"))?
+}
+
+#[tauri::command]
+fn list_saved_machines(state: State<'_, AppState>) -> Result<WorkspaceTargetsSnapshot, String> {
+    state.targets_snapshot()
+}
+
+#[tauri::command]
+async fn connect_machine(name: String, app: AppHandle) -> Result<WorkspaceSnapshot, String> {
+    let valid_name = validate_machine_name(&name)?;
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_clone.state::<AppState>();
+        state.switch_target(app_clone.clone(), WorkspaceTarget::Machine(valid_name))
+    })
+    .await
+    .map_err(|error| format!("connect_machine task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn connect_local_workspace(
+    workspace: Option<String>,
     app: AppHandle,
-    state: State<'_, AppState>,
 ) -> Result<WorkspaceSnapshot, String> {
-    let client = state.client()?;
-    let snapshot = client.request(DaemonRequest::BootstrapWorkspace)?;
-    state.ensure_subscription(app, &client);
-    Ok(snapshot)
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_clone.state::<AppState>();
+        let target_path = if let Some(raw) = workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let candidate = PathBuf::from(raw);
+            let canonical = candidate
+                .canonicalize()
+                .map_err(|error| format!("workspace '{}': {error}", candidate.display()))?;
+            if !canonical.is_dir() {
+                return Err(format!(
+                    "workspace '{}' is not a directory",
+                    canonical.display()
+                ));
+            }
+            if let Ok(mut local_guard) = state.local_cwd.lock() {
+                *local_guard = canonical.clone();
+            }
+            canonical
+        } else {
+            state
+                .local_cwd
+                .lock()
+                .map_err(|_| "local workspace lock poisoned".to_string())?
+                .clone()
+        };
+        state.switch_target(app_clone.clone(), WorkspaceTarget::Local(target_path))
+    })
+    .await
+    .map_err(|error| format!("connect_local_workspace task failed: {error}"))?
+}
+
+#[tauri::command]
+fn set_machine_client_token(
+    name: String,
+    token: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<CommandOk, String> {
+    let valid_name = validate_machine_name(&name)?;
+    set_or_clear_machine_token_in(&machines_support_dir(), &valid_name, token.as_deref())?;
+    if let Ok(mut guard) = state.session.lock() {
+        if guard.target == WorkspaceTarget::Machine(valid_name) {
+            if let Some(sub) = guard.subscription.take() {
+                sub.cancel();
+            }
+            guard.client = None;
+        }
+    }
+    Ok(CommandOk { ok: true })
 }
 
 #[tauri::command]
@@ -7022,7 +7304,7 @@ pub fn run() {
     }
 
     tauri::Builder::default()
-        .manage(AppState::new())
+        .manage(AppState::from_args(&args))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
@@ -7032,6 +7314,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             bootstrap_workspace,
+            list_saved_machines,
+            connect_machine,
+            connect_local_workspace,
+            set_machine_client_token,
             create_pane,
             close_pane,
             rename_pane,

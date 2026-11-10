@@ -80,7 +80,10 @@ pub(crate) enum FrontendCall {
     Holder,
     /// `ui_smoke_enabled`: always false when served.
     SmokeDisabled,
-    /// Desktop-only commands (`install_update`, `complete_ui_smoke`).
+    /// `list_saved_machines`: empty list when served over HTTP so host SSH
+    /// machine topology is never exposed to served viewers.
+    SavedMachinesEmpty,
+    /// Desktop-only commands (`install_update`, `complete_ui_smoke`, workspace switching).
     Unsupported(&'static str),
 }
 
@@ -190,6 +193,12 @@ pub(crate) fn frontend_command(
         },
         "client_holder" => return Ok(FrontendCall::Holder),
         "ui_smoke_enabled" => return Ok(FrontendCall::SmokeDisabled),
+        "list_saved_machines" => return Ok(FrontendCall::SavedMachinesEmpty),
+        "connect_machine" | "connect_local_workspace" | "set_machine_client_token" => {
+            return Ok(FrontendCall::Unsupported(
+                "workspace switching is only available in the desktop app",
+            ))
+        }
         "install_update" => {
             return Ok(FrontendCall::Unsupported(
                 "updates are installed on the desk machine",
@@ -724,6 +733,12 @@ fn handle_connection(mut stream: std::net::TcpStream, session: &ServeSession) {
                 Err(error) => Err(error),
                 Ok(FrontendCall::Holder) => Ok(json!(holder)),
                 Ok(FrontendCall::SmokeDisabled) => Ok(json!(false)),
+                Ok(FrontendCall::SavedMachinesEmpty) => Ok(json!({
+                    "local_workspace": client.cwd.display().to_string(),
+                    "active_machine": null,
+                    "credential_from_env": false,
+                    "machines": [],
+                })),
                 Ok(FrontendCall::Unsupported(why)) => Err(format!(
                     "{command} is not available in a served view: {why}"
                 )),

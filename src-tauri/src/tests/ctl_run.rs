@@ -68,6 +68,7 @@ pub(crate) fn control_run_with_timeout(
         auto_spawn: false,
         client_token: client.client_token.clone(),
         tcp_endpoint: client.tcp_endpoint,
+        machine_reconnect: client.machine_reconnect.clone(),
     };
     std::thread::spawn(move || {
         let _ = tx.send(control_run(&client_clone, &args, json));
@@ -495,6 +496,7 @@ fn control_exec_help_flag_prints_help_not_error() {
         auto_spawn: false,
         client_token: client.client_token.clone(),
         tcp_endpoint: client.tcp_endpoint,
+        machine_reconnect: client.machine_reconnect.clone(),
     };
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -585,6 +587,7 @@ fn control_exec_help_after_separator_runs_command() {
         auto_spawn: false,
         client_token: client.client_token.clone(),
         tcp_endpoint: client.tcp_endpoint,
+        machine_reconnect: client.machine_reconnect.clone(),
     };
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -622,6 +625,7 @@ fn control_exec_short_help_after_separator_runs_command() {
         auto_spawn: false,
         client_token: client.client_token.clone(),
         tcp_endpoint: client.tcp_endpoint,
+        machine_reconnect: client.machine_reconnect.clone(),
     };
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1025,6 +1029,7 @@ pub(crate) fn collect_batched_with_timeout(
         auto_spawn: false,
         client_token: client.client_token.clone(),
         tcp_endpoint: client.tcp_endpoint,
+        machine_reconnect: client.machine_reconnect.clone(),
     };
     let plan = RunPlan {
         pane_ref: plan.pane_ref.clone(),

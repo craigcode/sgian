@@ -37,11 +37,24 @@ const KNOWN_COMMANDS = [
   "install_update",
   "ui_smoke_enabled",
   "complete_ui_smoke",
+  "list_saved_machines",
+  "connect_machine",
+  "connect_local_workspace",
+  "set_machine_client_token",
 ];
 const KNOWN_COMMAND_SET = new Set(KNOWN_COMMANDS);
 // Registered by the backend and invoked only from the React controller
 // (app-controller.js; covered by react-app.test.jsx), never by main.js.
-const REACT_ONLY_COMMANDS = new Set(["client_holder", "take_lease", "release_lease", "lease_status"]);
+const REACT_ONLY_COMMANDS = new Set([
+  "client_holder",
+  "take_lease",
+  "release_lease",
+  "lease_status",
+  "list_saved_machines",
+  "connect_machine",
+  "connect_local_workspace",
+  "set_machine_client_token",
+]);
 
 // --- DOM skeleton (the ids main.js queries, mirroring ui/index.html) ---
 

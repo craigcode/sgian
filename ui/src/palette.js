@@ -2,6 +2,8 @@
  * Command palette command registry and fuzzy filter.
  */
 
+import { formatMachineSubtitle, workspaceBasename } from "./machines.js";
+
 function fuzzyMatch(haystack, needle) {
   const text = haystack.toLowerCase();
   const query = needle.toLowerCase().trim();
@@ -145,6 +147,54 @@ export function buildPaletteCommands(controller) {
       label: `New pane with profile: ${profile.name}`,
       keywords: ["profile", profile.name, profile.kind || "pane", "new", "create"],
       run: () => void controller.newPaneWithProfile(profile.name),
+    });
+  }
+
+  if (state.activeMachine && typeof controller.connectLocalWorkspace === "function") {
+    const localLabel = workspaceBasename(state.localWorkspace || state.cwd);
+    commands.push({
+      id: "switch-local-workspace",
+      label: `Switch to local workspace: ${localLabel}`,
+      keywords: ["local", "workspace", "machine", "switch", state.localWorkspace || ""].filter(
+        Boolean,
+      ),
+      run: () => void controller.connectLocalWorkspace(),
+    });
+  }
+
+  if (typeof controller.connectMachine === "function") {
+    for (const machine of state.savedMachines || []) {
+      if (!machine?.name) continue;
+      const subtitle = formatMachineSubtitle(machine);
+      commands.push({
+        id: `switch-machine-${machine.name}`,
+        label: subtitle
+          ? `Switch to machine: ${machine.name} (${subtitle})`
+          : `Switch to machine: ${machine.name}`,
+        keywords: [
+          "machine",
+          "remote",
+          "ssh",
+          "switch",
+          machine.name,
+          machine.host,
+          machine.workspace,
+          machine.target,
+        ].filter(Boolean),
+        run: () => void controller.connectMachine(machine.name),
+      });
+    }
+  }
+
+  if (
+    ((state.savedMachines && state.savedMachines.length > 0) || state.activeMachine) &&
+    typeof controller.refreshWorkspaceTargets === "function"
+  ) {
+    commands.push({
+      id: "reload-saved-machines",
+      label: "Reload saved machines",
+      keywords: ["machine", "reload", "refresh", "remote"],
+      run: () => void controller.refreshWorkspaceTargets(),
     });
   }
 

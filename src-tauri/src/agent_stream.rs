@@ -3135,6 +3135,31 @@ pub(crate) struct DaemonClient {
     /// Optional loopback TCP endpoint (`127.0.0.1:<port>`) used for local SSH
     /// tunnel forwarding on Windows (#114) and loopback attach tests (#116).
     pub(crate) tcp_endpoint: Option<std::net::SocketAddr>,
+    /// Reconnection spec for saved remote machines so dropped SSH tunnels heal
+    /// automatically on subsequent RPCs and subscription reconnects.
+    pub(crate) machine_reconnect: Option<MachineReconnectSpec>,
+}
+
+pub(crate) struct SubscriptionHandle {
+    cancelled: Arc<AtomicBool>,
+    active_stream: Arc<Mutex<Option<TransportStream>>>,
+}
+
+impl SubscriptionHandle {
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Ok(mut guard) = self.active_stream.lock() {
+            if let Some(stream) = guard.take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+impl Drop for SubscriptionHandle {
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
 
 impl DaemonClient {
@@ -3144,6 +3169,11 @@ impl DaemonClient {
     pub(crate) fn connect_or_spawn(cwd: PathBuf) -> Result<Self, String> {
         let client = Self::new(cwd)?;
         client.ensure_daemon()?;
+        Ok(client)
+    }
+
+    pub(crate) fn connect_machine(machine_name: &str) -> Result<Self, String> {
+        let (client, _) = ensure_machine_client(machine_name)?;
         Ok(client)
     }
 
@@ -3174,6 +3204,7 @@ impl DaemonClient {
             auto_spawn: false,
             client_token: None,
             tcp_endpoint: None,
+            machine_reconnect: None,
         };
         client.raw_request(DaemonRequest::Ping).map_err(|error| {
             // (M6) A presented credential that the daemon refused is not a
@@ -3210,6 +3241,7 @@ impl DaemonClient {
             auto_spawn: true,
             client_token: None,
             tcp_endpoint: None,
+            machine_reconnect: None,
         })
     }
 
@@ -3321,8 +3353,17 @@ impl DaemonClient {
         request: DaemonRequest,
         timeout: Option<Duration>,
     ) -> Result<T, String> {
-        self.ensure_daemon()?;
-        let response = self.raw_request_with_timeout(request, timeout)?;
+        let response = if let Some(ref reconnect) = self.machine_reconnect {
+            if self.raw_request(DaemonRequest::Ping).is_ok() {
+                self.raw_request_with_timeout(request, timeout)?
+            } else {
+                let refreshed = reconnect.reconnect()?;
+                refreshed.raw_request_with_timeout(request, timeout)?
+            }
+        } else {
+            self.ensure_daemon()?;
+            self.raw_request_with_timeout(request, timeout)?
+        };
         if !response.ok {
             return Err(response
                 .error
@@ -3376,58 +3417,109 @@ impl DaemonClient {
         authenticate_stream_at(&self.socket_path, &self.token)
     }
 
-    pub(crate) fn start_subscription(&self, app: AppHandle) {
-        let socket_path = self.socket_path.clone();
-        let tcp_endpoint = self.tcp_endpoint;
-        let token = self.token.clone();
-        let client_token = self.client_token.clone();
+    pub(crate) fn start_subscription(&self, app: AppHandle) -> SubscriptionHandle {
+        self.start_subscription_with_sink(move |event| emit_daemon_event(&app, event))
+    }
+
+    pub(crate) fn start_subscription_with_sink<F>(&self, on_event: F) -> SubscriptionHandle
+    where
+        F: Fn(DaemonEvent) + Send + 'static,
+    {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let active_stream: Arc<Mutex<Option<TransportStream>>> = Arc::new(Mutex::new(None));
+        let cancelled_worker = Arc::clone(&cancelled);
+        let active_stream_worker = Arc::clone(&active_stream);
+        let mut current = self.clone();
+
         thread::spawn(move || {
             let mut backoff = SubscriptionBackoff::new();
             loop {
-                // (L19) A session that died younger than SUBSCRIPTION_HEALTHY_MIN
-                // counts as a failure: space the next connect by the backoff so a
-                // daemon that accepts+acks then immediately EOFs cannot busy-loop
-                // reconnects. A healthy long session resets to an immediate
-                // reconnect. Connect failures keep their own fixed sleep below.
+                if cancelled_worker.load(Ordering::SeqCst) {
+                    break;
+                }
                 let delay = backoff.pre_connect_delay();
                 if !delay.is_zero() {
                     thread::sleep(delay);
+                    if cancelled_worker.load(Ordering::SeqCst) {
+                        break;
+                    }
                 }
                 let session_started = Instant::now();
                 match DaemonConnection::connect_with_options(
-                    &socket_path,
-                    tcp_endpoint,
-                    &token,
-                    client_token.as_deref(),
+                    &current.socket_path,
+                    current.tcp_endpoint,
+                    &current.token,
+                    current.client_token.as_deref(),
                     Some(CLIENT_READ_TIMEOUT),
                 ) {
                     Ok(mut conn) => {
+                        if cancelled_worker.load(Ordering::SeqCst) {
+                            break;
+                        }
                         if conn.write_request(&DaemonRequest::Subscribe).is_err()
                             || conn.await_subscribe_ack().is_err()
                         {
-                            // Never established: a zero-length session, so the next
-                            // iteration takes the short-session backoff (same
-                            // cadence as the fixed sleep this replaces).
                             backoff.session_ended(Some(session_started.elapsed()));
                             continue;
                         }
-                        // Events are legitimately sparse; only the handshake + ack get
-                        // the default read deadline, not the long-lived stream.
                         conn.set_read_timeout(None);
+                        if let Ok(cloned) = conn.reader.get_ref().try_clone() {
+                            if let Ok(mut guard) = active_stream_worker.lock() {
+                                *guard = Some(cloned);
+                            }
+                        }
+                        if cancelled_worker.load(Ordering::SeqCst) {
+                            if let Ok(mut guard) = active_stream_worker.lock() {
+                                if let Some(stream) = guard.take() {
+                                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                                }
+                            }
+                            break;
+                        }
                         while let Ok(Some(event)) = conn.read_event() {
-                            emit_daemon_event(&app, event);
+                            if cancelled_worker.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            on_event(event);
+                        }
+                        if let Ok(mut guard) = active_stream_worker.lock() {
+                            *guard = None;
+                        }
+                        if cancelled_worker.load(Ordering::SeqCst) {
+                            break;
                         }
                         backoff.session_ended(Some(session_started.elapsed()));
                     }
                     Err(_) => {
-                        // The fixed sleep below already backs this case off; record
-                        // no session so the state machine adds nothing on top.
                         backoff.session_ended(None);
                         thread::sleep(SUBSCRIPTION_RECONNECT_BACKOFF);
+                        if cancelled_worker.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if let Some(ref reconnect) = current.machine_reconnect {
+                            match reconnect.reconnect() {
+                                Ok(refreshed) => {
+                                    current = refreshed;
+                                }
+                                Err(_) => {
+                                    for _ in 0..15 {
+                                        if cancelled_worker.load(Ordering::SeqCst) {
+                                            return;
+                                        }
+                                        thread::sleep(Duration::from_millis(100));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         });
+
+        SubscriptionHandle {
+            cancelled,
+            active_stream,
+        }
     }
 }
 

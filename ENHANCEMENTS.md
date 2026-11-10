@@ -255,9 +255,11 @@ Shipped (2026-09-16):
 - **Saved remote workspaces (`machines`, #114).** User-global `machines` config
   (`ctl machine add|list|remove`), `0600` per-machine client token files plus
   macOS Keychain / Windows PasswordVault integration, client-owned `ssh -N -L`
-  tunnel management (`src-tauri/src/machines.rs`), `--machine <name>` /
-  `SGIAN_MACHINE` / `<machine>/<pane>` targeting across `sgian ctl`, and saved
-  machine switchers in the native macOS and Windows desktop clients.
+  tunnel management with automatic tunnel-drop recovery (`src-tauri/src/machines.rs`,
+  `src-tauri/src/agent_stream.rs`), `--machine <name>` / `SGIAN_MACHINE` /
+  `<machine>/<pane>` targeting across `sgian ctl`, and saved machine switchers
+  across all three desktop clients (Tauri Linux/desktop, native macOS, and
+  native Windows).
 - **Windows daemon as a remote target (#116).** Opt-in `127.0.0.1` loopback TCP
   IPC listener (`remote_loopback_port` / `--listen-loopback <PORT>`, publishing
   `daemon.loopback_port` and `ipc-endpoint.loopback_port`), strict per-client

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-connect-machine"
+description = "Enables the connect_machine command without any pre-configured scope."
+commands.allow = ["connect_machine"]
+
+[[permission]]
+identifier = "deny-connect-machine"
+description = "Denies the connect_machine command without any pre-configured scope."
+commands.deny = ["connect_machine"]

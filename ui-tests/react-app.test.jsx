@@ -724,3 +724,195 @@ describe("controller lifecycle", () => {
     expect(nativeClose).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("saved remote machines switcher", () => {
+  it("renders zero machine chrome when no saved machines are configured", async () => {
+    const { controller } = createHarness();
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    expect(view.container.querySelector("#machine-targets")).toBeNull();
+    expect(view.container.querySelector("#active-machine-badge")).toBeNull();
+    expect(view.container.querySelector("#target-error-banner")).toBeNull();
+  });
+
+  it("switches between local workspace and a saved remote machine and disposes old xterm views", async () => {
+    let activeMachine = null;
+    const listeners = new Map();
+    const invoke = vi.fn(async (command, args) => {
+      if (command === "bootstrap_workspace" || command === "connect_local_workspace") {
+        activeMachine = null;
+        return {
+          panes: [{ id: "pane-local", title: "local-shell", kind: "shell", created_at_ms: 1 }],
+          pane_states: { "pane-local": "live" },
+          active_pane_id: "pane-local",
+          cwd: "/workspace/local-repo",
+          layout: null,
+          scrollback: { "pane-local": "local ready\r\n" },
+        };
+      }
+      if (command === "connect_machine") {
+        activeMachine = args.name;
+        return {
+          panes: [{ id: "pane-remote", title: "remote-shell", kind: "shell", created_at_ms: 2 }],
+          pane_states: { "pane-remote": "live" },
+          active_pane_id: "pane-remote",
+          cwd: "/srv/remote-repo",
+          layout: null,
+          scrollback: { "pane-remote": "remote ready\r\n" },
+        };
+      }
+      if (command === "list_saved_machines") {
+        return {
+          local_workspace: "/workspace/local-repo",
+          active_machine: activeMachine,
+          credential_from_env: false,
+          machines: [
+            {
+              name: "gpu-box",
+              transport: "ssh",
+              host: "dev@gpu.internal",
+              port: 22,
+              workspace: "/srv/remote-repo",
+              token_configured: true,
+              tunnel_present: activeMachine === "gpu-box",
+            },
+          ],
+        };
+      }
+      if (command === "client_holder") return activeMachine ? "laptop-op" : "me@local";
+      if (command === "get_config") return { font_size: 13 };
+      if (command === "ui_smoke_enabled") return false;
+      return { ok: true };
+    });
+    const controller = createAppController({
+      nativeInvoke: invoke,
+      nativeListen: async (name, handler) => {
+        listeners.set(name, handler);
+        return () => {};
+      },
+    });
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+    await waitFor(() =>
+      expect(view.container.querySelector('button[data-machine="gpu-box"]')).toBeTruthy(),
+    );
+
+    const localBtn = view.container.querySelector("#machine-target-local");
+    expect(localBtn.dataset.active).toBe("true");
+    expect(localBtn.textContent).toContain("local-repo");
+
+    const liveBeforeSwitch = FakeTerminal.instances.filter((t) => !t.disposed);
+    expect(liveBeforeSwitch).toHaveLength(1);
+
+    const user = userEvent.setup();
+    await user.click(view.container.querySelector('button[data-machine="gpu-box"]'));
+
+    await waitFor(() =>
+      expect(view.container.querySelector("#active-machine-badge")?.textContent).toContain(
+        "gpu-box",
+      ),
+    );
+    expect(view.container.querySelector("#workspace-cwd").textContent).toBe("/srv/remote-repo");
+    expect(liveBeforeSwitch[0].disposed).toBe(true);
+    expect(FakeTerminal.instances.filter((t) => !t.disposed)).toHaveLength(1);
+
+    // Local button still preserves the local workspace basename while attached remotely.
+    expect(view.container.querySelector("#machine-target-local").textContent).toContain(
+      "local-repo",
+    );
+
+    await user.click(view.container.querySelector("#machine-target-local"));
+    await waitFor(() =>
+      expect(view.container.querySelector("#workspace-cwd").textContent).toBe(
+        "/workspace/local-repo",
+      ),
+    );
+    expect(view.container.querySelector("#active-machine-badge")).toBeNull();
+  });
+
+  it("surfaces connect_machine auth errors in #target-error-banner and reconnects after saving a token in Settings", async () => {
+    let tokenStored = false;
+    let activeMachine = null;
+    const invoke = vi.fn(async (command, args) => {
+      if (command === "bootstrap_workspace") {
+        return {
+          panes: [{ id: "pane-a", title: "term-a", kind: "shell", created_at_ms: 1 }],
+          pane_states: { "pane-a": "live" },
+          active_pane_id: "pane-a",
+          cwd: "/workspace/local",
+          layout: null,
+          scrollback: { "pane-a": "ready\r\n" },
+        };
+      }
+      if (command === "connect_machine") {
+        activeMachine = args.name;
+        if (!tokenStored) {
+          throw new Error("authentication refused: missing client_token");
+        }
+        return {
+          panes: [{ id: "pane-win", title: "pwsh", kind: "shell", created_at_ms: 2 }],
+          pane_states: { "pane-win": "live" },
+          active_pane_id: "pane-win",
+          cwd: "C:\\Users\\op\\repo",
+          layout: null,
+          scrollback: { "pane-win": "PS> \r\n" },
+        };
+      }
+      if (command === "set_machine_client_token") {
+        tokenStored = Boolean(args.token);
+        return { ok: true };
+      }
+      if (command === "list_saved_machines") {
+        return {
+          local_workspace: "/workspace/local",
+          active_machine: activeMachine,
+          credential_from_env: false,
+          machines: [
+            {
+              name: "winbox",
+              transport: "ssh",
+              host: "op@win.internal",
+              workspace: "C:\\Users\\op\\repo",
+              token_configured: tokenStored,
+              tunnel_present: false,
+            },
+          ],
+        };
+      }
+      if (command === "client_holder") return "laptop-op";
+      if (command === "get_config") return { font_size: 13 };
+      if (command === "ui_smoke_enabled") return false;
+      return { ok: true };
+    });
+    const controller = createAppController({
+      nativeInvoke: invoke,
+      nativeListen: async () => () => {},
+    });
+    const view = render(<App controller={controller} />);
+    await waitFor(() =>
+      expect(view.container.querySelector('button[data-machine="winbox"]')).toBeTruthy(),
+    );
+
+    const user = userEvent.setup();
+    await user.click(view.container.querySelector('button[data-machine="winbox"]'));
+
+    await waitFor(() =>
+      expect(view.container.querySelector("#target-error-banner")?.textContent).toContain(
+        "authentication refused",
+      ),
+    );
+
+    await user.click(view.container.querySelector("#target-error-set-token"));
+    await waitFor(() => expect(controller.state.settingsModalOpen).toBe(true));
+
+    const tokenInput = view.container.querySelector("#settings-machine-token");
+    await user.type(tokenInput, `sgc_${"b".repeat(16)}`);
+    await user.click(view.container.querySelector("#settings-machine-token-save"));
+
+    await waitFor(() => expect(view.container.querySelector("#target-error-banner")).toBeNull());
+    expect(view.container.querySelector("#workspace-cwd").textContent).toBe(
+      "C:\\Users\\op\\repo",
+    );
+    expect(view.container.querySelector("#active-machine-badge")?.textContent).toContain("winbox");
+  });
+});
