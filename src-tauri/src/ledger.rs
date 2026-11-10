@@ -453,6 +453,53 @@ pub(crate) fn ledger_verify(path: &Path) -> Result<LedgerSummary, LedgerBreak> {
     })
 }
 
+/// Verify an already-parsed sequence of `LedgerRecord` JSON values (used by
+/// remote `ctl --machine <name> ledger --verify` so the client independently
+/// verifies the cryptographic SHA-256 chain returned over IPC).
+pub(crate) fn ledger_verify_records(items: &[Value]) -> Result<LedgerSummary, LedgerBreak> {
+    let mut prev = String::new();
+    let mut expected_seq: u64 = 1;
+    let mut records: u64 = 0;
+    for (index, item) in items.iter().enumerate() {
+        let line_no = index + 1;
+        let record: LedgerRecord =
+            serde_json::from_value(item.clone()).map_err(|error| LedgerBreak {
+                line: line_no,
+                seq: None,
+                reason: format!("unparseable record: {error}"),
+            })?;
+        if record.seq != expected_seq {
+            return Err(LedgerBreak {
+                line: line_no,
+                seq: Some(record.seq),
+                reason: format!("sequence {} where {expected_seq} was expected", record.seq),
+            });
+        }
+        if record.prev != prev {
+            return Err(LedgerBreak {
+                line: line_no,
+                seq: Some(record.seq),
+                reason: "prev hash does not match the previous record".to_string(),
+            });
+        }
+        let expected_hash = ledger_hash(&record.prev, &ledger_body(&record));
+        if !constant_time_eq(&expected_hash, &record.h) {
+            return Err(LedgerBreak {
+                line: line_no,
+                seq: Some(record.seq),
+                reason: "record hash mismatch (content altered)".to_string(),
+            });
+        }
+        prev = record.h;
+        expected_seq = expected_seq.saturating_add(1);
+        records += 1;
+    }
+    Ok(LedgerSummary {
+        records,
+        head: prev,
+    })
+}
+
 /// The last `limit` records (0 = all) as raw JSON values; unparseable lines
 /// are skipped so a torn tail still lists what came before it.
 pub(crate) fn read_ledger_tail(path: &Path, limit: usize) -> Vec<Value> {

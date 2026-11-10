@@ -336,12 +336,12 @@ pub(crate) fn resolve_machine_client_token_in(
 }
 
 #[derive(Debug, Deserialize)]
-struct RemoteEndpointDiscovery {
-    transport: String,
-    endpoint: String,
-    protocol_version: u32,
+pub(crate) struct RemoteEndpointDiscovery {
+    pub(crate) transport: String,
+    pub(crate) endpoint: String,
+    pub(crate) protocol_version: u32,
     #[serde(default)]
-    loopback_port: Option<u16>,
+    pub(crate) loopback_port: Option<u16>,
 }
 
 fn resolve_ssh_bin() -> String {
@@ -352,7 +352,7 @@ fn resolve_ssh_bin() -> String {
         .unwrap_or_else(|| "ssh".to_string())
 }
 
-fn extract_first_json_object(raw: &str) -> Option<&str> {
+pub(crate) fn extract_first_json_object(raw: &str) -> Option<&str> {
     let start = raw.find('{')?;
     let end = raw.rfind('}')?;
     (end >= start).then_some(&raw[start..=end])
@@ -449,14 +449,16 @@ pub(crate) struct MachineReconnectSpec {
     pub(crate) app_dir: PathBuf,
     pub(crate) machine_name: String,
     pub(crate) ssh_bin_override: Option<String>,
+    pub(crate) aws_bin_override: Option<String>,
 }
 
 impl MachineReconnectSpec {
     pub(crate) fn reconnect(&self) -> Result<DaemonClient, String> {
-        let (client, _) = ensure_machine_client_with_ssh_in(
+        let (client, _) = ensure_machine_client_with_bins_in(
             &self.app_dir,
             &self.machine_name,
             self.ssh_bin_override.as_deref(),
+            self.aws_bin_override.as_deref(),
         )?;
         Ok(client)
     }
@@ -625,19 +627,69 @@ fn probe_machine_client(client: &DaemonClient, machine_name: &str) -> TunnelProb
     }
 }
 
-/// Ensure a live, authenticated client-owned SSH tunnel exists for `machine_name`
-/// and return both a ready `DaemonClient` and the local `NativeIpcEndpoint`.
+enum SpawnedTunnelChild {
+    Process(std::process::Child),
+    #[cfg(test)]
+    InProcessThread(PathBuf),
+}
+
+impl SpawnedTunnelChild {
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Process(c) => Some(c.id()),
+            #[cfg(test)]
+            Self::InProcessThread(_) => None,
+        }
+    }
+
+    fn try_wait(&mut self) -> Result<Option<String>, String> {
+        match self {
+            Self::Process(c) => c
+                .try_wait()
+                .map(|opt| opt.map(|st| st.to_string()))
+                .map_err(|e| e.to_string()),
+            #[cfg(test)]
+            Self::InProcessThread(_) => Ok(None),
+        }
+    }
+
+    fn kill_and_wait(&mut self) {
+        match self {
+            Self::Process(c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            #[cfg(test)]
+            Self::InProcessThread(runtime_dir) => {
+                let _ = fs::write(runtime_dir.join("tunnel.stop"), b"1");
+            }
+        }
+    }
+}
+
+/// Ensure a live, authenticated client-owned SSH or SSM tunnel exists for
+/// `machine_name` and return both a ready `DaemonClient` and the local `NativeIpcEndpoint`.
 pub(crate) fn ensure_machine_client_in(
     app_dir: &Path,
     machine_name: &str,
 ) -> Result<(DaemonClient, NativeIpcEndpoint), String> {
-    ensure_machine_client_with_ssh_in(app_dir, machine_name, None)
+    ensure_machine_client_with_bins_in(app_dir, machine_name, None, None)
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_machine_client_with_ssh_in(
     app_dir: &Path,
     machine_name: &str,
     ssh_bin_override: Option<&str>,
+) -> Result<(DaemonClient, NativeIpcEndpoint), String> {
+    ensure_machine_client_with_bins_in(app_dir, machine_name, ssh_bin_override, None)
+}
+
+pub(crate) fn ensure_machine_client_with_bins_in(
+    app_dir: &Path,
+    machine_name: &str,
+    ssh_bin_override: Option<&str>,
+    aws_bin_override: Option<&str>,
 ) -> Result<(DaemonClient, NativeIpcEndpoint), String> {
     let name = validate_machine_name(machine_name)?;
     let machines = load_global_machines_in(app_dir)?;
@@ -650,13 +702,6 @@ pub(crate) fn ensure_machine_client_with_ssh_in(
             )
         })?;
 
-    if entry.transport == "ssm" {
-        return Err(format!(
-            "machine '{name}' uses transport 'ssm', which is not yet supported in this build \
-             (tracked in issue #115)"
-        ));
-    }
-
     let (client_token, token_path) = resolve_machine_client_token_in(app_dir, &entry)?;
     let runtime_dir = machine_runtime_dir_in(app_dir, &name);
     ensure_private_dir(&runtime_dir)?;
@@ -667,6 +712,7 @@ pub(crate) fn ensure_machine_client_with_ssh_in(
         app_dir: app_dir.to_path_buf(),
         machine_name: name.clone(),
         ssh_bin_override: ssh_bin_override.map(str::to_string),
+        aws_bin_override: aws_bin_override.map(str::to_string),
     };
 
     let local_sock = runtime_dir.join(SOCKET_FILE);
@@ -713,25 +759,17 @@ pub(crate) fn ensure_machine_client_with_ssh_in(
         }
     }
 
-    // 2. Discover remote daemon endpoint via SSH (`sgian ctl --json ipc-endpoint`).
-    let ssh_bin = ssh_bin_override
-        .map(str::to_string)
-        .unwrap_or_else(resolve_ssh_bin);
-    let remote_target = discover_remote_forward_target(&entry, &ssh_bin)?;
-    let host = entry
-        .host
-        .as_deref()
-        .ok_or_else(|| format!("machine '{name}' has no host"))?;
-
     #[cfg(unix)]
     let (local_bind, tcp_endpoint): (String, Option<std::net::SocketAddr>) = {
         terminate_previous_tunnel(&runtime_dir, &local_sock);
+        let _ = fs::write(runtime_dir.join("tunnel.stop"), b"1");
         remove_stale_socket(&local_sock)?;
         (local_sock.display().to_string(), None)
     };
 
     #[cfg(windows)]
     let (local_bind, tcp_endpoint): (String, Option<std::net::SocketAddr>) = {
+        let _ = fs::write(runtime_dir.join("tunnel.stop"), b"1");
         let reservation = std::net::TcpListener::bind(("127.0.0.1", 0))
             .map_err(|error| format!("failed to allocate local tunnel port: {error}"))?;
         let local_port = reservation
@@ -761,57 +799,137 @@ pub(crate) fn ensure_machine_client_with_ssh_in(
         .map_err(|error| format!("failed to open tunnel log {}: {error}", log_path.display()))?;
     let _ = set_private_file_permissions(&log_path);
 
-    let mut ssh_cmd = Command::new(&ssh_bin);
-    ssh_cmd.args([
-        "-N",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-o",
-        "ServerAliveInterval=15",
-        "-o",
-        "ServerAliveCountMax=3",
-        "-o",
-        "StreamLocalBindUnlink=yes",
-    ]);
-    if let Some(port) = entry.port {
-        ssh_cmd.arg("-p").arg(port.to_string());
-    }
-    ssh_cmd
-        .arg("-L")
-        .arg(format!("{local_bind}:{remote_target}"))
-        .arg("--")
-        .arg(host)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log_file));
-    configure_daemon_process(&mut ssh_cmd);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: async-signal-safe calls in child before exec: tighten umask so
-        // the forwarded Unix domain socket is created 0600, and detach session so
-        // terminal signals on a single ctl invocation do not kill the shared tunnel.
-        unsafe {
-            ssh_cmd.pre_exec(|| {
-                libc::umask(0o077);
-                let _ = libc::setsid();
-                Ok(())
-            });
+    let transport_label = if entry.transport == "ssm" {
+        "SSM"
+    } else {
+        "SSH"
+    };
+    let mut child: SpawnedTunnelChild = if entry.transport == "ssm" {
+        let aws_bin = aws_bin_override
+            .map(str::to_string)
+            .unwrap_or_else(resolve_aws_bin);
+        let remote_port = discover_ssm_remote_loopback_port(&entry, &runtime_dir, &aws_bin)?;
+        let target = entry
+            .target
+            .as_deref()
+            .ok_or_else(|| format!("SSM machine '{name}' has no target"))?;
+        let mut tunnel_args = vec![
+            "sgian".to_string(),
+            SSM_TUNNEL_ARG.to_string(),
+            "--target".to_string(),
+            target.to_string(),
+            "--remote-port".to_string(),
+            remote_port.to_string(),
+            "--runtime-dir".to_string(),
+            runtime_dir.display().to_string(),
+            "--aws-bin".to_string(),
+            aws_bin,
+        ];
+        if let Some(addr) = tcp_endpoint {
+            tunnel_args.push("--local-port".to_string());
+            tunnel_args.push(addr.port().to_string());
+        } else {
+            tunnel_args.push("--local-sock".to_string());
+            tunnel_args.push(local_sock.display().to_string());
         }
-    }
+        if token_path.exists() {
+            tunnel_args.push("--token-file".to_string());
+            tunnel_args.push(token_path.display().to_string());
+        }
 
-    let mut child = ssh_cmd.spawn().map_err(|error| {
-        format!("failed to spawn SSH tunnel ('{ssh_bin}') for machine '{name}': {error}")
-    })?;
-    let pid_path = runtime_dir.join(TUNNEL_PID_FILE);
-    let _ = write_file_atomic(
-        &pid_path.with_extension("pid.tmp"),
-        &pid_path,
-        format!("{}\n", child.id()).as_bytes(),
-        false,
-    );
+        let current_exe = std::env::current_exe()
+            .map_err(|e| format!("failed to resolve current executable for SSM tunnel: {e}"))?;
+        let is_libtest = current_exe
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with("sgian_lib-"));
+
+        #[cfg(test)]
+        if is_libtest {
+            let _ = fs::remove_file(runtime_dir.join("tunnel.stop"));
+            let log_clone = log_path.clone();
+            let rt_clone = runtime_dir.clone();
+            thread::spawn(move || {
+                if let Err(err) = run_ssm_tunnel_from_args(&tunnel_args) {
+                    let _ = fs::write(&log_clone, format!("{err}\n"));
+                }
+            });
+            SpawnedTunnelChild::InProcessThread(rt_clone)
+        } else {
+            spawn_ssm_tunnel_process(&current_exe, &tunnel_args[1..], log_file, &name)?
+        }
+        #[cfg(not(test))]
+        {
+            let _ = is_libtest;
+            spawn_ssm_tunnel_process(&current_exe, &tunnel_args[1..], log_file, &name)?
+        }
+    } else {
+        // 2. Discover remote daemon endpoint via SSH (`sgian ctl --json ipc-endpoint`).
+        let ssh_bin = ssh_bin_override
+            .map(str::to_string)
+            .unwrap_or_else(resolve_ssh_bin);
+        let remote_target = discover_remote_forward_target(&entry, &ssh_bin)?;
+        let host = entry
+            .host
+            .as_deref()
+            .ok_or_else(|| format!("machine '{name}' has no host"))?;
+
+        let mut ssh_cmd = Command::new(&ssh_bin);
+        ssh_cmd.args([
+            "-N",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "StreamLocalBindUnlink=yes",
+        ]);
+        if let Some(port) = entry.port {
+            ssh_cmd.arg("-p").arg(port.to_string());
+        }
+        ssh_cmd
+            .arg("-L")
+            .arg(format!("{local_bind}:{remote_target}"))
+            .arg("--")
+            .arg(host)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log_file));
+        configure_daemon_process(&mut ssh_cmd);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: async-signal-safe calls in child before exec: tighten umask so
+            // the forwarded Unix domain socket is created 0600, and detach session so
+            // terminal signals on a single ctl invocation do not kill the shared tunnel.
+            unsafe {
+                ssh_cmd.pre_exec(|| {
+                    libc::umask(0o077);
+                    let _ = libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+
+        let proc = ssh_cmd.spawn().map_err(|error| {
+            format!("failed to spawn SSH tunnel ('{ssh_bin}') for machine '{name}': {error}")
+        })?;
+        SpawnedTunnelChild::Process(proc)
+    };
+
+    if let Some(pid) = child.pid() {
+        let pid_path = runtime_dir.join(TUNNEL_PID_FILE);
+        let _ = write_file_atomic(
+            &pid_path.with_extension("pid.tmp"),
+            &pid_path,
+            format!("{pid}\n").as_bytes(),
+            false,
+        );
+    }
 
     let (candidate, endpoint) = build_machine_client_and_endpoint(
         &entry,
@@ -837,8 +955,7 @@ pub(crate) fn ensure_machine_client_with_ssh_in(
                 last_error = err;
             }
             TunnelProbe::AuthFailed(auth_error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                child.kill_and_wait();
                 #[cfg(unix)]
                 let _ = remove_stale_socket(&local_sock);
                 return Err(auth_error);
@@ -850,23 +967,52 @@ pub(crate) fn ensure_machine_client_with_ssh_in(
                     .map(|text| format!(": {text}"))
                     .unwrap_or_default();
                 return Err(format!(
-                    "SSH tunnel for machine '{name}' exited prematurely ({status}){excerpt}"
+                    "{transport_label} tunnel for machine '{name}' exited prematurely ({status}){excerpt}"
                 ));
             }
             Ok(None) => {}
-            Err(error) => last_error = error.to_string(),
+            Err(error) => last_error = error,
         }
         thread::sleep(TUNNEL_READY_POLL);
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill_and_wait();
     let excerpt = daemon_startup_log_excerpt(&log_path)
-        .map(|text| format!("; ssh stderr: {text}"))
+        .map(|text| format!("; tunnel stderr: {text}"))
         .unwrap_or_default();
     Err(format!(
-        "SSH tunnel for machine '{name}' did not become ready ({last_error}{excerpt})"
+        "{transport_label} tunnel for machine '{name}' did not become ready ({last_error}{excerpt})"
     ))
+}
+
+fn spawn_ssm_tunnel_process(
+    exe: &Path,
+    args: &[String],
+    log_file: File,
+    name: &str,
+) -> Result<SpawnedTunnelChild, String> {
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log_file));
+    configure_daemon_process(&mut cmd);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: async-signal-safe umask + setsid in child before exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::umask(0o077);
+                let _ = libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn SSM tunnel for machine '{name}': {e}"))?;
+    Ok(SpawnedTunnelChild::Process(child))
 }
 
 pub(crate) fn ensure_machine_client(
@@ -910,6 +1056,7 @@ fn cleanup_machine_state_in(app_dir: &Path, name: &str) {
     #[cfg(unix)]
     {
         let sock = runtime_dir.join(SOCKET_FILE);
+        let _ = fs::write(runtime_dir.join("tunnel.stop"), b"1");
         terminate_previous_tunnel(&runtime_dir, &sock);
         let _ = remove_stale_socket(&sock);
     }
@@ -1372,6 +1519,24 @@ pub(crate) fn rewrite_qualified_subcommand_args(
                 let a = sub_args[idx].as_str();
                 match a {
                     "-n" | "--last" => idx += 2,
+                    "--" => break,
+                    _ if a.starts_with('-') => idx += 1,
+                    _ => {
+                        found = Some(idx);
+                        break;
+                    }
+                }
+            }
+            found
+        }
+        "ledger" => {
+            let mut idx = 0;
+            let mut found = None;
+            while idx < sub_args.len() {
+                let a = sub_args[idx].as_str();
+                match a {
+                    "-n" | "--lines" => idx += 2,
+                    "--verify" => idx += 1,
                     "--" => break,
                     _ if a.starts_with('-') => idx += 1,
                     _ => {

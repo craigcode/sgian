@@ -169,6 +169,7 @@ pub(crate) fn request_scope(request: &DaemonRequest) -> ClientScope {
         | DaemonRequest::ProjectList
         | DaemonRequest::ProjectShow { .. }
         | DaemonRequest::ProjectLedger { .. }
+        | DaemonRequest::PaneLedger { .. }
         | DaemonRequest::ProjectDossier { .. }
         | DaemonRequest::ProjectNotes { .. }
         | DaemonRequest::AgentStatus { .. }

@@ -245,3 +245,6 @@ pub(crate) use grants::*;
 mod machines;
 #[allow(unused_imports)]
 pub(crate) use machines::*;
+mod ssm;
+#[allow(unused_imports)]
+pub(crate) use ssm::*;

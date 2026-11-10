@@ -1324,6 +1324,26 @@ enum DaemonRequest {
         #[serde(default)]
         limit: usize,
     },
+    /// Read or verify a single pane's hash-chained ledger over IPC so remote
+    /// `--machine` clients can inspect and cryptographically verify `ledger/<pane>.jsonl`
+    /// without direct filesystem access (#115).
+    PaneLedger {
+        pane_id: String,
+        #[serde(default)]
+        limit: usize,
+        #[serde(default)]
+        verify: bool,
+    },
+    /// Record a durable transport session lifecycle event (`session.started`,
+    /// `session.resumed`, `session.terminated`) in the target (or active) pane's
+    /// hash-chained ledger (#115).
+    SessionEvent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+        event: String,
+        #[serde(default)]
+        details: Value,
+    },
     /// Everything about a project in one document: the roll-up, each member
     /// pane's state, its full ledger with the chain verified, and the tail of
     /// its scrollback with controls stripped. `lines` = scrollback lines per
@@ -2966,6 +2986,119 @@ impl DaemonServer {
         Ok(json!({ "project": name, "total": total, "records": records }))
     }
 
+    fn validate_ledger_pane_key(pane_id: &str) -> Result<(), String> {
+        if pane_id.is_empty()
+            || pane_id.len() > 64
+            || !pane_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!("invalid pane id '{pane_id}'"));
+        }
+        Ok(())
+    }
+
+    fn handle_pane_ledger(
+        &self,
+        pane_id: &str,
+        limit: usize,
+        verify: bool,
+    ) -> Result<Value, String> {
+        Self::validate_ledger_pane_key(pane_id)?;
+        let dir = self
+            .ledger
+            .lock()
+            .map_err(|_| "ledger lock poisoned".to_string())?
+            .dir
+            .clone();
+        let path = ledger_path(&dir, pane_id);
+        if verify {
+            return match ledger_verify(&path) {
+                Ok(summary) => Ok(json!({
+                    "pane_id": pane_id,
+                    "ok": true,
+                    "records": summary.records,
+                    "head": summary.head,
+                    "items": read_ledger_tail(&path, 0),
+                })),
+                Err(broken) => Err(format!(
+                    "ledger break in {} at line {}{}: {}",
+                    pane_id,
+                    broken.line,
+                    broken
+                        .seq
+                        .map(|seq| format!(" (seq {seq})"))
+                        .unwrap_or_default(),
+                    broken.reason
+                )),
+            };
+        }
+        let capped_limit = if limit == 0 {
+            0
+        } else {
+            limit.min(PROJECT_LEDGER_MAX_LIMIT)
+        };
+        let records = read_ledger_tail(&path, capped_limit);
+        Ok(json!({
+            "pane_id": pane_id,
+            "records": records,
+        }))
+    }
+
+    fn handle_session_event(
+        &self,
+        pane_id: Option<&str>,
+        event: &str,
+        details: Value,
+        credential: Option<&str>,
+        holder: Option<&str>,
+    ) -> Result<Value, String> {
+        if !matches!(
+            event,
+            "session.started" | "session.resumed" | "session.terminated"
+        ) {
+            return Err(format!("unsupported session ledger event '{event}'"));
+        }
+        let target_pane = match pane_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(explicit) => {
+                Self::validate_ledger_pane_key(explicit)?;
+                self.ensure_pane_exists(explicit)?;
+                explicit.to_string()
+            }
+            None => {
+                let reg = self.lock_registry()?;
+                reg.active_pane_id
+                    .clone()
+                    .or_else(|| reg.panes.first().map(|p| p.id.clone()))
+                    .ok_or_else(|| "workspace has no panes to record session event".to_string())?
+            }
+        };
+        let mut payload = match details {
+            Value::Object(map) => Value::Object(map),
+            Value::Null => json!({}),
+            other => json!({ "detail": other }),
+        };
+        let encoded_len = serde_json::to_string(&payload)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
+        if encoded_len > 2048 {
+            return Err("session event details exceed 2048 bytes".to_string());
+        }
+        if let Some(cred) = credential {
+            payload["credential"] = Value::String(cred.to_string());
+        }
+        if let Some(h) = holder {
+            payload["holder"] = Value::String(h.to_string());
+        }
+        let record = self.ledger_record(&target_pane, event, payload)?;
+        Ok(json!({
+            "ok": true,
+            "pane_id": target_pane,
+            "seq": record.seq,
+            "h": record.h,
+        }))
+    }
+
     fn agent_usage_snapshot(&self) -> HashMap<String, AgentUsage> {
         self.agent_usage
             .lock()
@@ -4088,6 +4221,16 @@ impl DaemonServer {
             DaemonRequest::ProjectLedger { name, limit } => {
                 self.handle_project_ledger(&name, limit)
             }
+            DaemonRequest::PaneLedger {
+                pane_id,
+                limit,
+                verify,
+            } => self.handle_pane_ledger(&pane_id, limit, verify),
+            DaemonRequest::SessionEvent {
+                pane_id,
+                event,
+                details,
+            } => self.handle_session_event(pane_id.as_deref(), &event, details, None, None),
             DaemonRequest::LeaseStatus { pane_id } => {
                 self.ensure_pane_exists(&pane_id)?;
                 self.lease_info(&pane_id).map(|info| json!(info))
@@ -5858,6 +6001,17 @@ impl DaemonServer {
                 generation,
                 identity.credential.as_deref(),
             ),
+            DaemonRequest::SessionEvent {
+                pane_id,
+                event,
+                details,
+            } => self.handle_session_event(
+                pane_id.as_deref(),
+                &event,
+                details,
+                identity.credential.as_deref(),
+                identity.holder.as_deref(),
+            ),
             DaemonRequest::Whoami => Ok(identity.describe(self.identity_policy())),
             other => self.handle_with_peer(other, peer),
         }
@@ -6749,6 +6903,7 @@ pub struct AppState {
     startup_error: Mutex<Option<String>>,
     generation: AtomicU64,
     session: Mutex<ActiveSession>,
+    lease_trackers: Mutex<HashMap<String, ClientLeaseTracker>>,
 }
 
 impl AppState {
@@ -6769,7 +6924,26 @@ impl AppState {
                 client: None,
                 subscription: None,
             }),
+            lease_trackers: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn sync_lease_trackers_from_snapshot(&self, snapshot: &WorkspaceSnapshot) {
+        if let Ok(mut trackers) = self.lease_trackers.lock() {
+            trackers.clear();
+            for (pane_id, info) in &snapshot.leases {
+                let mut tracker = ClientLeaseTracker::default();
+                tracker.observe_server_lease(info);
+                trackers.insert(pane_id.clone(), tracker);
+            }
+        }
+    }
+
+    fn is_remote_target(&self) -> bool {
+        self.session
+            .lock()
+            .map(|g| matches!(g.target, WorkspaceTarget::Machine(_)))
+            .unwrap_or(false)
     }
 
     fn connect_for_target(target: &WorkspaceTarget) -> Result<DaemonClient, String> {
@@ -6853,6 +7027,8 @@ impl AppState {
         let sub = client.start_subscription(app);
         guard.client = Some(client);
         guard.subscription = Some(sub);
+        drop(guard);
+        self.sync_lease_trackers_from_snapshot(&snapshot);
         Ok(snapshot)
     }
 
@@ -6886,7 +7062,8 @@ async fn bootstrap_workspace(app: AppHandle) -> Result<WorkspaceSnapshot, String
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_clone.state::<AppState>();
         let client = state.client()?;
-        let snapshot = client.request(DaemonRequest::BootstrapWorkspace)?;
+        let snapshot: WorkspaceSnapshot = client.request(DaemonRequest::BootstrapWorkspace)?;
+        state.sync_lease_trackers_from_snapshot(&snapshot);
         state.ensure_subscription(app_clone.clone(), &client);
         Ok(snapshot)
     })
@@ -7023,10 +7200,23 @@ fn write_to_pane(
     state: State<'_, AppState>,
 ) -> Result<CommandOk, String> {
     let client = state.client()?;
+    let holder = effective_holder(&client);
+    if state.is_remote_target() {
+        if let Ok(trackers) = state.lease_trackers.lock() {
+            if let Some(tracker) = trackers.get(&pane_id) {
+                if matches!(
+                    tracker.phase(),
+                    ClientLeasePhase::Requested { .. } | ClientLeasePhase::Releasing { .. }
+                ) {
+                    tracker.can_send_local_input(LeasePolicy::Open, &holder)?;
+                }
+            }
+        }
+    }
     match client.request(DaemonRequest::SendInputAs {
         pane_id: pane_id.clone(),
         input: data.clone(),
-        holder: effective_holder(&client),
+        holder,
         generation: None,
     }) {
         Err(error) if error.contains("unknown variant") => {
@@ -7055,12 +7245,43 @@ fn take_lease(
 ) -> Result<LeaseInfo, String> {
     let client = state.client()?;
     let holder = effective_holder(&client);
-    client.request(DaemonRequest::TakeLease {
-        pane_id,
+    let remote = state.is_remote_target();
+    if remote {
+        if let Ok(mut trackers) = state.lease_trackers.lock() {
+            let _ = trackers
+                .entry(pane_id.clone())
+                .or_default()
+                .begin_take(&holder, now_millis());
+        }
+    }
+    match client.request::<LeaseInfo>(DaemonRequest::TakeLease {
+        pane_id: pane_id.clone(),
         holder,
         force,
         why,
-    })
+    }) {
+        Ok(info) => {
+            if let Ok(mut trackers) = state.lease_trackers.lock() {
+                let entry = trackers.entry(pane_id).or_default();
+                if let Some(ref h) = info.holder {
+                    let _ = entry.confirm_taken(h, info.generation.unwrap_or(0));
+                } else {
+                    entry.observe_server_lease(&info);
+                }
+            }
+            Ok(info)
+        }
+        Err(err) => {
+            if remote {
+                if let Ok(mut trackers) = state.lease_trackers.lock() {
+                    if let Some(t) = trackers.get_mut(&pane_id) {
+                        t.fail_take();
+                    }
+                }
+            }
+            Err(err)
+        }
+    }
 }
 
 #[tauri::command]
@@ -7071,19 +7292,51 @@ fn release_lease(
 ) -> Result<LeaseInfo, String> {
     let client = state.client()?;
     let holder = effective_holder(&client);
-    client.request(DaemonRequest::ReleaseLease {
-        pane_id,
+    let remote = state.is_remote_target();
+    if remote {
+        if let Ok(mut trackers) = state.lease_trackers.lock() {
+            if let Some(t) = trackers.get_mut(&pane_id) {
+                let _ = t.begin_release(now_millis());
+            }
+        }
+    }
+    match client.request::<LeaseInfo>(DaemonRequest::ReleaseLease {
+        pane_id: pane_id.clone(),
         holder,
         note,
         generation: None,
-    })
+    }) {
+        Ok(info) => {
+            if let Ok(mut trackers) = state.lease_trackers.lock() {
+                trackers.entry(pane_id).or_default().confirm_released();
+            }
+            Ok(info)
+        }
+        Err(err) => {
+            if remote {
+                if let Ok(mut trackers) = state.lease_trackers.lock() {
+                    if let Some(t) = trackers.get_mut(&pane_id) {
+                        t.fail_release();
+                    }
+                }
+            }
+            Err(err)
+        }
+    }
 }
 
 #[tauri::command]
 fn lease_status(pane_id: String, state: State<'_, AppState>) -> Result<LeaseInfo, String> {
-    state
-        .client()?
-        .request(DaemonRequest::LeaseStatus { pane_id })
+    let info: LeaseInfo = state.client()?.request(DaemonRequest::LeaseStatus {
+        pane_id: pane_id.clone(),
+    })?;
+    if let Ok(mut trackers) = state.lease_trackers.lock() {
+        trackers
+            .entry(pane_id)
+            .or_default()
+            .observe_server_lease(&info);
+    }
+    Ok(info)
 }
 
 /// A project's shared context notes, newest first, bodies scrubbed
@@ -7201,6 +7454,9 @@ mod daemon_client;
 use daemon_client::*;
 mod machines;
 use machines::*;
+mod ssm;
+use ssm::*;
+pub use ssm::{ClientLeasePhase, ClientLeaseTracker};
 mod ctl;
 use ctl::*;
 mod serve_http;
@@ -7284,6 +7540,22 @@ fn complete_ui_smoke(ok: bool, error: Option<String>) -> Result<(), String> {
 
 pub fn run() {
     let args = std::env::args().collect::<Vec<_>>();
+    if is_ssm_plugin_capture_invocation(&args) {
+        if let Err(error) = run_ssm_plugin_capture_from_args(&args) {
+            let _ = writeln!(std::io::stderr(), "sgian ssm-capture: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if args.iter().any(|arg| arg == SSM_TUNNEL_ARG) {
+        if let Err(error) = run_ssm_tunnel_from_args(&args) {
+            let _ = writeln!(std::io::stderr(), "sgian ssm-tunnel: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if is_control_invocation(&args) {
         if let Err(error) = run_control_cli_from_args(&args) {
             let _ = writeln!(std::io::stderr(), "sgianctl: {error}");

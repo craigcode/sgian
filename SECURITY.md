@@ -18,7 +18,13 @@ write needs a credential. Remote access (`ctl --machine` / saved `machines` in
 user-global `config.json`) uses a client-owned `ssh -N -L` tunnel (`BatchMode`,
 strict `--` host/command separation, shell-metacharacter validation on remote
 workspace paths, and `0600` non-symlinked token files or OS credential vaults)
-presenting a per-client credential; the daemon never listens on `0.0.0.0` or external interfaces.
+or an AWS Systems Manager Session Manager (`transport: "ssm"`, #115) `wss://`
+data-channel tunnel forwarding `127.0.0.1:<loopback_port>` over `smux` v1
+(authenticating AWS control-plane calls with the operator's ambient IAM/SSO
+credentials via `aws ssm`, verifying SHA-256 `PayloadDigest` on every binary
+`AgentMessage` frame with a strict `10 MiB` pre-allocation cap, failing closed
+if KMS `EncChallenge` is requested, and still requiring a valid Sgian
+`client_token` on the forwarded loopback IPC stream); the daemon never listens on `0.0.0.0` or external interfaces.
 Two opt-in `127.0.0.1`-only loopback listeners exist for SSH port forwarding:
 1. `remote_loopback_port` (`--listen-loopback <PORT>`, #116), primarily so a
    Windows daemon whose named pipe cannot be forwarded by OpenSSH `-L` can be
