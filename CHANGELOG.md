@@ -56,6 +56,14 @@ follow SemVer once the first public tag exists.
 
 ### Agents
 
+- Execution grants end-to-end with Kranz (`docs/design/execution-grants.md`):
+  Kranz's `SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`)
+  provisions/rotates `<repo>/.kranz/serve.grant.key` (`0600`) and routes
+  opted-in host ACP `terminal/*` lifecycles through
+  `sgian ctl --workspace <repo> --json grant exec|output|wait|kill|release`
+  using RFC 2104 HMAC-SHA256-signed canonical JSON `ExecutionGrant`s, durable
+  `grant.exec` ledger receipts, `kranz:<run>` pane leases, and fail-closed
+  `CleanupReceipt` verification.
 - `Codex` and `Gemini` chat-native agent backends (`src-tauri/src/agent_stream.rs`):
   `AgentBackendKind::Codex` (`codex exec --json` and `codex exec resume --json`)
   and `AgentBackendKind::Gemini` (`gemini --output-format stream-json` and
