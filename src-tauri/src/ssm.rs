@@ -13,16 +13,25 @@ use std::sync::OnceLock;
 //    10 MiB pre-allocation payload bound).
 // 2. Reliable sequence / ACK / EWMA-retransmit stream engine (`SsmStreamState`)
 //    with deferred-ACK backpressure and `ResumeSession` replay preparation.
-// 3. `xtaci/smux` v1 stream multiplexer for `AWS-StartPortForwardingSession`.
-// 4. Synchronous RFC 6455 WebSocket client (`ws://` + `wss://` via `rustls`).
-// 5. `ClientLeaseTracker` (`Requested` / `Releasing`) for round-trip transports.
-// 6. `aws` CLI `session-manager-plugin` capture shim and `--ssm-tunnel` bridge.
+// 3. AWS KMS session encryption (`KMSEncryption` / `EncChallengeRequest` /
+//    `EncChallengeResponse`) with 64-byte `GenerateDataKey` envelope key split
+//    and AES-256-GCM stream payload encryption via `ring::aead`.
+// 4. `xtaci/smux` v1 stream multiplexer for `AWS-StartPortForwardingSession`.
+// 5. Synchronous RFC 6455 WebSocket client (`ws://` + `wss://` via `rustls`).
+// 6. `ClientLeaseTracker` (`Requested` / `Releasing`) for round-trip transports.
+// 7. `aws` CLI `session-manager-plugin` capture shim and `--ssm-tunnel` bridge.
 // ---------------------------------------------------------------------------
 
 pub(crate) const SSM_PLUGIN_CAPTURE_ARG: &str = "--ssm-plugin-capture";
 pub(crate) const SSM_TUNNEL_ARG: &str = "--ssm-tunnel";
 pub(crate) const SSM_CAPTURE_FILE_ENV: &str = "SGIAN_SSM_CAPTURE_FILE";
+pub(crate) const SSM_KMS_CHALLENGE_CONTEXT_ENV: &str = "SGIAN_SSM_KMS_CHALLENGE_CONTEXT";
 pub(crate) const SSM_CLIENT_VERSION: &str = "1.2.463.0";
+
+pub(crate) const SSM_KMS_DATA_KEY_LEN: usize = 64;
+pub(crate) const SSM_KMS_HALF_KEY_LEN: usize = 32;
+pub(crate) const SSM_AES_GCM_NONCE_LEN: usize = 12;
+pub(crate) const SSM_AES_GCM_TAG_LEN: usize = 16;
 
 pub(crate) const SSM_HEADER_LEN: u32 = 116;
 pub(crate) const SSM_MAX_HEADER_LEN: u32 = 4096;
@@ -49,7 +58,10 @@ pub(crate) mod payload_type {
     pub(crate) const HANDSHAKE_RESPONSE: u32 = 6;
     pub(crate) const HANDSHAKE_COMPLETE: u32 = 7;
     pub(crate) const ENC_CHALLENGE_REQUEST: u32 = 8;
+    pub(crate) const ENC_CHALLENGE_RESPONSE: u32 = 9;
     pub(crate) const FLAG: u32 = 10;
+    pub(crate) const STD_ERR: u32 = 11;
+    pub(crate) const EXIT_CODE: u32 = 12;
 }
 
 const MAX_INBOUND_OOO_FRAMES: usize = 64;
@@ -456,19 +468,304 @@ pub(crate) struct ChannelClosedPayload {
     pub(crate) output: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct KmsEncryptionRequest {
+    #[serde(rename = "KMSKeyId", alias = "KMSKeyID")]
+    pub(crate) kms_key_id: String,
+    #[serde(rename = "Challenge", default, skip_serializing_if = "Option::is_none")]
+    pub(crate) challenge: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct KmsEncryptionResponse {
+    #[serde(rename = "KMSCipherTextKey")]
+    pub(crate) kms_cipher_text_key: String,
+    #[serde(
+        rename = "KMSCipherTextHash",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) kms_cipher_text_hash: Option<String>,
+    #[serde(
+        rename = "ChallengeAcknowledgement",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub(crate) challenge_acknowledgement: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct EncryptionChallengePayload {
+    #[serde(rename = "Challenge")]
+    pub(crate) challenge: String,
+}
+
+/// Zero-on-drop byte buffer used for transient KMS data-key and challenge
+/// plaintexts so raw key material is scrubbed on all exit paths without `unsafe`.
+pub(crate) struct ZeroizingBytes(Vec<u8>);
+
+impl ZeroizingBytes {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for ZeroizingBytes {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        std::hint::black_box(&mut self.0);
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn zeroize_slice(bytes: &mut [u8]) {
+    bytes.fill(0);
+    std::hint::black_box(bytes);
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) struct KmsDataKeyMaterial {
+    pub(crate) ciphertext_blob: Vec<u8>,
+    pub(crate) plaintext_key: ZeroizingBytes,
+    pub(crate) challenge_acknowledged: bool,
+}
+
+/// Client-side AWS SSM KMS session cipher matching upstream `encrypter.go` and
+/// `amazon-ssm-agent` `blockcipher.go`:
+/// - `plaintext_key` is 64 bytes from `kms:GenerateDataKey(NumberOfBytes=64)`.
+/// - `plaintext_key[0..32]` is the agent->client key (`decryption_key` on client).
+/// - `plaintext_key[32..64]` is the client->agent key (`encryption_key` on client).
+/// - Wire payload is `[nonce (12B) || AES-256-GCM ciphertext || tag (16B)]` with
+///   empty AAD.
+pub(crate) struct SsmKmsCipher {
+    encryption_key: ring::aead::LessSafeKey,
+    decryption_key: ring::aead::LessSafeKey,
+    challenge_verified: bool,
+}
+
+impl SsmKmsCipher {
+    pub(crate) fn from_client_data_key(plaintext_key: &[u8]) -> Result<Self, String> {
+        if plaintext_key.len() != SSM_KMS_DATA_KEY_LEN {
+            return Err(format!(
+                "invalid KMS plaintext data key length {} (expected {SSM_KMS_DATA_KEY_LEN})",
+                plaintext_key.len()
+            ));
+        }
+        let mut dec_raw = [0_u8; SSM_KMS_HALF_KEY_LEN];
+        let mut enc_raw = [0_u8; SSM_KMS_HALF_KEY_LEN];
+        dec_raw.copy_from_slice(&plaintext_key[..SSM_KMS_HALF_KEY_LEN]);
+        enc_raw.copy_from_slice(&plaintext_key[SSM_KMS_HALF_KEY_LEN..]);
+        let dec_res = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &dec_raw)
+            .map(ring::aead::LessSafeKey::new);
+        let enc_res = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &enc_raw)
+            .map(ring::aead::LessSafeKey::new);
+        zeroize_slice(&mut dec_raw);
+        zeroize_slice(&mut enc_raw);
+        let decryption_key =
+            dec_res.map_err(|_| "failed to initialize SSM KMS decryption key".to_string())?;
+        let encryption_key =
+            enc_res.map_err(|_| "failed to initialize SSM KMS encryption key".to_string())?;
+        Ok(Self {
+            encryption_key,
+            decryption_key,
+            challenge_verified: false,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_agent_side_for_test(plaintext_key: &[u8]) -> Result<Self, String> {
+        if plaintext_key.len() != SSM_KMS_DATA_KEY_LEN {
+            return Err(format!(
+                "invalid test agent KMS key length {}",
+                plaintext_key.len()
+            ));
+        }
+        let mut enc_raw = [0_u8; SSM_KMS_HALF_KEY_LEN];
+        let mut dec_raw = [0_u8; SSM_KMS_HALF_KEY_LEN];
+        enc_raw.copy_from_slice(&plaintext_key[..SSM_KMS_HALF_KEY_LEN]);
+        dec_raw.copy_from_slice(&plaintext_key[SSM_KMS_HALF_KEY_LEN..]);
+        let encryption_key = ring::aead::LessSafeKey::new(
+            ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &enc_raw)
+                .map_err(|_| "test agent enc key init failed".to_string())?,
+        );
+        let decryption_key = ring::aead::LessSafeKey::new(
+            ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &dec_raw)
+                .map_err(|_| "test agent dec key init failed".to_string())?,
+        );
+        zeroize_slice(&mut enc_raw);
+        zeroize_slice(&mut dec_raw);
+        Ok(Self {
+            encryption_key,
+            decryption_key,
+            challenge_verified: true,
+        })
+    }
+
+    pub(crate) fn challenge_verified(&self) -> bool {
+        self.challenge_verified
+    }
+
+    pub(crate) fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        let overhead = SSM_AES_GCM_NONCE_LEN + SSM_AES_GCM_TAG_LEN;
+        let total = plaintext
+            .len()
+            .checked_add(overhead)
+            .filter(|&len| len <= SSM_MAX_PAYLOAD_LEN as usize)
+            .ok_or_else(|| "SSM plaintext exceeds maximum encrypted payload bound".to_string())?;
+        let mut nonce_bytes = [0_u8; SSM_AES_GCM_NONCE_LEN];
+        fill_secure_random(&mut nonce_bytes)?;
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(plaintext);
+        let tag = self
+            .encryption_key
+            .seal_in_place_separate_tag(
+                ring::aead::Nonce::assume_unique_for_key(nonce_bytes),
+                ring::aead::Aad::empty(),
+                &mut out[SSM_AES_GCM_NONCE_LEN..],
+            )
+            .map_err(|_| "SSM AES-256-GCM encryption failed".to_string())?;
+        out.extend_from_slice(tag.as_ref());
+        Ok(out)
+    }
+
+    pub(crate) fn decrypt(&self, ciphertext_with_nonce: &[u8]) -> Result<Vec<u8>, String> {
+        let min_len = SSM_AES_GCM_NONCE_LEN + SSM_AES_GCM_TAG_LEN;
+        if ciphertext_with_nonce.len() < min_len {
+            return Err(format!(
+                "SSM encrypted payload truncated: {} bytes (minimum {min_len})",
+                ciphertext_with_nonce.len()
+            ));
+        }
+        if ciphertext_with_nonce.len() > SSM_MAX_PAYLOAD_LEN as usize {
+            return Err(format!(
+                "SSM encrypted payload length {} exceeds maximum {}",
+                ciphertext_with_nonce.len(),
+                SSM_MAX_PAYLOAD_LEN
+            ));
+        }
+        let mut nonce_bytes = [0_u8; SSM_AES_GCM_NONCE_LEN];
+        nonce_bytes.copy_from_slice(&ciphertext_with_nonce[..SSM_AES_GCM_NONCE_LEN]);
+        let mut buf = ciphertext_with_nonce[SSM_AES_GCM_NONCE_LEN..].to_vec();
+        let plain_len = self
+            .decryption_key
+            .open_in_place(
+                ring::aead::Nonce::assume_unique_for_key(nonce_bytes),
+                ring::aead::Aad::empty(),
+                &mut buf,
+            )
+            .map_err(|_| "SSM AES-256-GCM authentication tag verification failed".to_string())?
+            .len();
+        buf.truncate(plain_len);
+        Ok(buf)
+    }
+
+    pub(crate) fn decrypt_stream_payload(
+        &self,
+        ciphertext_with_nonce: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if !self.challenge_verified {
+            return Err(
+                "SSM encrypted stream payload arrived before EncChallengeRequest verification"
+                    .to_string(),
+            );
+        }
+        self.decrypt(ciphertext_with_nonce)
+    }
+
+    pub(crate) fn handle_challenge_request(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let req: EncryptionChallengePayload = serde_json::from_slice(payload)
+            .map_err(|error| format!("invalid SSM EncChallengeRequest JSON: {error}"))?;
+        let encrypted_challenge = base64_decode(&req.challenge)
+            .map_err(|error| format!("invalid SSM EncChallengeRequest base64: {error}"))?;
+        let plain_challenge = ZeroizingBytes::new(self.decrypt(&encrypted_challenge)?);
+        let reencrypted = self.encrypt(plain_challenge.as_slice())?;
+        self.challenge_verified = true;
+        let resp = EncryptionChallengePayload {
+            challenge: base64_encode(&reencrypted),
+        };
+        serde_json::to_vec(&resp)
+            .map_err(|error| format!("failed to serialize EncChallengeResponse: {error}"))
+    }
+}
+
+pub(crate) fn validate_kms_key_id(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 2048 {
+        return Err("invalid SSM KMSKeyId: must be 1..=2048 characters".to_string());
+    }
+    if trimmed.starts_with('-') {
+        return Err("invalid SSM KMSKeyId: must not start with '-'".to_string());
+    }
+    if trimmed.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err("invalid SSM KMSKeyId: contains control characters".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+#[cfg(test)]
+type NoopKmsGenerator = fn(&str, Option<&str>) -> Result<KmsDataKeyMaterial, String>;
+
+#[cfg(test)]
 pub(crate) fn build_handshake_response(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let none_gen: Option<NoopKmsGenerator> = None;
+    negotiate_handshake_response(payload, none_gen).map(|(bytes, _)| bytes)
+}
+
+pub(crate) fn negotiate_handshake_response<F>(
+    payload: &[u8],
+    mut kms_generator: Option<F>,
+) -> Result<(Vec<u8>, Option<SsmKmsCipher>), String>
+where
+    F: FnMut(&str, Option<&str>) -> Result<KmsDataKeyMaterial, String>,
+{
     let req: HandshakeRequestPayload = serde_json::from_slice(payload)
         .map_err(|error| format!("invalid SSM HandshakeRequest payload: {error}"))?;
     let mut processed = Vec::with_capacity(req.requested_client_actions.len());
+    let mut negotiated_cipher: Option<SsmKmsCipher> = None;
+
     for action in &req.requested_client_actions {
         match action.action_type.as_str() {
             "KMSEncryption" => {
-                return Err(
-                    "SSM session requires AWS KMS session encryption (KMSEncryption / EncChallenge), \
-                     which is not yet supported; disable KMS encryption on the Session Manager preferences \
-                     or connect via SSH"
-                        .to_string(),
-                );
+                if negotiated_cipher.is_some() {
+                    return Err(
+                        "duplicate KMSEncryption action in SSM HandshakeRequest".to_string()
+                    );
+                }
+                let Some(ref mut generator) = kms_generator else {
+                    return Err(
+                        "SSM session requires AWS KMS session encryption (KMSEncryption), \
+                         but no KMS key provider is configured"
+                            .to_string(),
+                    );
+                };
+                let kms_req: KmsEncryptionRequest =
+                    serde_json::from_value(action.action_parameters.clone()).map_err(|error| {
+                        format!("invalid SSM KMSEncryption ActionParameters: {error}")
+                    })?;
+                let kms_key_id = validate_kms_key_id(&kms_req.kms_key_id)?;
+                let material = generator(&kms_key_id, kms_req.challenge.as_deref())?;
+                if material.ciphertext_blob.is_empty() {
+                    return Err("KMS GenerateDataKey returned empty CiphertextBlob".to_string());
+                }
+                let cipher = SsmKmsCipher::from_client_data_key(material.plaintext_key.as_slice())?;
+                let action_result = serde_json::to_value(KmsEncryptionResponse {
+                    kms_cipher_text_key: base64_encode(&material.ciphertext_blob),
+                    kms_cipher_text_hash: None,
+                    challenge_acknowledgement: material.challenge_acknowledged,
+                })
+                .map_err(|error| format!("failed to serialize KMSEncryptionResponse: {error}"))?;
+                negotiated_cipher = Some(cipher);
+                processed.push(ProcessedClientAction {
+                    action_type: "KMSEncryption".to_string(),
+                    action_status: 1, // Success
+                    action_result: Some(action_result),
+                    error: None,
+                });
             }
             "SessionType" => {
                 let session_type = action
@@ -505,8 +802,9 @@ pub(crate) fn build_handshake_response(payload: &[u8]) -> Result<Vec<u8>, String
         processed_client_actions: processed,
         errors: Vec::new(),
     };
-    serde_json::to_vec(&resp)
-        .map_err(|error| format!("failed to encode HandshakeResponse: {error}"))
+    let bytes = serde_json::to_vec(&resp)
+        .map_err(|error| format!("failed to encode HandshakeResponse: {error}"))?;
+    Ok((bytes, negotiated_cipher))
 }
 
 // ---------------------------------------------------------------------------
@@ -658,12 +956,6 @@ impl SsmStreamState {
     ) -> Result<InboundOutcome, String> {
         match msg.message_type.as_str() {
             MSG_OUTPUT_STREAM_DATA => {
-                if msg.payload_type == payload_type::ENC_CHALLENGE_REQUEST {
-                    return Err(
-                        "SSM EncChallengeRequest received; KMS encryption is not supported"
-                            .to_string(),
-                    );
-                }
                 let seq = msg.sequence_number;
                 if seq < self.expected_incoming_seq {
                     // Already delivered to local sink: re-ACK immediately so ssm-agent
@@ -1237,6 +1529,66 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    fn sextet(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let clean: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if clean.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !clean.len().is_multiple_of(4) {
+        return Err(format!(
+            "invalid base64 length {} (must be a multiple of 4)",
+            clean.len()
+        ));
+    }
+
+    let mut out = Vec::with_capacity((clean.len() / 4) * 3);
+    let chunks = clean.as_chunks::<4>().0;
+    let total_chunks = chunks.len();
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        let is_last = chunk_idx + 1 == total_chunks;
+        let v0 = sextet(chunk[0]).ok_or_else(|| "invalid base64 character".to_string())?;
+        let v1 = sextet(chunk[1]).ok_or_else(|| "invalid base64 character".to_string())?;
+        match (chunk[2], chunk[3]) {
+            (b'=', b'=') if is_last => {
+                if (v1 & 0x0F) != 0 {
+                    return Err("non-canonical trailing base64 bits".to_string());
+                }
+                out.push((v0 << 2) | (v1 >> 4));
+            }
+            (c2, b'=') if is_last && c2 != b'=' => {
+                let v2 = sextet(c2).ok_or_else(|| "invalid base64 character".to_string())?;
+                if (v2 & 0x03) != 0 {
+                    return Err("non-canonical trailing base64 bits".to_string());
+                }
+                out.push((v0 << 2) | (v1 >> 4));
+                out.push(((v1 & 0x0F) << 4) | (v2 >> 2));
+            }
+            (c2, c3) if c2 != b'=' && c3 != b'=' => {
+                let v2 = sextet(c2).ok_or_else(|| "invalid base64 character".to_string())?;
+                let v3 = sextet(c3).ok_or_else(|| "invalid base64 character".to_string())?;
+                out.push((v0 << 2) | (v1 >> 4));
+                out.push(((v1 & 0x0F) << 4) | (v2 >> 2));
+                out.push(((v2 & 0x03) << 6) | v3);
+            }
+            _ => {
+                return Err("invalid base64 padding".to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn compute_websocket_accept(sec_key: &str) -> String {
@@ -1975,6 +2327,169 @@ fn terminate_ssm_session_best_effort(aws_bin: &str, session_id: &str) {
     let _ = run_subprocess_bounded(&mut cmd, Duration::from_secs(5));
 }
 
+#[derive(Deserialize)]
+struct AwsCliKmsDataKeyOutput {
+    #[serde(rename = "Plaintext")]
+    plaintext: String,
+    #[serde(rename = "CiphertextBlob")]
+    ciphertext_blob: String,
+}
+
+pub(crate) fn infer_kms_region(kms_key_id: &str, stream_url: &str) -> Option<String> {
+    let valid_region = |candidate: &str| -> bool {
+        !candidate.is_empty()
+            && candidate.len() <= 64
+            && !candidate.starts_with('-')
+            && candidate
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+
+    if kms_key_id.starts_with("arn:") {
+        let parts: Vec<&str> = kms_key_id.splitn(6, ':').collect();
+        if parts.len() >= 5 && parts[2] == "kms" && valid_region(parts[3]) {
+            return Some(parts[3].to_string());
+        }
+    }
+
+    if let Ok(parsed) = parse_ws_url(stream_url) {
+        let host_lower = parsed.host.to_ascii_lowercase();
+        if let Some(after) = host_lower.strip_prefix("ssmmessages.") {
+            if let Some((region, tail)) = after.split_once('.') {
+                if (tail.starts_with("amazonaws.")
+                    || tail.ends_with(".ic.gov")
+                    || tail.ends_with(".scloud"))
+                    && valid_region(region)
+                {
+                    return Some(region.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn validate_kms_context_value(label: &str, raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 512 {
+        return Err(format!(
+            "invalid SSM KMS encryption context {label}: must be 1..=512 characters"
+        ));
+    }
+    if trimmed.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err(format!(
+            "invalid SSM KMS encryption context {label}: contains control characters"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+pub(crate) fn run_aws_kms_generate_data_key(
+    aws_bin: &str,
+    kms_key_id: &str,
+    session_id: &str,
+    target_id: &str,
+    stream_url: &str,
+    random_challenge: Option<&str>,
+    include_random_challenge: bool,
+) -> Result<KmsDataKeyMaterial, String> {
+    let valid_key_id = validate_kms_key_id(kms_key_id)?;
+    let valid_session = validate_kms_context_value("SessionId", session_id)?;
+    let valid_target = validate_kms_context_value("TargetId", target_id)?;
+
+    let mut enc_ctx = serde_json::Map::new();
+    enc_ctx.insert(
+        "aws:ssm:SessionId".to_string(),
+        Value::String(valid_session),
+    );
+    enc_ctx.insert("aws:ssm:TargetId".to_string(), Value::String(valid_target));
+    let mut challenge_acknowledged = false;
+    if include_random_challenge {
+        if let Some(ch) = random_challenge.map(str::trim).filter(|s| !s.is_empty()) {
+            let valid_challenge = validate_kms_context_value("RandomChallenge", ch)?;
+            enc_ctx.insert(
+                "aws:ssm:RandomChallenge".to_string(),
+                Value::String(valid_challenge),
+            );
+            challenge_acknowledged = true;
+        }
+    }
+    let enc_ctx_json = Value::Object(enc_ctx).to_string();
+
+    let mut aws_args = vec![
+        "kms".to_string(),
+        "generate-data-key".to_string(),
+        "--key-id".to_string(),
+        valid_key_id.clone(),
+        "--number-of-bytes".to_string(),
+        SSM_KMS_DATA_KEY_LEN.to_string(),
+        "--encryption-context".to_string(),
+        enc_ctx_json,
+        "--output".to_string(),
+        "json".to_string(),
+    ];
+    if let Some(region) = infer_kms_region(&valid_key_id, stream_url) {
+        aws_args.push("--region".to_string());
+        aws_args.push(region);
+    }
+
+    let mut cmd = Command::new(aws_bin);
+    cmd.args(&aws_args)
+        .env("AWS_PAGER", "")
+        .stdin(Stdio::null());
+    configure_daemon_process(&mut cmd);
+
+    let output = run_subprocess_bounded(&mut cmd, Duration::from_secs(15))
+        .map_err(|e| format!("failed to execute '{aws_bin} kms generate-data-key': {e}"))?;
+    let stdout_guard = ZeroizingBytes::new(output.stdout);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("exit status {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(format!("aws kms generate-data-key failed: {detail}"));
+    }
+
+    let mut parsed: AwsCliKmsDataKeyOutput = serde_json::from_slice(stdout_guard.as_slice())
+        .map_err(|_| "failed to parse aws kms generate-data-key JSON output".to_string())?;
+    let plain_res = base64_decode(&parsed.plaintext);
+    let cipher_res = base64_decode(&parsed.ciphertext_blob);
+    // Scrub base64 plaintext string before propagating any decode error.
+    let mut plain_str_bytes = std::mem::take(&mut parsed.plaintext).into_bytes();
+    zeroize_slice(&mut plain_str_bytes);
+
+    let plaintext_vec = ZeroizingBytes::new(
+        plain_res
+            .map_err(|_| "invalid base64 Plaintext in KMS GenerateDataKey output".to_string())?,
+    );
+    if plaintext_vec.as_slice().len() != SSM_KMS_DATA_KEY_LEN {
+        return Err(format!(
+            "KMS GenerateDataKey returned {}-byte Plaintext (expected {SSM_KMS_DATA_KEY_LEN})",
+            plaintext_vec.as_slice().len()
+        ));
+    }
+    let ciphertext_blob = cipher_res
+        .map_err(|_| "invalid base64 CiphertextBlob in KMS GenerateDataKey output".to_string())?;
+    if ciphertext_blob.is_empty() || ciphertext_blob.len() > 64 * 1024 {
+        return Err("KMS GenerateDataKey returned invalid CiphertextBlob length".to_string());
+    }
+
+    Ok(KmsDataKeyMaterial {
+        ciphertext_blob,
+        plaintext_key: plaintext_vec,
+        challenge_acknowledged,
+    })
+}
+
+fn kms_challenge_context_enabled() -> bool {
+    std::env::var(SSM_KMS_CHALLENGE_CONTEXT_ENV)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE"))
+}
+
 fn remote_ssm_discovery_command(workspace: &str) -> String {
     let escaped = workspace.replace('"', "\\\"");
     format!("sgian ctl --workspace \"{escaped}\" --json ipc-endpoint")
@@ -2005,7 +2520,7 @@ pub(crate) fn discover_ssm_remote_loopback_port(
     ];
     let creds = run_aws_ssm_session_command(aws_bin, &aws_args, runtime_dir)?;
     let client_id = SsmUuid::new_v4()?.to_string();
-    let result = collect_ssm_discovery_output(&creds, &client_id);
+    let result = collect_ssm_discovery_output(&creds, &client_id, aws_bin, target);
     terminate_ssm_session_best_effort(aws_bin, &creds.session_id);
     let raw_stdout = result?;
     let cleaned = strip_terminal_controls(&raw_stdout);
@@ -2036,6 +2551,8 @@ pub(crate) fn discover_ssm_remote_loopback_port(
 fn collect_ssm_discovery_output(
     creds: &SsmSessionCredentials,
     client_id: &str,
+    aws_bin: &str,
+    target_id: &str,
 ) -> Result<String, String> {
     let mut ws = WsStream::connect(&creds.stream_url, Duration::from_secs(10))?;
     let open = OpenDataChannelInput::new(&creds.token_value, client_id)?;
@@ -2045,6 +2562,7 @@ fn collect_ssm_discovery_output(
     ws.set_poll_timeout(Some(Duration::from_millis(50)));
 
     let mut state = SsmStreamState::new();
+    let mut kms_cipher: Option<SsmKmsCipher> = None;
     let mut collected = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(15);
 
@@ -2058,11 +2576,27 @@ fn collect_ssm_discovery_output(
                     ws.send_binary(&dup_ack.encode()?)?;
                 }
                 while let Some(deliv) = state.peek_next_deliverable() {
-                    let ack = state.commit_inbound_delivered(&deliv, now)?;
-                    ws.send_binary(&ack.encode()?)?;
                     match deliv.payload_type {
                         payload_type::HANDSHAKE_REQUEST => {
-                            let resp_bytes = build_handshake_response(&deliv.payload)?;
+                            let ack = state.commit_inbound_delivered(&deliv, now)?;
+                            ws.send_binary(&ack.encode()?)?;
+                            let use_ch = kms_challenge_context_enabled();
+                            let (resp_bytes, negotiated) = negotiate_handshake_response(
+                                &deliv.payload,
+                                Some(|key_id: &str, ch: Option<&str>| {
+                                    run_aws_kms_generate_data_key(
+                                        aws_bin,
+                                        key_id,
+                                        &creds.session_id,
+                                        target_id,
+                                        &creds.stream_url,
+                                        ch,
+                                        use_ch,
+                                    )
+                                }),
+                            )
+                            .inspect_err(|_| ws.close())?;
+                            kms_cipher = negotiated;
                             let out_msg = state.queue_outbound_data(
                                 payload_type::HANDSHAKE_RESPONSE,
                                 resp_bytes,
@@ -2071,8 +2605,48 @@ fn collect_ssm_discovery_output(
                             )?;
                             ws.send_binary(&out_msg.encode()?)?;
                         }
+                        payload_type::ENC_CHALLENGE_REQUEST => {
+                            let ack = state.commit_inbound_delivered(&deliv, now)?;
+                            ws.send_binary(&ack.encode()?)?;
+                            let cipher = kms_cipher.as_mut().ok_or_else(|| {
+                                ws.close();
+                                "SSM EncChallengeRequest arrived without active KMSEncryption handshake"
+                                    .to_string()
+                            })?;
+                            let resp_bytes = cipher
+                                .handle_challenge_request(&deliv.payload)
+                                .inspect_err(|_| ws.close())?;
+                            let out_msg = state.queue_outbound_data(
+                                payload_type::ENC_CHALLENGE_RESPONSE,
+                                resp_bytes,
+                                SSM_FLAG_DATA,
+                                now,
+                            )?;
+                            ws.send_binary(&out_msg.encode()?)?;
+                        }
+                        payload_type::HANDSHAKE_COMPLETE => {
+                            if let Some(ref c) = kms_cipher {
+                                if !c.challenge_verified() {
+                                    ws.close();
+                                    return Err(
+                                        "SSM HandshakeComplete arrived before EncChallengeRequest verification"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                            let ack = state.commit_inbound_delivered(&deliv, now)?;
+                            ws.send_binary(&ack.encode()?)?;
+                        }
                         payload_type::OUTPUT => {
-                            collected.extend_from_slice(&deliv.payload);
+                            let plain = match kms_cipher.as_ref() {
+                                Some(c) => c
+                                    .decrypt_stream_payload(&deliv.payload)
+                                    .inspect_err(|_| ws.close())?,
+                                None => deliv.payload.clone(),
+                            };
+                            let ack = state.commit_inbound_delivered(&deliv, now)?;
+                            ws.send_binary(&ack.encode()?)?;
+                            collected.extend_from_slice(&plain);
                             if collected.len() > 256 * 1024 {
                                 ws.close();
                                 return Err("SSM ipc-endpoint discovery output exceeded 256 KiB"
@@ -2085,7 +2659,18 @@ fn collect_ssm_discovery_output(
                                 return Ok(text.into_owned());
                             }
                         }
-                        _ => {}
+                        payload_type::STD_ERR | payload_type::EXIT_CODE => {
+                            if let Some(ref c) = kms_cipher {
+                                c.decrypt_stream_payload(&deliv.payload)
+                                    .inspect_err(|_| ws.close())?;
+                            }
+                            let ack = state.commit_inbound_delivered(&deliv, now)?;
+                            ws.send_binary(&ack.encode()?)?;
+                        }
+                        _ => {
+                            let ack = state.commit_inbound_delivered(&deliv, now)?;
+                            ws.send_binary(&ack.encode()?)?;
+                        }
                     }
                 }
                 if matches!(outcome, InboundOutcome::ChannelClosed { .. }) {
@@ -2346,12 +2931,17 @@ fn open_mgs_data_channel(
 
 fn enqueue_smux_frame(
     state: &mut SsmStreamState,
+    kms_cipher: Option<&SsmKmsCipher>,
     ws: &mut WsStream,
     frame: &SmuxFrame,
     now_ms: u64,
 ) -> Result<(), String> {
-    let bytes = frame.encode()?;
-    let msg = state.queue_outbound_data(payload_type::OUTPUT, bytes, SSM_FLAG_DATA, now_ms)?;
+    let raw_bytes = frame.encode()?;
+    let payload = match kms_cipher {
+        Some(cipher) => cipher.encrypt(&raw_bytes)?,
+        None => raw_bytes,
+    };
+    let msg = state.queue_outbound_data(payload_type::OUTPUT, payload, SSM_FLAG_DATA, now_ms)?;
     ws.send_binary(&msg.encode()?)
 }
 
@@ -2417,6 +3007,7 @@ pub(crate) fn run_ssm_tunnel_from_args(args: &[String]) -> Result<(), String> {
     let mut creds = start_port_forwarding_session(&cfg)?;
     let mut ws = open_mgs_data_channel(&creds, &client_id)?;
     let mut state = SsmStreamState::new();
+    let mut kms_cipher: Option<SsmKmsCipher> = None;
     let mut smux_decoder = SmuxDecoder::new();
 
     // Bind the local listener ONLY after the initial SSM session and MGS data
@@ -2489,7 +3080,15 @@ pub(crate) fn run_ssm_tunnel_from_args(args: &[String]) -> Result<(), String> {
                     let _ = conn.set_nonblocking(true);
                     let sid = next_stream_id;
                     next_stream_id = next_stream_id.wrapping_add(2);
-                    if enqueue_smux_frame(&mut state, &mut ws, &SmuxFrame::syn(sid), now).is_ok() {
+                    if enqueue_smux_frame(
+                        &mut state,
+                        kms_cipher.as_ref(),
+                        &mut ws,
+                        &SmuxFrame::syn(sid),
+                        now,
+                    )
+                    .is_ok()
+                    {
                         streams.insert(
                             sid,
                             ActiveSmuxStream {
@@ -2552,7 +3151,13 @@ pub(crate) fn run_ssm_tunnel_from_args(args: &[String]) -> Result<(), String> {
                 }
                 Ok(n) => {
                     for chunk in SmuxFrame::psh_chunks(sid, &buf[..n]) {
-                        let _ = enqueue_smux_frame(&mut state, &mut ws, &chunk, now);
+                        let _ = enqueue_smux_frame(
+                            &mut state,
+                            kms_cipher.as_ref(),
+                            &mut ws,
+                            &chunk,
+                            now,
+                        );
                     }
                     did_work = true;
                 }
@@ -2568,7 +3173,13 @@ pub(crate) fn run_ssm_tunnel_from_args(args: &[String]) -> Result<(), String> {
             if let Some(removed) = streams.remove(&sid) {
                 removed.conn.shutdown_both();
                 if send_fin && state.handshake_complete() {
-                    let _ = enqueue_smux_frame(&mut state, &mut ws, &SmuxFrame::fin(sid), now);
+                    let _ = enqueue_smux_frame(
+                        &mut state,
+                        kms_cipher.as_ref(),
+                        &mut ws,
+                        &SmuxFrame::fin(sid),
+                        now,
+                    );
                 }
             }
         }
@@ -2583,8 +3194,25 @@ pub(crate) fn run_ssm_tunnel_from_args(args: &[String]) -> Result<(), String> {
                 let mut fatal_err: Option<String> = None;
                 match deliv.payload_type {
                     payload_type::HANDSHAKE_REQUEST => {
-                        match build_handshake_response(&deliv.payload) {
-                            Ok(resp_bytes) => {
+                        let use_ch = kms_challenge_context_enabled();
+                        let session_id = creds.session_id.clone();
+                        let stream_url = creds.stream_url.clone();
+                        match negotiate_handshake_response(
+                            &deliv.payload,
+                            Some(|key_id: &str, ch: Option<&str>| {
+                                run_aws_kms_generate_data_key(
+                                    &cfg.aws_bin,
+                                    key_id,
+                                    &session_id,
+                                    &cfg.target,
+                                    &stream_url,
+                                    ch,
+                                    use_ch,
+                                )
+                            }),
+                        ) {
+                            Ok((resp_bytes, negotiated)) => {
+                                kms_cipher = negotiated;
                                 if let Ok(out_msg) = state.queue_outbound_data(
                                     payload_type::HANDSHAKE_RESPONSE,
                                     resp_bytes,
@@ -2597,13 +3225,47 @@ pub(crate) fn run_ssm_tunnel_from_args(args: &[String]) -> Result<(), String> {
                             Err(err) => fatal_err = Some(err),
                         }
                     }
+                    payload_type::ENC_CHALLENGE_REQUEST => match kms_cipher.as_mut() {
+                        Some(cipher) => match cipher.handle_challenge_request(&deliv.payload) {
+                            Ok(resp_bytes) => {
+                                if let Ok(out_msg) = state.queue_outbound_data(
+                                    payload_type::ENC_CHALLENGE_RESPONSE,
+                                    resp_bytes,
+                                    SSM_FLAG_DATA,
+                                    now,
+                                ) {
+                                    let _ = ws.send_binary(&out_msg.encode()?);
+                                }
+                            }
+                            Err(err) => fatal_err = Some(err),
+                        },
+                        None => {
+                            fatal_err = Some(
+                                "SSM EncChallengeRequest arrived without active KMSEncryption handshake"
+                                    .to_string(),
+                            );
+                        }
+                    },
                     payload_type::HANDSHAKE_COMPLETE => {
-                        // Handshake marked complete inside `commit_inbound_delivered`.
+                        if let Some(ref cipher) = kms_cipher {
+                            if !cipher.challenge_verified() {
+                                fatal_err = Some(
+                                    "SSM HandshakeComplete arrived before EncChallengeRequest verification"
+                                        .to_string(),
+                                );
+                            }
+                        }
                     }
                     payload_type::OUTPUT => {
-                        // If an agent skips explicit handshake, treat first Output as ready.
-                        state.handshake_complete = true;
-                        match smux_decoder.push(&deliv.payload) {
+                        let decrypted = match kms_cipher.as_ref() {
+                            Some(cipher) => cipher.decrypt_stream_payload(&deliv.payload),
+                            None => {
+                                // Only unencrypted sessions may implicitly mark ready on first Output.
+                                state.handshake_complete = true;
+                                Ok(deliv.payload.clone())
+                            }
+                        };
+                        match decrypted.and_then(|plain| smux_decoder.push(&plain)) {
                             Ok(smux_frames) => {
                                 for sf in smux_frames {
                                     match sf.cmd {
@@ -2625,6 +3287,13 @@ pub(crate) fn run_ssm_tunnel_from_args(args: &[String]) -> Result<(), String> {
                             Err(err) => fatal_err = Some(err),
                         }
                     }
+                    payload_type::STD_ERR | payload_type::EXIT_CODE => {
+                        if let Some(ref cipher) = kms_cipher {
+                            if let Err(err) = cipher.decrypt_stream_payload(&deliv.payload) {
+                                fatal_err = Some(err);
+                            }
+                        }
+                    }
                     // Port forwarding Flag payload (e.g. ConnectToPortError = 2).
                     payload_type::FLAG if deliv.payload.len() == 4 => {
                         let flag_val = u32::from_be_bytes(deliv.payload[0..4].try_into().unwrap());
@@ -2638,14 +3307,14 @@ pub(crate) fn run_ssm_tunnel_from_args(args: &[String]) -> Result<(), String> {
                     _ => {}
                 }
 
-                let ack = state.commit_inbound_delivered(&deliv, now)?;
-                let _ = ws.send_binary(&ack.encode()?);
-                did_work = true;
                 if let Some(err) = fatal_err {
                     ws.close();
                     terminate_ssm_session_best_effort(&cfg.aws_bin, &creds.session_id);
                     return Err(err);
                 }
+                let ack = state.commit_inbound_delivered(&deliv, now)?;
+                let _ = ws.send_binary(&ack.encode()?);
+                did_work = true;
             }
         }
 
@@ -2694,6 +3363,7 @@ pub(crate) fn run_ssm_tunnel_from_args(args: &[String]) -> Result<(), String> {
             creds = fresh_creds;
             ws = fresh_ws;
             state = SsmStreamState::new();
+            kms_cipher = None;
             smux_decoder = SmuxDecoder::new();
             pending_audit_events.push_back((
                 "session.terminated".to_string(),
@@ -2746,6 +3416,7 @@ pub(crate) fn run_ssm_tunnel_from_args(args: &[String]) -> Result<(), String> {
                     creds = fresh_creds;
                     ws = fresh_ws;
                     state = SsmStreamState::new();
+                    kms_cipher = None;
                     smux_decoder = SmuxDecoder::new();
                     pending_audit_events.push_back((
                         "session.terminated".to_string(),

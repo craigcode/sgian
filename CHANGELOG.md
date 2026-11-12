@@ -57,9 +57,13 @@ follow SemVer once the first public tag exists.
 ### Agents
 
 - Execution grants end-to-end with Kranz (`docs/design/execution-grants.md`):
-  Kranz's `SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`)
-  provisions/rotates `<repo>/.kranz/serve.grant.key` (`0600`) and routes
-  opted-in host ACP `terminal/*` lifecycles through
+  Kranz's `SgianTerminalProvider` (`kranz_acp::terminal::TerminalProvider`,
+  wired behind `AcpBackend::with_sgian_terminals` and automatically attached
+  per run by `AcpBackend::for_mission_worker` / `MissionEngine` when
+  `KRANZ_SGIAN_BIN` and `<repo>/.kranz/serve.grant.key` are present on
+  uncontained `sandbox.enforce: off` host sessions) provisions/rotates
+  `<repo>/.kranz/serve.grant.key` (`0600`) and routes opted-in host ACP
+  `terminal/*` lifecycles through
   `sgian ctl --workspace <repo> --json grant exec|output|wait|kill|release`
   using RFC 2104 HMAC-SHA256-signed canonical JSON `ExecutionGrant`s, durable
   `grant.exec` ledger receipts, `kranz:<run>` pane leases, and fail-closed
@@ -83,7 +87,11 @@ follow SemVer once the first public tag exists.
 - AWS SSM Session Manager remote transport (`transport: "ssm"`, part of #115):
   binary `AgentMessage` wire codec (half-swapped `MessageId` UUIDs, SHA-256
   `PayloadDigest`, `10 MiB` payload bound), deferred-ACK backpressure and EWMA
-  retransmit stream engine (`SsmStreamState`), `xtaci/smux` v1 multiplexing over
+  retransmit stream engine (`SsmStreamState`), AWS KMS session encryption
+  (`KMSEncryption` / `EncChallengeRequest` / `EncChallengeResponse` via
+  `aws kms generate-data-key` 64-byte directional key split and `ring::aead`
+  AES-256-GCM authenticated encryption across both `ipc-endpoint` discovery and
+  `smux` port forwarding), `xtaci/smux` v1 multiplexing over
   `AWS-StartPortForwardingSession`, `rustls`-backed `wss://` MGS WebSocket
   client, `aws` CLI `session-manager-plugin` capture shim (no external plugin
   install required), `ClientLeaseTracker` (`Requested` / `Releasing`),

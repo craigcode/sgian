@@ -266,26 +266,32 @@ Shipped (2026-09-16):
   `client_token` enforcement on loopback TCP handshakes, `"tcp_loopback"` client
   transport in Rust and `Sgian.Protocol`, and Task Scheduler S4U / Session 0
   ConPTY operational guidance (`docs/scripting-and-local-operation.md`).
-- **M5 AWS SSM Session Manager transport framing and mock MGS harness (part of #115).**
+- **M5 AWS SSM Session Manager transport framing, KMS envelope encryption, and mock MGS harness (part of #115).**
   `src-tauri/src/ssm.rs` implements the AWS SSM `AgentMessage` binary wire codec
   (`116..=4096`-byte big-endian header, half-swapped `[LSB_8 | MSB_8]` UUID wire
   layout, SHA-256 `PayloadDigest`, `10 MiB` pre-allocation cap), reliable sequence
   and EWMA-retransmit stream engine (`SsmStreamState`) with deferred-ACK
-  backpressure, `xtaci/smux` v1 multiplexing over `AWS-StartPortForwardingSession`,
-  synchronous `ws://`/`wss://` (`rustls`) MGS client, `ClientLeaseTracker`
-  (`Requested` / `Releasing`), `session-manager-plugin` capture shim, `ResumeSession`
-  blip recovery with durable `session.started` / `session.resumed` /
-  `session.terminated` ledger entries, remote `ctl --machine <name> ledger --verify`,
-  10,000-iteration PRNG frame fuzzing, and an in-process Mock MGS WebSocket
-  integration suite (`src-tauri/src/tests/ssm.rs`).
+  backpressure, AWS KMS session encryption (`KMSEncryption` / `EncChallengeRequest`
+  / `EncChallengeResponse` via `aws kms generate-data-key` 64-byte directional key
+  split and `ring::aead` AES-256-GCM authenticated encryption, preserved across
+  `ResumeSession` reconnects and rotated on `channel_closed`), `xtaci/smux` v1
+  multiplexing over `AWS-StartPortForwardingSession`, synchronous `ws://`/`wss://`
+  (`rustls`) MGS client, `ClientLeaseTracker` (`Requested` / `Releasing`),
+  `session-manager-plugin` capture shim, `ResumeSession` blip recovery with durable
+  `session.started` / `session.resumed` / `session.terminated` ledger entries,
+  remote `ctl --machine <name> ledger --verify`, 10,000-iteration PRNG frame +
+  cipher fuzzing, and an in-process Mock MGS WebSocket integration suite
+  (`src-tauri/src/tests/ssm.rs`).
 - **Execution grants — Kranz `TerminalProvider` consumer.** Kranz provisions and
   rotates `<repo>/.kranz/serve.grant.key` (`0600`, non-symlink, authority-denied
   and scrubbed) and implements `SgianTerminalProvider`
   (`kranz_acp::terminal::TerminalProvider`) behind
-  `AcpBackend::with_sgian_terminals` for explicitly opted-in uncontained host
-  sessions (`sandbox.enforce: off`, never combined with contained profiles),
-  minting RFC 2104 HMAC-SHA256-signed canonical JSON `ExecutionGrant`s and
-  routing `terminal/create|output|wait_for_exit|kill|release` through
+  `AcpBackend::with_sgian_terminals` and automatic `MissionEngine` / `runner`
+  per-run attachment (`AcpBackend::for_mission_worker` when `KRANZ_SGIAN_BIN` and
+  `<repo>/.kranz/serve.grant.key` are present on uncontained `sandbox.enforce: off`
+  host sessions, never combined with contained profiles), minting RFC 2104
+  HMAC-SHA256-signed canonical JSON `ExecutionGrant`s and routing
+  `terminal/create|output|wait_for_exit|kill|release` through
   `sgian ctl --workspace <repo> --json grant exec|output|wait|kill|release` with
   full one-call consent, scope/generation fencing, lifetime/retention budgets,
   verified `PaneObservation` projection, and fail-closed `CleanupReceipt`
@@ -293,10 +299,10 @@ Shipped (2026-09-16):
 
 Open, in order:
 
-- **M5 SSM / ECS Exec live AWS host sign-off** (#115): framing, `smux` port
-  forwarding, `ResumeSession`, and Mock MGS integration tests are in place; live
-  Linux EC2 + Windows WorkSpace sign-off and optional KMS `EncChallenge` session
-  encryption remain open.
+- **M5 SSM / ECS Exec live AWS host sign-off** (#115): framing, `KMSEncryption` /
+  `EncChallenge` AES-256-GCM session encryption, `smux` port forwarding,
+  `ResumeSession`, and Mock MGS integration tests are in place; live Linux EC2 +
+  Windows WorkSpace host sign-off remains open.
 - **Hands-on acceptance on a phone** (#83): the served view over `ssh -L` from
   a real device (the phone-width layout was checked in a desktop browser at
   375×812 only).
