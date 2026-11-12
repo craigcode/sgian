@@ -31,6 +31,26 @@ follow SemVer once the first public tag exists.
 
 ### Project
 
+- Cross-client accessibility hardening (#82):
+  - `apps/macos`: `TerminalSurface` enables `SwiftTerm`'s `notifyUpdateChanges`
+    (previously `false`, leaving `rangeChanged` dead and `AXValue` empty),
+    coalesces PTY feeds into `AXValue`, and posts
+    `NSAccessibility.Notification.valueChanged` only when visible screen text
+    changes; explicit VoiceOver labels on pane header controls, search bar
+    buttons, lease dialog editor, agent chat composer/tool-result/permission
+    cards, settings slider/profile actions, and combined sidebar `PaneRow`,
+    `MachineRow`, `ProjectHeader` (including project goals), and workspace
+    footer status summaries.
+  - `apps/windows`: UIA `AutomationProperties.Name` and `LiveSetting` coverage
+    across `MainWindow` chrome, dynamic zoom/close/workspace-switcher labels,
+    symbol-free `PaneViewModel.AccessibleSummary` item bindings, programmatic
+    search/commands/lease/rename/settings dialogs, `AgentChatView`, and
+    `TerminalPaneView`.
+  - `ui/`: `aria-label` and `role` semantics on `AgentBadge`, `LeaseBadge`,
+    `UsageBadge`, `OutputBadge`, `#active-machine-badge`, `PaneTabs`
+    (`aria-current`), workbench `<article class="pane">` containers,
+    `PermissionCard` regions/denial inputs, and `.chat-error` live alerts.
+
 - `docs/scripting-and-local-operation.md`: reproducible `ctl --json` scripting
   and exit-code reference (`0`, `1..=255`, `1`), generation-fenced lease
   automation, explicit separation between local daemon persistence and outbound

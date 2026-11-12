@@ -35,7 +35,12 @@ struct SettingsView: View {
                     HStack {
                         Text("Terminal font size")
                         Slider(value: $model.terminalFontSize, in: 9...30, step: 1)
-                        Text("\(Int(model.terminalFontSize)) pt").monospacedDigit().frame(width: 45)
+                            .accessibilityLabel("Terminal font size")
+                            .accessibilityValue("\(Int(model.terminalFontSize)) points")
+                        Text("\(Int(model.terminalFontSize)) pt")
+                            .monospacedDigit()
+                            .frame(width: 45)
+                            .accessibilityHidden(true)
                     }
                 }
                 Section("New agent defaults") {
@@ -74,11 +79,13 @@ struct SettingsView: View {
                 }
                 Section("Profiles") {
                     ForEach(Array(profiles.enumerated()), id: \.offset) { index, profile in
+                        let profileTitle = profile["name"]?.stringValue ?? "Profile"
                         HStack {
-                            Text(profile["name"]?.stringValue ?? "Profile")
+                            Text(profileTitle)
                             Spacer()
                             Text(profile["kind"]?.stringValue ?? "shell").foregroundStyle(.secondary)
                             Button("Remove") { profiles.remove(at: index) }
+                                .accessibilityLabel("Remove profile \(profileTitle)")
                         }
                     }
                     TextField("Profile name", text: $profileName)

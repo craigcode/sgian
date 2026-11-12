@@ -25,6 +25,8 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
 
     private var resizeTask: Task<Void, Never>?
     private var accessibilityTask: Task<Void, Never>?
+    private var lastAccessibilityValue = ""
+    private(set) var accessibilityValueChangeCount = 0
     private(set) var latestColumns = 80
     private(set) var latestRows = 24
     private var loadedInitialScrollback = false
@@ -46,6 +48,7 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
         // before feeding it so zsh's margin-sensitive prompt marker and wrapped
         // lines reproduce exactly instead of becoming visible artifacts.
         view.resize(cols: initialColumns, rows: initialRows)
+        view.notifyUpdateChanges = true
         view.terminalDelegate = self
         view.wantsLayer = true
         view.nativeForegroundColor = NSColor(calibratedWhite: 0.91, alpha: 1)
@@ -59,6 +62,7 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
         view.setAccessibilityElement(true)
         view.setAccessibilityRole(.textArea)
         view.setAccessibilityLabel("Terminal \(id)")
+        view.setAccessibilityValue("")
     }
 
     /// Name the terminal after its pane for accessibility clients.
@@ -75,6 +79,17 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
             .joined(separator: "\n")
     }
 
+    /// Immediately publish the visible screen to AppKit accessibility and post
+    /// `.valueChanged` when the rendered text actually changed.
+    func refreshAccessibilityValue() {
+        let next = TerminalSurface.visibleText(of: view.getTerminal())
+        view.setAccessibilityValue(next)
+        guard next != lastAccessibilityValue else { return }
+        lastAccessibilityValue = next
+        accessibilityValueChangeCount += 1
+        NSAccessibility.post(element: view, notification: .valueChanged)
+    }
+
     /// Republish the visible screen as the accessibility value, coalescing
     /// bursts of output into one update.
     private func scheduleAccessibilityRefresh() {
@@ -83,12 +98,13 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
             try? await Task.sleep(for: .milliseconds(150))
             guard let self else { return }
             self.accessibilityTask = nil
-            self.view.setAccessibilityValue(TerminalSurface.visibleText(of: self.view.getTerminal()))
+            self.refreshAccessibilityValue()
         }
     }
 
     func feed(_ text: String) {
         view.feed(text: text)
+        scheduleAccessibilityRefresh()
     }
 
     func loadInitialScrollback(_ text: String) {
@@ -102,7 +118,10 @@ final class TerminalSurface: NSObject, ObservableObject, @preconcurrency Termina
         window.makeFirstResponder(view)
     }
 
-    func clearScrollback() { view.clearScrollback() }
+    func clearScrollback() {
+        view.clearScrollback()
+        scheduleAccessibilityRefresh()
+    }
 
     func setFontSize(_ size: CGFloat) {
         view.font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)

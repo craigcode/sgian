@@ -914,5 +914,96 @@ describe("saved remote machines switcher", () => {
       "C:\\Users\\op\\repo",
     );
     expect(view.container.querySelector("#active-machine-badge")?.textContent).toContain("winbox");
+    expect(view.container.querySelector("#active-machine-badge")?.getAttribute("aria-label")).toBe(
+      "Attached to remote machine winbox",
+    );
+  });
+});
+
+describe("accessibility landmarks, live alerts, and badge labels", () => {
+  it("exposes screen-reader labels on pane tabs, workbench panes, status badges, and permission cards", async () => {
+    const user = userEvent.setup();
+    const panes = [
+      { id: "pane-a", title: "term-a", kind: "shell", created_at_ms: 1 },
+      { id: "pane-agent", title: "planner", kind: "agent", created_at_ms: 2 },
+    ];
+    const { controller, listeners } = createHarness({
+      panes,
+      activePaneId: "pane-a",
+      leases: { "pane-a": { holder: "bob", since_ms: 1 } },
+      outputWarnings: { "pane-a": { conceal: 2 } },
+      agentUsage: {
+        "pane-a": {
+          model: "Opus",
+          context_used_percentage: 40,
+          five_hour: { used_percentage: 23 },
+          updated_at_ms: 1,
+        },
+      },
+    });
+    const view = render(<App controller={controller} />);
+    await waitFor(() => expect(view.container.querySelector("#app").dataset.ready).toBe("true"));
+
+    const tabGroup = view.getByRole("group", { name: "Pane list" });
+    const tabs = tabGroup.querySelectorAll(".pane-tab");
+    expect(tabs[0].getAttribute("aria-current")).toBe("true");
+    expect(tabs[1].getAttribute("aria-current")).toBeNull();
+
+    const firstPane = view.container.querySelector('article.pane[data-pane-id="pane-a"]');
+    expect(firstPane.getAttribute("aria-label")).toBe("Pane term-a");
+
+    listeners.get("agent-state")({
+      payload: {
+        pane_id: "pane-a",
+        agent: "claude",
+        attention: "needs_input",
+        mode: "auto",
+        unattended: true,
+      },
+    });
+    await waitFor(() =>
+      expect(firstPane.querySelector(".agent-badge")?.getAttribute("aria-label")).toBe(
+        "claude needs input · auto: tools run without your approval",
+      ),
+    );
+    expect(firstPane.querySelector(".agent-badge")?.getAttribute("role")).toBe("img");
+    expect(firstPane.querySelector(".lease-badge")?.getAttribute("aria-label")).toBe(
+      "Keyboard held by bob",
+    );
+    expect(firstPane.querySelector(".output-badge")?.getAttribute("aria-label")).toBe(
+      "Output hid something: 2 concealed text",
+    );
+    expect(firstPane.querySelector(".usage-badge")?.getAttribute("aria-label")).toBe(
+      "Opus · 40% context · 5h 23%",
+    );
+
+    listeners.get("agent-event")({
+      payload: {
+        pane_id: "pane-agent",
+        event: {
+          kind: "permission_request",
+          request_id: "req-1",
+          tool_name: "Bash",
+          input: { command: "ls" },
+        },
+      },
+    });
+    const permRegion = await view.findByRole("region", { name: "Permission request: Bash" });
+    await user.click(permRegion.querySelector(".chat-deny"));
+    expect(view.getByLabelText("Denial reason (optional)")).toBeTruthy();
+
+    listeners.get("agent-event")({
+      payload: {
+        pane_id: "pane-agent",
+        event: { kind: "error", message: "rate limit exceeded" },
+      },
+    });
+    await waitFor(() =>
+      expect(
+        Array.from(view.getAllByRole("alert")).some((node) =>
+          node.textContent.includes("rate limit exceeded"),
+        ),
+      ).toBe(true),
+    );
   });
 });

@@ -65,7 +65,9 @@ function AgentBadge({ info }) {
   return (
     <span
       className={`agent-badge agent-badge-${attention}${info.unattended ? " agent-badge-unattended" : ""}`}
+      role="img"
       title={title}
+      aria-label={title}
       data-mode={info.mode ?? undefined}
     >
       ◆{info.unattended ? " ⚠" : ""}
@@ -81,6 +83,7 @@ function LeaseBadge({ info, holder }) {
     <span
       className={`lease-badge${mine ? " lease-badge-mine" : ""}`}
       title={title}
+      aria-label={title}
       data-holder={info.holder}
     >
       ⌨ {mine ? "you" : info.holder}
@@ -112,6 +115,7 @@ function UsageBadge({ usage }) {
     <span
       className={`usage-badge${hot ? " usage-badge-hot" : ""}`}
       title={full}
+      aria-label={full}
       data-context={usage.context ?? undefined}
     >
       {bits.join(" · ")}
@@ -121,10 +125,13 @@ function UsageBadge({ usage }) {
 
 function OutputBadge({ warning }) {
   if (!warning) return null;
+  const label = `Output hid something: ${outputWarningSummary(warning)}${warning.sample ? ` · first seen: ${warning.sample}` : ""}`;
   return (
     <span
       className="output-badge"
-      title={`Output hid something: ${outputWarningSummary(warning)}${warning.sample ? ` · first seen: ${warning.sample}` : ""}`}
+      role="img"
+      title={label}
+      aria-label={label}
       data-total={warning.total}
     >
       ⚠ {warning.total}
@@ -421,6 +428,7 @@ function MachineTargets({ state, controller }) {
         type="button"
         className="machine-target-btn"
         data-active={state.activeMachine === null}
+        aria-current={state.activeMachine === null ? "true" : undefined}
         disabled={switching}
         title={localPath}
         onClick={() => {
@@ -449,6 +457,7 @@ function MachineTargets({ state, controller }) {
             className="machine-target-btn"
             data-machine={machine.name}
             data-active={active}
+            aria-current={active ? "true" : undefined}
             disabled={switching}
             title={subtitle ? `${machine.name} — ${subtitle}` : machine.name}
             onClick={() => {
@@ -469,13 +478,14 @@ function MachineTargets({ state, controller }) {
 
 function PaneTabs({ state, controller }) {
   return (
-    <div id="pane-tabs" className="pane-tabs">
+    <div id="pane-tabs" className="pane-tabs" role="group" aria-label="Pane list">
       {Array.from(state.panes.values()).map((pane, index) => (
         <button
           key={pane.id}
           className="pane-tab"
           type="button"
           data-active={pane.id === state.activePaneId}
+          aria-current={pane.id === state.activePaneId ? "true" : undefined}
           data-runtime={controller.paneRuntimeState(pane.id)}
           title={pane.title}
           onClick={() => controller.focusPane(pane.id)}
@@ -645,7 +655,11 @@ function ChatMessage({ message, index }) {
       </div>
     );
   }
-  return <div className="chat-error">{message.message ?? "agent error"}</div>;
+  return (
+    <div className="chat-error" role="alert">
+      {message.message ?? "agent error"}
+    </div>
+  );
 }
 
 function PermissionCard({ paneId, permission, controller }) {
@@ -660,7 +674,11 @@ function PermissionCard({ paneId, permission, controller }) {
     if (denying) inputRef.current?.focus();
   }, [denying]);
   return (
-    <div className="chat-permission">
+    <div
+      className="chat-permission"
+      role="region"
+      aria-label={`Permission request: ${permission.toolName}`}
+    >
       <div className="chat-permission-title">{permission.toolName} wants permission</div>
       {permission.replacedRequestId && (
         <div className="chat-permission-note">replaced an earlier request</div>
@@ -691,6 +709,7 @@ function PermissionCard({ paneId, permission, controller }) {
                 className="chat-deny-input"
                 type="text"
                 placeholder="Reason (optional)"
+                aria-label="Denial reason (optional)"
                 value={reason}
                 onChange={(event) => setReason(event.target.value)}
               />
@@ -852,6 +871,7 @@ function Pane({ paneId, state, controller }) {
   return (
     <article
       className="pane"
+      aria-label={`Pane ${paneLabel(pane, index)}`}
       data-active={paneId === state.activePaneId}
       data-pane-id={paneId}
       data-runtime={runtime}
@@ -1612,7 +1632,7 @@ function MachineSettingsSection({ state, controller }) {
             </div>
           ) : null}
           {state.machineTokenStatus ? (
-            <p id="settings-machine-token-status" className="settings-machine-status">
+            <p id="settings-machine-token-status" className="settings-machine-status" role="status">
               {state.machineTokenStatus}
             </p>
           ) : null}
@@ -1813,6 +1833,7 @@ export function App({ controller }) {
                     id="active-machine-badge"
                     className="machine-badge"
                     title={`Attached to remote machine ${state.activeMachine}`}
+                    aria-label={`Attached to remote machine ${state.activeMachine}`}
                   >
                     ⇄ {state.activeMachine}
                   </span>
