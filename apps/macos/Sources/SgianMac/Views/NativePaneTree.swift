@@ -35,6 +35,7 @@ struct NativePaneTree: View {
                                 .padding(.bottom, 14)
                                 .allowsHitTesting(false)
                                 .accessibilityIdentifier("lease-notice")
+                                .accessibilityAddTraits(.updatesFrequently)
                         }
                     }
                     .simultaneousGesture(TapGesture().onEnded {
@@ -115,12 +116,25 @@ struct TerminalSearchBar: View {
     var body: some View {
         HStack {
             Image(systemName: "magnifyingglass")
-            TextField("Find in active terminal", text: $query).focused($focused)
+                .accessibilityHidden(true)
+            TextField("Find in active terminal", text: $query)
+                .focused($focused)
+                .accessibilityLabel("Find in active terminal")
                 .onSubmit { find(previous: false) }
-            Text(result).foregroundStyle(.secondary).font(.caption)
-            Button { find(previous: true) } label: { Image(systemName: "chevron.up") }.help("Previous match")
-            Button { find(previous: false) } label: { Image(systemName: "chevron.down") }.help("Next match")
-            Button { close() } label: { Image(systemName: "xmark") }.help("Close search")
+            Text(result)
+                .foregroundStyle(.secondary)
+                .font(.caption)
+                .accessibilityHidden(result.isEmpty)
+                .accessibilityLabel("Search matches: \(result)")
+            Button { find(previous: true) } label: { Image(systemName: "chevron.up") }
+                .help("Previous match")
+                .accessibilityLabel("Previous match")
+            Button { find(previous: false) } label: { Image(systemName: "chevron.down") }
+                .help("Next match")
+                .accessibilityLabel("Next match")
+            Button { close() } label: { Image(systemName: "xmark") }
+                .help("Close search")
+                .accessibilityLabel("Close search")
         }
         .padding(8).background(.bar)
         .onAppear { focused = true }
@@ -175,13 +189,17 @@ struct NativeCommandPalette: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            TextField("Search commands and panes", text: $query).textFieldStyle(.roundedBorder)
-                .focused($focused).onSubmit { run(selection ?? commands.first?.0) }
+            TextField("Search commands and panes", text: $query)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Search commands and panes")
+                .focused($focused)
+                .onSubmit { run(selection ?? commands.first?.0) }
             List(selection: $selection) {
                 ForEach(commands, id: \.0) { item in
                     Text(item.0).tag(item.0).onTapGesture(count: 2) { run(item.0) }
                 }
             }
+            .accessibilityLabel("Commands and panes")
             HStack { Button("Cancel") { model.showingCommands = false }; Spacer(); Button("Run") { run(selection ?? commands.first?.0) }.keyboardShortcut(.defaultAction) }
         }.padding(20).frame(width: 520, height: 380)
             .onAppear { focused = true }

@@ -89,22 +89,30 @@ struct PaneHeader: View {
     let pane: Pane
 
     var body: some View {
+        let zoomLabel = model.zoomed ? "Show all panes" : "Zoom \(pane.title)"
         HStack(spacing: 10) {
             Image(systemName: pane.kind == .shell ? "terminal" : "bubble.left.and.bubble.right")
                 .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
             Text(pane.title).font(.headline)
             if pane.kind == .agent && model.permissionMode != "manual" {
                 Label(model.permissionMode, systemImage: "exclamationmark.shield")
-                    .font(.caption).foregroundStyle(.orange)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .accessibilityLabel("Permission mode: \(model.permissionMode)")
             }
             if pane.kind == .shell, let info = model.agentStates[pane.id], let mode = info.mode {
                 // An agent in the shell running tools without approval is the
                 // loudest thing a supervisor needs to see.
+                let modeSummary = info.isUnattended
+                    ? "\(mode) mode: tools run without your approval"
+                    : "Permission mode: \(mode)"
                 Label(info.isUnattended ? "\(mode) · unattended" : mode,
                       systemImage: info.isUnattended ? "exclamationmark.shield.fill" : "shield")
                     .font(.caption)
                     .foregroundStyle(info.isUnattended ? Color.orange : Color.secondary)
-                    .help(info.isUnattended ? "\(mode) mode: tools run without your approval" : "Permission mode: \(mode)")
+                    .help(modeSummary)
+                    .accessibilityLabel(modeSummary)
                     .accessibilityIdentifier("agent-mode")
             }
             if pane.kind == .agent, let spec = model.agentSpecs[pane.id] {
@@ -114,18 +122,25 @@ struct PaneHeader: View {
             }
             if let lease = model.lease(for: pane.id), let holder = lease.holder {
                 let mine = model.isOwnLease(lease)
+                let leaseSummary = mine ? "You hold this pane's keyboard" : "Keyboard held by \(holder)"
                 Label(mine ? "you" : holder, systemImage: "keyboard")
                     .font(.caption)
                     .foregroundStyle(mine ? Color.green : Color.orange)
-                    .help(mine ? "You hold this pane's keyboard" : "Keyboard held by \(holder)")
+                    .help(leaseSummary)
+                    .accessibilityLabel(leaseSummary)
                     .accessibilityIdentifier("lease-badge")
             }
             Spacer()
             Button { model.select(pane.id); model.toggleZoom() } label: {
                 Image(systemName: model.zoomed ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-            }.buttonStyle(.plain).help("Zoom pane")
+            }
+            .buttonStyle(.plain)
+            .help(zoomLabel)
+            .accessibilityLabel(zoomLabel)
             Button { model.requestClose(pane) } label: { Image(systemName: "xmark") }
-                .buttonStyle(.plain).help("Close pane")
+                .buttonStyle(.plain)
+                .help("Close \(pane.title)")
+                .accessibilityLabel("Close \(pane.title)")
             if model.paneStates[pane.id] == .ended {
                 Button("Restart", systemImage: "arrow.clockwise") { model.restart(pane.id) }
                     .buttonStyle(.bordered)
@@ -217,6 +232,7 @@ struct LeaseDialogView: View {
                 .frame(minHeight: isRelease ? 96 : 56)
                 .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.3)))
                 .focused($focused)
+                .accessibilityLabel(isRelease ? "Hand-back note" : "Reason for taking keyboard")
                 .accessibilityIdentifier("lease-text")
             if let error = model.leaseDialog?.error {
                 Text(error).font(.caption).foregroundStyle(.orange)

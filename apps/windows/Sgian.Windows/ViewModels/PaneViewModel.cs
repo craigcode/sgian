@@ -33,7 +33,19 @@ public sealed class PaneViewModel : ObservableObject
     public string Title
     {
         get => _title;
-        set => Set(ref _title, value);
+        set
+        {
+            if (Set(ref _title, value))
+            {
+                Raise(nameof(AccessibleSummary));
+            }
+        }
+    }
+
+    private void RaiseSummary()
+    {
+        Raise(nameof(Subtitle));
+        Raise(nameof(AccessibleSummary));
     }
 
     public string State
@@ -43,7 +55,7 @@ public sealed class PaneViewModel : ObservableObject
         {
             if (Set(ref _state, value))
             {
-                Raise(nameof(Subtitle));
+                RaiseSummary();
             }
         }
     }
@@ -55,7 +67,7 @@ public sealed class PaneViewModel : ObservableObject
         {
             if (Set(ref _attention, value))
             {
-                Raise(nameof(Subtitle));
+                RaiseSummary();
             }
         }
     }
@@ -68,7 +80,7 @@ public sealed class PaneViewModel : ObservableObject
         {
             if (Set(ref _mode, value))
             {
-                Raise(nameof(Subtitle));
+                RaiseSummary();
             }
         }
     }
@@ -81,7 +93,7 @@ public sealed class PaneViewModel : ObservableObject
         {
             if (Set(ref _unattended, value))
             {
-                Raise(nameof(Subtitle));
+                RaiseSummary();
             }
         }
     }
@@ -94,7 +106,7 @@ public sealed class PaneViewModel : ObservableObject
         {
             if (Set(ref _leaseHolder, value))
             {
-                Raise(nameof(Subtitle));
+                RaiseSummary();
                 Raise(nameof(LeaseLabel));
             }
         }
@@ -107,7 +119,7 @@ public sealed class PaneViewModel : ObservableObject
         {
             if (Set(ref _leaseIsMine, value))
             {
-                Raise(nameof(Subtitle));
+                RaiseSummary();
                 Raise(nameof(LeaseLabel));
             }
         }
@@ -124,7 +136,7 @@ public sealed class PaneViewModel : ObservableObject
         {
             if (Set(ref _agentSpec, value))
             {
-                Raise(nameof(Subtitle));
+                RaiseSummary();
             }
         }
     }
@@ -137,7 +149,7 @@ public sealed class PaneViewModel : ObservableObject
         {
             if (Set(ref _projectName, value))
             {
-                Raise(nameof(Subtitle));
+                RaiseSummary();
             }
         }
     }
@@ -150,7 +162,7 @@ public sealed class PaneViewModel : ObservableObject
         {
             if (Set(ref _outputWarning, value))
             {
-                Raise(nameof(Subtitle));
+                RaiseSummary();
                 Raise(nameof(OutputWarningLabel));
                 Raise(nameof(OutputWarningSummary));
             }
@@ -165,7 +177,7 @@ public sealed class PaneViewModel : ObservableObject
         {
             if (Set(ref _usage, value))
             {
-                Raise(nameof(Subtitle));
+                RaiseSummary();
                 Raise(nameof(UsageLabel));
             }
         }
@@ -205,6 +217,50 @@ public sealed class PaneViewModel : ObservableObject
                 : string.Join(" · ", new[] { AgentSpec.Backend, AgentSpec.Model }
                     .Where(value => !string.IsNullOrWhiteSpace(value)));
             return project + (Attention is null ? identity : $"{identity} · {Attention.Replace('_', ' ')}") + lease;
+        }
+    }
+
+    public string AccessibleSummary
+    {
+        get
+        {
+            var parts = new List<string> { Title };
+            if (!string.IsNullOrEmpty(ProjectName)) parts.Add($"project {ProjectName}");
+            if (State == "ended")
+            {
+                parts.Add("Session ended");
+            }
+            else if (!IsAgent)
+            {
+                parts.Add(Attention is null ? "Terminal" : $"Terminal, {Attention.Replace('_', ' ')}");
+            }
+            else
+            {
+                var identity = AgentSpec is null
+                    ? "Agent"
+                    : string.Join(" · ", new[] { AgentSpec.Backend, AgentSpec.Model }
+                        .Where(value => !string.IsNullOrWhiteSpace(value)));
+                if (string.IsNullOrWhiteSpace(identity)) identity = "Agent";
+                parts.Add(Attention is null ? identity : $"{identity}, {Attention.Replace('_', ' ')}");
+            }
+            if (Mode is not null)
+            {
+                parts.Add(Unattended ? $"{Mode} mode, tools run without approval" : $"permission mode {Mode}");
+            }
+            if (OutputWarning is not null)
+            {
+                parts.Add($"Output hid something: {OutputWarning.Summary}");
+            }
+            if (LeaseHolder is not null)
+            {
+                parts.Add(LeaseIsMine ? "You hold the keyboard" : $"Keyboard held by {LeaseHolder}");
+            }
+            if (Usage is not null)
+            {
+                var usageSummary = Usage.Summary();
+                if (!string.IsNullOrEmpty(usageSummary)) parts.Add(usageSummary);
+            }
+            return string.Join(", ", parts);
         }
     }
 }

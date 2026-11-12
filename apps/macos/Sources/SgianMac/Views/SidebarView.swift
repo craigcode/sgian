@@ -20,6 +20,7 @@ struct SidebarView: View {
                                     Image(systemName: "laptopcomputer")
                                         .frame(width: 17)
                                         .foregroundStyle(.secondary)
+                                        .accessibilityHidden(true)
                                     VStack(alignment: .leading, spacing: 1) {
                                         Text(model.localWorkspaceURL.lastPathComponent)
                                             .lineLimit(1)
@@ -36,6 +37,7 @@ struct SidebarView: View {
                             }
                             .buttonStyle(.plain)
                             .help("Switch back to local workspace")
+                            .accessibilityLabel("Switch to local workspace \(model.localWorkspaceURL.lastPathComponent)")
                         }
                         ForEach(model.savedMachines) { machine in
                             MachineRow(
@@ -134,10 +136,17 @@ struct SidebarView: View {
     }
 
     private var workspaceFooter: some View {
-        Button(action: model.chooseWorkspace) {
+        let footerSummary = SidebarAccessibility.workspaceFooterLabel(
+            workspaceURL: model.workspaceURL,
+            activeMachine: model.activeMachine,
+            status: model.status
+        )
+        let footerAction = model.activeMachine == nil ? "Change workspace" : "Open a local workspace"
+        return Button(action: model.chooseWorkspace) {
             HStack(spacing: 9) {
                 Image(systemName: model.activeMachine == nil ? "folder" : "network")
                     .foregroundStyle(model.activeMachine == nil ? Color.secondary : Color.accentColor)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(model.activeMachine?.name ?? model.workspaceURL.lastPathComponent)
                         .font(.callout.weight(.medium))
@@ -156,7 +165,104 @@ struct SidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(model.activeMachine == nil ? "Change workspace" : "Open a local workspace")
+        .help(footerAction)
+        .accessibilityLabel(footerSummary)
+        .accessibilityHint(footerAction)
+    }
+}
+
+enum SidebarAccessibility {
+    static func projectHeaderLabel(
+        title: String,
+        goal: String?,
+        rollup: String,
+        limit: String? = nil,
+        notes: [String] = []
+    ) -> String {
+        var parts = [title]
+        if let goal, !goal.isEmpty { parts.append(goal) }
+        if !rollup.isEmpty { parts.append(rollup) }
+        if let limit, !limit.isEmpty { parts.append(limit) }
+        parts.append(contentsOf: notes.filter { !$0.isEmpty })
+        return parts.joined(separator: ". ")
+    }
+
+    static func paneRowLabel(
+        pane: Pane,
+        runtime: PaneRuntimeState,
+        attention: AgentAttention?,
+        spec: AgentPaneSpec?,
+        leaseHolder: String? = nil,
+        ownLease: Bool = false,
+        unattended: Bool = false,
+        outputWarning: OutputTricks? = nil,
+        usage: AgentUsage? = nil
+    ) -> String {
+        var parts = [pane.title]
+        if pane.kind == .shell {
+            parts.append("Terminal")
+        } else {
+            let identity = [spec?.backend.displayName, spec?.model]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+                .joined(separator: " · ")
+            parts.append(identity.isEmpty ? "Agent" : identity)
+        }
+        if runtime == .ended {
+            parts.append("Session ended")
+        } else if attention == .needsInput {
+            parts.append("Needs input")
+        } else if attention == .working {
+            parts.append("Working")
+        }
+        if unattended {
+            parts.append("Agent runs tools without approval")
+        }
+        if let outputWarning {
+            parts.append("Output hid something: \(outputWarning.summary)")
+        }
+        if let leaseHolder {
+            parts.append(ownLease ? "You hold the keyboard" : "Keyboard held by \(leaseHolder)")
+        }
+        if let usage {
+            let summary = usage.summary()
+            if !summary.isEmpty { parts.append(summary) }
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    static func machineRowLabel(
+        machine: SavedMachine,
+        isActive: Bool,
+        summary: MachineSummary?,
+        activeStatus: ConnectionStatus?
+    ) -> String {
+        var parts = [machine.name]
+        if isActive { parts.append("Active") }
+        parts.append(summary?.badgeText ?? machine.displaySubtitle)
+        if let activeStatus {
+            parts.append(activeStatus.label)
+        } else if let summary, summary.connected {
+            if summary.needsInputCount > 0 {
+                parts.append("Needs input")
+            } else if summary.workingCount > 0 {
+                parts.append("Working")
+            } else {
+                parts.append("Tunnel connected")
+            }
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    static func workspaceFooterLabel(
+        workspaceURL: URL,
+        activeMachine: SavedMachine?,
+        status: ConnectionStatus
+    ) -> String {
+        if let activeMachine {
+            return "Remote workspace \(activeMachine.name), \(activeMachine.displaySubtitle), \(status.label)"
+        }
+        return "Local workspace \(workspaceURL.lastPathComponent), \(status.label)"
     }
 }
 
@@ -173,6 +279,7 @@ private struct MachineRow: View {
                 Image(systemName: "network")
                     .frame(width: 17)
                     .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(machine.name)
                         .fontWeight(isActive ? .semibold : .regular)
@@ -201,6 +308,14 @@ private struct MachineRow: View {
         }
         .buttonStyle(.plain)
         .help("Connect to \(machine.name) (\(machine.displaySubtitle))")
+        .accessibilityLabel(
+            SidebarAccessibility.machineRowLabel(
+                machine: machine,
+                isActive: isActive,
+                summary: summary,
+                activeStatus: activeStatus
+            )
+        )
     }
 }
 
@@ -241,8 +356,13 @@ private struct ProjectHeader: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "\(title). \(rollup)\(limit.map { ". " + $0 } ?? "")"
-                + (notes.isEmpty ? "" : ". " + notes.joined(separator: ". "))
+            SidebarAccessibility.projectHeaderLabel(
+                title: title,
+                goal: goal,
+                rollup: rollup,
+                limit: limit,
+                notes: notes
+            )
         )
     }
 }
@@ -263,6 +383,7 @@ private struct PaneRow: View {
             Image(systemName: pane.kind == .shell ? "terminal" : "bubble.left.and.bubble.right")
                 .frame(width: 17)
                 .foregroundStyle(iconColor)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(pane.title)
                     .lineLimit(1)
@@ -312,6 +433,20 @@ private struct PaneRow: View {
             }
         }
         .padding(.vertical, 3)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            SidebarAccessibility.paneRowLabel(
+                pane: pane,
+                runtime: runtime,
+                attention: attention,
+                spec: spec,
+                leaseHolder: leaseHolder,
+                ownLease: ownLease,
+                unattended: unattended,
+                outputWarning: outputWarning,
+                usage: usage
+            )
+        )
     }
 
     private var iconColor: Color {

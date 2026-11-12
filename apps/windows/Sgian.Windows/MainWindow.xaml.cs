@@ -1,5 +1,7 @@
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Automation;
+using Microsoft.UI.Xaml.Automation.Peers;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Sgian.Protocol;
@@ -114,6 +116,11 @@ public sealed partial class MainWindow : Window
         ProjectNotes.Visibility = projectNotes.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         RenameButton.Visibility = pane is null ? Visibility.Collapsed : Visibility.Visible;
         CloseButton.Visibility = pane is null ? Visibility.Collapsed : Visibility.Visible;
+        AutomationProperties.SetName(CloseButton, pane is null ? "Close pane" : $"Close {pane.Title}");
+        ZoomButton.Content = ViewModel.Zoomed ? "Show all" : "Zoom";
+        AutomationProperties.SetName(
+            ZoomButton,
+            ViewModel.Zoomed ? "Show all panes" : (pane is null ? "Zoom pane" : $"Zoom {pane.Title}"));
         RestartButton.Visibility = pane?.State == "ended"
             ? Visibility.Visible
             : Visibility.Collapsed;
@@ -152,6 +159,7 @@ public sealed partial class MainWindow : Window
     private async Task<string?> PromptLeaseTextAsync(string title, string prompt, string primary)
     {
         var input = new TextBox { AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, MinHeight = 90 };
+        AutomationProperties.SetName(input, prompt);
         var label = new TextBlock { Text = prompt, TextWrapping = TextWrapping.Wrap };
         var content = new StackPanel { Spacing = 10, MinWidth = 420 };
         content.Children.Add(label);
@@ -183,13 +191,20 @@ public sealed partial class MainWindow : Window
             WorkspaceHeaderLabel.Text = "Remote machine";
             WorkspaceLabel.Text = machine.Name;
             ToolTipService.SetToolTip(WorkspaceLabel, machine.DisplaySubtitle);
+            AutomationProperties.SetName(
+                WorkspaceSwitcherButton,
+                $"Remote machine {machine.Name}, {machine.DisplaySubtitle}, {ViewModel.Status}");
         }
         else
         {
+            var localName = Path.GetFileName(ViewModel.WorkspacePath.TrimEnd(Path.DirectorySeparatorChar));
             WorkspaceIcon.Glyph = "\uE8B7";
             WorkspaceHeaderLabel.Text = "Workspace";
-            WorkspaceLabel.Text = Path.GetFileName(ViewModel.WorkspacePath.TrimEnd(Path.DirectorySeparatorChar));
+            WorkspaceLabel.Text = localName;
             ToolTipService.SetToolTip(WorkspaceLabel, ViewModel.WorkspacePath);
+            AutomationProperties.SetName(
+                WorkspaceSwitcherButton,
+                $"Local workspace {localName}, {ViewModel.Status}");
         }
         ErrorBar.Message = ViewModel.ErrorMessage ?? "";
         ErrorBar.IsOpen = !string.IsNullOrWhiteSpace(ViewModel.ErrorMessage);
@@ -333,7 +348,9 @@ public sealed partial class MainWindow : Window
     {
         if (ViewModel.SelectedPane is not { } pane || !_terminals.TryGetValue(pane.Id, out var terminal)) return;
         var input = new TextBox { PlaceholderText = "Find in terminal" };
+        AutomationProperties.SetName(input, "Find in terminal");
         var status = new TextBlock { Text = "Enter text to search the terminal buffer." };
+        AutomationProperties.SetLiveSetting(status, AutomationLiveSetting.Polite);
         var content = new StackPanel { Spacing = 10 }; content.Children.Add(input); content.Children.Add(status);
         void Result(string result) => status.Text = result;
         terminal.SearchCompleted += Result;
@@ -389,7 +406,9 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception error) { App.TraceSmoke($"Command profile loading: {error.Message}"); }
         var input = new TextBox { PlaceholderText = "Search commands and panes" };
+        AutomationProperties.SetName(input, "Search commands and panes");
         var list = new ListView { Height = 260, ItemsSource = actions.Select(item => item.Label).ToList() };
+        AutomationProperties.SetName(list, "Commands and panes");
         input.TextChanged += (_, _) => list.ItemsSource = actions.Where(item => item.Label.Contains(input.Text, StringComparison.OrdinalIgnoreCase)).Select(item => item.Label).ToList();
         var panel = new StackPanel { Spacing = 12, MinWidth = 420 }; panel.Children.Add(input); panel.Children.Add(list);
         var dialog = new ContentDialog { XamlRoot = Root.XamlRoot, Title = "Commands", Content = panel,
@@ -486,6 +505,7 @@ public sealed partial class MainWindow : Window
     {
         if (ViewModel.SelectedPane is not { } pane) return;
         var input = new TextBox { Text = pane.Title, SelectionStart = pane.Title.Length };
+        AutomationProperties.SetName(input, "Pane name");
         var dialog = new ContentDialog
         {
             XamlRoot = Root.XamlRoot,

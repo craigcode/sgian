@@ -30,16 +30,19 @@
                     <Border Width="32" Height="32" CornerRadius="8"
                             Background="{ThemeResource AccentFillColorDefaultBrush}">
                         <TextBlock Text="†" FontSize="24" FontWeight="SemiBold"
-                                   Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                   Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                   AutomationProperties.AccessibilityView="Raw" />
                     </Border>
                     <StackPanel Grid.Column="1" VerticalAlignment="Center">
                         <TextBlock Text="Sgian" FontWeight="SemiBold" FontSize="16" />
                         <TextBlock x:Name="ConnectionStatus" Text="Connecting"
-                                   FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                   FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                   AutomationProperties.LiveSetting="Polite" />
                     </StackPanel>
                     <Button Grid.Column="2" x:Name="SettingsButton" Click="Settings_Click"
-                            ToolTipService.ToolTip="Settings">
-                        <FontIcon Glyph="&#xE713;" FontSize="15" />
+                            ToolTipService.ToolTip="Settings"
+                            AutomationProperties.Name="Settings">
+                        <FontIcon Glyph="&#xE713;" FontSize="15" AutomationProperties.AccessibilityView="Raw" />
                     </Button>
                 </Grid>
 
@@ -68,7 +71,8 @@
                 <!-- Project board (ENHANCEMENTS "projects"): one line per project with its
                      attention roll-up; each pane's subtitle names its project. -->
                 <TextBlock x:Name="ProjectSummary" Grid.Row="2" FontSize="11" TextWrapping="Wrap"
-                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" Visibility="Collapsed" />
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" Visibility="Collapsed"
+                           AutomationProperties.Name="Project summary" />
 
                 <!-- Shared context notes beside each project (docs/design/shared-context-notes.md):
                      a summary and the newest few, titles only; bodies never reach the board. -->
@@ -77,15 +81,18 @@
                            AutomationProperties.Name="Project notes" />
 
                 <ListView x:Name="PaneList" Grid.Row="4" SelectionMode="Single"
-                          IsItemClickEnabled="True" SelectionChanged="PaneList_SelectionChanged">
+                          IsItemClickEnabled="True" SelectionChanged="PaneList_SelectionChanged"
+                          AutomationProperties.Name="Panes">
                     <ListView.ItemTemplate>
                         <DataTemplate>
-                            <Grid Padding="4,6" ColumnSpacing="10">
+                            <Grid Padding="4,6" ColumnSpacing="10"
+                                  AutomationProperties.Name="{Binding AccessibleSummary, Mode=OneWay}">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="28" />
                                     <ColumnDefinition Width="*" />
                                 </Grid.ColumnDefinitions>
-                                <FontIcon Glyph="{Binding Glyph}" FontSize="15" VerticalAlignment="Center" />
+                                <FontIcon Glyph="{Binding Glyph}" FontSize="15" VerticalAlignment="Center"
+                                          AutomationProperties.AccessibilityView="Raw" />
                                 <StackPanel Grid.Column="1">
                                     <TextBlock Text="{Binding Title, Mode=OneWay}" TextTrimming="CharacterEllipsis" />
                                     <TextBlock Text="{Binding Subtitle, Mode=OneWay}" FontSize="11"
@@ -98,13 +105,15 @@
                 </ListView>
 
                 <Button x:Name="WorkspaceSwitcherButton" Grid.Row="5" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
-                        Click="ChooseWorkspace_Click" ToolTipService.ToolTip="Choose workspace or saved machine">
+                        Click="ChooseWorkspace_Click" ToolTipService.ToolTip="Choose workspace or saved machine"
+                        AutomationProperties.Name="Choose workspace or saved machine">
                     <Grid ColumnSpacing="9">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="*" />
                         </Grid.ColumnDefinitions>
-                        <FontIcon x:Name="WorkspaceIcon" Glyph="&#xE8B7;" FontSize="14" />
+                        <FontIcon x:Name="WorkspaceIcon" Glyph="&#xE8B7;" FontSize="14"
+                                  AutomationProperties.AccessibilityView="Raw" />
                         <StackPanel Grid.Column="1">
                             <TextBlock x:Name="WorkspaceHeaderLabel" Text="Workspace" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                             <TextBlock x:Name="WorkspaceLabel" TextTrimming="CharacterEllipsis" />
@@ -142,7 +151,8 @@
                 <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
                     <Button Content="Split right" Click="SplitRight_Click" ToolTipService.ToolTip="Split right (Ctrl+Shift+D)" />
                     <Button Content="Split down" Click="SplitDown_Click" ToolTipService.ToolTip="Split down (Ctrl+Shift+E)" />
-                    <Button Content="Zoom" Click="Zoom_Click" ToolTipService.ToolTip="Zoom pane (Ctrl+Shift+Z)" />
+                    <Button x:Name="ZoomButton" Content="Zoom" Click="Zoom_Click" ToolTipService.ToolTip="Zoom pane (Ctrl+Shift+Z)"
+                            AutomationProperties.Name="Zoom pane" />
                     <Button Content="Find" Click="Search_Click" ToolTipService.ToolTip="Find in terminal (Ctrl+Shift+F)" />
                     <Button Content="Commands" Click="Commands_Click" ToolTipService.ToolTip="Commands (Ctrl+Shift+P)" />
                     <Button x:Name="LeaseButton" Content="Take keyboard" Click="Lease_Click"
@@ -150,8 +160,9 @@
                     <Button x:Name="RestartButton" Content="Restart" Visibility="Collapsed" Click="Restart_Click" />
                     <Button x:Name="RenameButton" Content="Rename" Visibility="Collapsed" Click="Rename_Click" />
                     <Button x:Name="CloseButton" Visibility="Collapsed" Click="Close_Click"
-                            ToolTipService.ToolTip="Close pane">
-                        <FontIcon Glyph="&#xE711;" FontSize="12" />
+                            ToolTipService.ToolTip="Close pane"
+                            AutomationProperties.Name="Close pane">
+                        <FontIcon Glyph="&#xE711;" FontSize="12" AutomationProperties.AccessibilityView="Raw" />
                     </Button>
                 </StackPanel>
             </Grid>

@@ -4,6 +4,7 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
     <Grid Background="{StaticResource SgianTerminalBrush}">
         <WebView2 x:Name="TerminalWebView" DefaultBackgroundColor="#101318" AutomationProperties.Name="Terminal" />
-        <ProgressRing x:Name="LoadingIndicator" IsActive="True" HorizontalAlignment="Center" VerticalAlignment="Center" />
+        <ProgressRing x:Name="LoadingIndicator" IsActive="True" HorizontalAlignment="Center" VerticalAlignment="Center"
+                      AutomationProperties.Name="Loading terminal" />
     </Grid>
 </UserControl>

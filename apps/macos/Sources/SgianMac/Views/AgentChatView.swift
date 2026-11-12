@@ -64,6 +64,7 @@ struct AgentChatView: View {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .stroke(.separator.opacity(0.55), lineWidth: 1)
                 }
+                .accessibilityLabel("Message the agent")
                 .disabled(chat.busy)
                 .onSubmit(send)
 
@@ -78,6 +79,7 @@ struct AgentChatView: View {
             .tint(chat.busy ? .red : .accentColor)
             .disabled(!chat.busy && draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .help(chat.busy ? "Interrupt agent" : "Send message")
+            .accessibilityLabel(chat.busy ? "Interrupt agent" : "Send message")
         }
         .padding(14)
     }
@@ -102,6 +104,7 @@ private struct EmptyChatView: View {
             Image(systemName: "sparkles")
                 .font(.system(size: 28, weight: .light))
                 .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
             Text("Start a conversation")
                 .font(.title3.weight(.medium))
             Text("This agent runs in the Sgian daemon and will keep its session when this window closes.")
@@ -164,11 +167,14 @@ private struct ChatMessageView: View {
                 Image(systemName: message.isError ? "exclamationmark.triangle" : "checkmark.circle")
             }
             .foregroundStyle(message.isError ? Color.red : Color.secondary)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(message.isError ? "Tool error" : "Tool result"): \(message.text)")
         case .error:
             Label(message.text, systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.red)
                 .padding(10)
                 .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                .accessibilityLabel("Agent error: \(message.text)")
         case .historyElided:
             Text(message.text)
                 .font(.caption)
@@ -218,5 +224,7 @@ private struct PermissionCard: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(Color.orange.opacity(0.35))
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Permission requested: \(permission.toolName)")
     }
 }

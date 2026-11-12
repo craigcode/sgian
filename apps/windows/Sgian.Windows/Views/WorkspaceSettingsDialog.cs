@@ -1,5 +1,7 @@
 using System.Text.Json.Nodes;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Automation;
+using Microsoft.UI.Xaml.Automation.Peers;
 using Microsoft.UI.Xaml.Controls;
 using Sgian.Protocol;
 using Sgian.Windows.ViewModels;
@@ -55,10 +57,12 @@ internal static class WorkspaceSettingsDialog
                 if (item is null) continue;
                 var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
                 // The daemon omits an unset kind; infer it as the daemon does and name the backend.
+                var profileName = item["name"]?.GetValue<string>() ?? "profile";
                 var rowBackend = item["agent_backend"]?.GetValue<string>();
                 var rowIsAgent = WorkspaceStartup.IsAgentProfile(item["kind"]?.GetValue<string>(), rowBackend, item["agent_model"]?.GetValue<string>());
-                row.Children.Add(new TextBlock { Text = $"{item["name"]?.GetValue<string>()} · {(rowIsAgent ? $"agent ({rowBackend ?? "claude"})" : "shell")}", VerticalAlignment = VerticalAlignment.Center });
+                row.Children.Add(new TextBlock { Text = $"{profileName} · {(rowIsAgent ? $"agent ({rowBackend ?? "claude"})" : "shell")}", VerticalAlignment = VerticalAlignment.Center });
                 var remove = new Button { Content = "Remove" };
+                AutomationProperties.SetName(remove, $"Remove profile {profileName}");
                 remove.Click += (_, _) => { profiles.Remove(item); RefreshProfiles(); };
                 row.Children.Add(remove); profileList.Children.Add(row);
             }
@@ -70,6 +74,7 @@ internal static class WorkspaceSettingsDialog
         var profileModel = new TextBox { Header = "Agent model (optional)" };
         panel.Children.Add(name); panel.Children.Add(kind); panel.Children.Add(profileModel);
         var message = new TextBlock { TextWrapping = TextWrapping.Wrap };
+        AutomationProperties.SetLiveSetting(message, AutomationLiveSetting.Polite);
         var add = new Button { Content = "Add profile" };
         add.Click += (_, _) =>
         {
