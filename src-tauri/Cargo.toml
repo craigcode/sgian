@@ -40,8 +40,10 @@ tauri-plugin-process = "2.3.1"
 # build.rs makes sure the directory exists so a daemon-only build without a
 # frontend still compiles. The HTTP loop itself is std-only (serve_http.rs).
 include_dir = "0.7"
-# AWS SSM M5 WebSocket (`wss://`) client transport (#115). Already transitive
-# dependencies of tauri-plugin-updater, so `--locked` builds add zero crates.
+# AWS SSM M5 WebSocket (`wss://`) client transport and KMS AES-256-GCM envelope
+# cipher (#115). Already transitive dependencies of tauri-plugin-updater, so
+# `--locked` builds add zero crates.
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"
 webpki-root-certs = "1"

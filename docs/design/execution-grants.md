@@ -1,6 +1,6 @@
 # Execution grants: Kranz authorizes, Sgian executes and displays
 
-**Status:** Shipped end-to-end — Sgian daemon and `ctl grant` surface (`src-tauri/src/grants.rs`) + Kranz `SgianTerminalProvider` (`crates/engine/src/sgian_terminal.rs`) behind `AcpBackend::with_sgian_terminals` with `.kranz/serve.grant.key` (`0600`) rotation.
+**Status:** Shipped end-to-end — Sgian daemon and `ctl grant` surface (`src-tauri/src/grants.rs`) + Kranz `SgianTerminalProvider` (`crates/engine/src/sgian_terminal.rs`) behind `AcpBackend::with_sgian_terminals` and automatic `MissionEngine` / `runner` per-run attachment (`AcpBackend::for_mission_worker` when `KRANZ_SGIAN_BIN` and `.kranz/serve.grant.key` are present on uncontained `sandbox.enforce: off` host sessions) with `.kranz/serve.grant.key` (`0600`) rotation.
 **Depends on (Kranz side):** a `kranz-acp` crate (ACP client transport + neutral events)
 extracted from `kranz-engine`, and a `TerminalProvider` seam in Kranz's ACP
 client that advertises `terminal` capability only when a provider is
