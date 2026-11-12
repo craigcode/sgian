@@ -285,22 +285,35 @@ export function serializeSettingsForm(values) {
  * than patching it, so omitting these would silently reset agent and env-scrub
  * settings whenever an unrelated appearance field is saved.
  */
+const SETTINGS_FORM_OWNED_KEYS = new Set([
+  "shell",
+  "shell_args",
+  "env",
+  "font_family",
+  "font_size",
+  "theme",
+  "idle_shutdown_secs",
+  "restore_policy",
+]);
+
+const UNSAFE_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+/**
+ * Config fields not owned by the settings form are passed through unchanged so
+ * saving from the UI does not strip unexposed settings (including future keys).
+ *
+ * `profiles` is intentionally passed through because an empty profiles field in
+ * the form omits `profiles` to preserve passthrough values on save.
+ *
+ * @param {object | null | undefined} config
+ * @returns {object}
+ */
 export function settingsPassthroughConfig(config) {
   if (!config || typeof config !== "object") return {};
   const passthrough = {};
-  for (const key of [
-    "scrub_env",
-    "agent_permission_mode",
-    "agent_claude_bin",
-    "agent_droid_bin",
-    "agent_codex_bin",
-    "agent_gemini_bin",
-    "profiles",
-    "remote_loopback_port",
-  ]) {
-    if (Object.prototype.hasOwnProperty.call(config, key)) {
-      passthrough[key] = config[key];
-    }
+  for (const key of Object.keys(config)) {
+    if (SETTINGS_FORM_OWNED_KEYS.has(key) || UNSAFE_OBJECT_KEYS.has(key)) continue;
+    passthrough[key] = config[key];
   }
   return passthrough;
 }

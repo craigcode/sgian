@@ -443,8 +443,15 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
             chat.Changed += (_, _) =>
             {
                 var pane = Panes.FirstOrDefault(item => item.Id == paneId);
-                if (pane is not null) pane.Attention = chat.PendingPermission is not null ? "needs_input" : chat.Busy ? "working" : "idle";
+                var attentionChanged = false;
+                if (pane is not null)
+                {
+                    var nextAttention = chat.PendingPermission is not null ? "needs_input" : chat.Busy ? "working" : "idle";
+                    attentionChanged = !string.Equals(pane.Attention, nextAttention, StringComparison.Ordinal);
+                    pane.Attention = nextAttention;
+                }
                 ChatChanged?.Invoke(this, new ChatChangedEventArgs(paneId));
+                if (attentionChanged) WorkspaceChanged?.Invoke(this, EventArgs.Empty);
             };
             _chats[paneId] = chat;
         }
@@ -892,6 +899,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IAsyncDisposable
                     statePane.Unattended = item.Payload.TryGetProperty("unattended", out var flag)
                         ? flag.ValueKind == JsonValueKind.True
                         : AgentPaneInfo.IsUnattendedMode(statePane.Mode);
+                    WorkspaceChanged?.Invoke(this, EventArgs.Empty);
                 }
                 break;
             case "projects_changed":

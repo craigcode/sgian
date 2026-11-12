@@ -641,6 +641,30 @@ impl TerminalStore {
         }
     }
 
+    /// (T2) True when `pane_id` still holds an active `AgentSession` and live
+    /// non-ended liveness entry matching `generation`. Used after off-lock
+    /// per-turn process spawns so a concurrent close or restart never orphans a
+    /// freshly spawned child.
+    #[cfg(any(unix, windows))]
+    pub(crate) fn is_agent_generation_live(&self, pane_id: &str, generation: u64) -> bool {
+        let session_matches = self
+            .agent_sessions
+            .get(pane_id)
+            .is_some_and(|session| session.generation == generation);
+        if !session_matches {
+            return false;
+        }
+        self.liveness
+            .lock()
+            .ok()
+            .and_then(|liveness| {
+                liveness
+                    .get(pane_id)
+                    .map(|entry| entry.generation == generation && !entry.ended)
+            })
+            .unwrap_or(false)
+    }
+
     /// Test-only store-level restart (production restarts go through
     /// DaemonServer::restart_terminal, which runs the fork/exec off the lock —
     /// M7). close_pane drops the sizes entry, which would silently reset the

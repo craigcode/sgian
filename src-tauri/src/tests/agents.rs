@@ -3868,3 +3868,32 @@ printf '{"type":"result","status":"success","stats":{"duration_ms":15,"total_tok
 
     daemon.shutdown();
 }
+
+#[test]
+fn utf8_prefix_max_bytes_handles_multibyte_boundaries_and_malformed_lines() {
+    // 198 ASCII bytes + 4-byte emoji ('🦀') at bytes 198..202 crosses byte 200.
+    let mut line = "a".repeat(198);
+    line.push('🦀');
+    line.push_str("{broken json");
+
+    let prefix = crate::agent_stream::utf8_prefix_max_bytes(&line, 200);
+    assert_eq!(prefix.len(), 198);
+    assert!(std::str::from_utf8(prefix.as_bytes()).is_ok());
+
+    // Exact 200 ASCII bytes is preserved intact.
+    let exact = "b".repeat(200);
+    assert_eq!(
+        crate::agent_stream::utf8_prefix_max_bytes(&exact, 200).len(),
+        200
+    );
+
+    // 197 + 4-byte emoji (bytes 197..201) truncates to 197; 199 + emoji truncates to 199.
+    for pad in 197..=200 {
+        let mut s = "x".repeat(pad);
+        s.push('🦀');
+        s.push_str("tail");
+        let sliced = crate::agent_stream::utf8_prefix_max_bytes(&s, 200);
+        assert!(sliced.len() <= 200);
+        assert!(s.is_char_boundary(sliced.len()));
+    }
+}

@@ -6420,13 +6420,40 @@ impl DaemonServer {
                     return Err(error);
                 }
             };
+            // Re-check under the terminal store lock that the pane was not
+            // closed or restarted while `spawn()` ran off-lock, and arm
+            // `killer_slot` before releasing the lock so close/restart/shutdown
+            // can never orphan this child.
+            let armed = {
+                let terminals = match self.lock_terminals() {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        prepared.kill_and_reap();
+                        agent_end_turn(&shared);
+                        return Err(error);
+                    }
+                };
+                if !terminals.is_agent_generation_live(pane_id, generation) {
+                    drop(terminals);
+                    prepared.kill_and_reap();
+                    agent_end_turn(&shared);
+                    return Err(format!("agent session ended: {pane_id}"));
+                }
+                prepared.arm_killer(&killer_slot)
+            };
             {
                 let mut events_guard = match events.lock() {
                     Ok(guard) => guard,
                     Err(_) => {
-                        let mut child = prepared.child;
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        if let Ok(mut guard) = killer_slot.lock() {
+                            if let Some(killer) = guard.take() {
+                                killer.kill();
+                            }
+                        }
+                        if let Ok(mut child) = armed.child.lock() {
+                            let _ = child.wait();
+                        }
+                        armed.reaped.store(true, Ordering::SeqCst);
                         agent_end_turn(&shared);
                         return Err("agent event log lock poisoned".to_string());
                     }
@@ -6442,7 +6469,7 @@ impl DaemonServer {
             start_per_turn_agent_workers(
                 pane_id.to_string(),
                 generation,
-                prepared,
+                armed,
                 killer_slot,
                 shared,
                 liveness,

@@ -210,18 +210,26 @@ impl OutputTricks {
 pub(crate) fn is_invisible_trick(c: char) -> bool {
     matches!(
         c,
-        '\u{200b}' | '\u{2060}'..='\u{2064}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}'
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{200b}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+            | '\u{e0000}'..='\u{e007f}'
     )
 }
 
 /// True when a string can contain anything the agent-pane scrub would
 /// remove or count: an escape, a C0 control other than LF, CR and TAB, DEL,
-/// or a UTF-8 lead byte that can start a C1 control (0xC2), a character in
-/// the U+2000 block (0xE2) or a byte-order mark (0xEF). Plain text in any
-/// script, including emoji, passes without a second look.
+/// or a UTF-8 lead byte that can start a C1 control / soft hyphen (0xC2),
+/// combining grapheme joiner (0xCD), a character in the U+2000 block (0xE2),
+/// a byte-order mark (0xEF), or Unicode Tag characters (0xF3). Plain text
+/// in any script passes without a second look.
 fn may_need_scrub(text: &str) -> bool {
     text.bytes().any(|byte| {
-        matches!(byte, 0x1b | 0x7f | 0xc2 | 0xe2 | 0xef)
+        matches!(byte, 0x1b | 0x7f | 0xc2 | 0xcd | 0xe2 | 0xef | 0xf3)
             || (byte < 0x20 && !matches!(byte, b'\n' | b'\r' | b'\t'))
     })
 }
@@ -331,14 +339,25 @@ pub(crate) fn url_host(text: &str) -> Option<String> {
     let trimmed = text.trim();
     let rest = if let Some((_, rest)) = trimmed.split_once("://") {
         rest
-    } else if trimmed.starts_with("www.") {
+    } else if trimmed
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("www."))
+    {
         trimmed
     } else {
         return None;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.split(':').next().unwrap_or(host);
+    let host = if let Some(bracketed) = host.strip_prefix('[') {
+        let end = bracketed.find(']')?;
+        if end == 0 {
+            return None;
+        }
+        &host[..=end + 1]
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
