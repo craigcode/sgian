@@ -2023,3 +2023,28 @@ fn ssm_mock_mgs_kms_encrypted_discovery_multiplexing_resume_and_tamper_refusal()
     mgs.shutdown();
     daemon.shutdown();
 }
+
+#[test]
+fn remote_ssm_discovery_command_escapes_trailing_backslash_and_quotes() {
+    assert_eq!(
+        crate::ssm::remote_ssm_discovery_command(r"foo\"),
+        r#"sgian ctl --workspace "foo\\" --json ipc-endpoint"#
+    );
+    assert_eq!(
+        crate::ssm::remote_ssm_discovery_command(r#"foo\"; id #" "#),
+        r#"sgian ctl --workspace "foo\\\"; id #\" " --json ipc-endpoint"#
+    );
+}
+
+#[test]
+fn parse_ws_url_rejects_header_injection_and_malformed_brackets() {
+    assert!(crate::ssm::parse_ws_url("wss://host.example.com\r\nInjected: 1/stream").is_err());
+    assert!(crate::ssm::parse_ws_url("wss://host.example.com/stream\r\nX-Test: 1").is_err());
+    assert!(crate::ssm::parse_ws_url("wss://host.example.com/stream with spaces").is_err());
+    assert!(crate::ssm::parse_ws_url("wss://[::1]junk:443/stream").is_err());
+    let parsed =
+        crate::ssm::parse_ws_url("wss://[::1]:8443/v1/stream?token=1").expect("valid IPv6 ws url");
+    assert_eq!(parsed.host, "::1");
+    assert_eq!(parsed.port, 8443);
+    assert_eq!(parsed.path_and_query, "/v1/stream?token=1");
+}

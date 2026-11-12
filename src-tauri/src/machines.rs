@@ -66,6 +66,30 @@ pub(crate) fn validate_machine_name(raw: &str) -> Result<String, String> {
     Ok(raw.to_string())
 }
 
+/// Escape and format the remote `ipc-endpoint` discovery command for a POSIX
+/// double-quoted shell command line (`ssh` / SSM interactive shell). Escaping
+/// `\` before `"` / `$` / `` ` `` ensures a trailing `\` or `\"` cannot escape
+/// the closing quote (`foo\"` -> `"foo\\\""` rather than `"foo\\"` + `"`).
+pub(crate) fn remote_discovery_command(workspace: &str) -> String {
+    let mut escaped = String::with_capacity(workspace.len());
+    for ch in workspace.chars() {
+        match ch {
+            '\\' | '"' | '$' | '`' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            c if c.is_control() => {}
+            c => escaped.push(c),
+        }
+    }
+    format!("sgian ctl --workspace \"{escaped}\" --json ipc-endpoint")
+}
+
+/// True when `value` contains characters that can alter command/argument
+/// boundaries inside POSIX double quotes or control-character sequences.
+/// Mid-path backslashes remain allowed so Windows remote workspace paths
+/// (`C:\Users\dev\repo`) validate cleanly, and `remote_discovery_command`
+/// escapes them before transmission.
 fn has_shell_metachar(value: &str) -> bool {
     value.chars().any(|c| {
         c.is_control()
@@ -368,10 +392,7 @@ fn discover_remote_forward_target(entry: &MachineEntry, ssh_bin: &str) -> Result
     if let Some(port) = entry.port {
         cmd.arg("-p").arg(port.to_string());
     }
-    let remote_command = format!(
-        "sgian ctl --workspace \"{}\" --json ipc-endpoint",
-        entry.workspace
-    );
+    let remote_command = remote_discovery_command(&entry.workspace);
     cmd.arg("--").arg(host).arg(remote_command);
     let output = run_subprocess_bounded(&mut cmd, Duration::from_secs(25)).map_err(|error| {
         format!(

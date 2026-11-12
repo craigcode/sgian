@@ -178,7 +178,11 @@ struct SettingsView: View {
         // Preserve all fields not exposed by this form, including environment restrictions.
         var next = config
         next["shell"] = shell.isEmpty ? .null : .string(shell)
-        next["shell_args"] = .array(shellArguments.split(separator: "\n").map { .string(String($0)) })
+        let parsedShellArgs = shellArguments
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.hasSuffix("\r") ? String($0.dropLast()) : String($0) }
+            .filter { !$0.isEmpty }
+        next["shell_args"] = parsedShellArgs.isEmpty ? .null : .array(parsedShellArgs.map { .string($0) })
         next["agent_claude_bin"] = claudeBinary.isEmpty ? .null : .string(claudeBinary)
         next["agent_droid_bin"] = droidBinary.isEmpty ? .null : .string(droidBinary)
         next["agent_codex_bin"] = codexBinary.isEmpty ? .null : .string(codexBinary)

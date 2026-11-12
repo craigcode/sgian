@@ -374,19 +374,7 @@ describe("serializeSettingsForm", () => {
 
 describe("settingsPassthroughConfig", () => {
   it("preserves full-config fields that the form does not edit", () => {
-    expect(
-      settingsPassthroughConfig({
-        scrub_env: ["TOKEN"],
-        agent_permission_mode: "plan",
-        agent_claude_bin: "C:\\tools\\claude.exe",
-        agent_codex_bin: "/opt/openai/codex",
-        agent_gemini_bin: "/opt/google/gemini",
-        profiles: [{ name: "dev", kind: "shell" }],
-        remote_loopback_port: 0,
-        font_size: 15,
-        env: { FOO: "bar" },
-      }),
-    ).toEqual({
+    const withProto = Object.assign(Object.create({ inherited_key: "ignore" }), {
       scrub_env: ["TOKEN"],
       agent_permission_mode: "plan",
       agent_claude_bin: "C:\\tools\\claude.exe",
@@ -394,7 +382,44 @@ describe("settingsPassthroughConfig", () => {
       agent_gemini_bin: "/opt/google/gemini",
       profiles: [{ name: "dev", kind: "shell" }],
       remote_loopback_port: 0,
+      identity: { issuer: "local" },
+      lease_policy: "Exclusive",
+      agent_probe_interval_ms: 250,
+      kranz_bin: "/usr/local/bin/kranz",
+      machines: [{ name: "devbox" }],
+      future_custom_key: { nested: true },
+      shell: "/bin/zsh",
+      shell_args: ["-l"],
+      font_family: "JetBrains Mono",
+      font_size: 15,
+      env: { FOO: "bar" },
+      theme: { fg: "#fff" },
+      idle_shutdown_secs: 600,
+      restore_policy: "auto_respawn",
     });
+    Object.defineProperty(withProto, "__proto__", {
+      value: { polluted: true },
+      enumerable: true,
+      configurable: true,
+    });
+    const out = settingsPassthroughConfig(withProto);
+    expect(out).toEqual({
+      scrub_env: ["TOKEN"],
+      agent_permission_mode: "plan",
+      agent_claude_bin: "C:\\tools\\claude.exe",
+      agent_codex_bin: "/opt/openai/codex",
+      agent_gemini_bin: "/opt/google/gemini",
+      profiles: [{ name: "dev", kind: "shell" }],
+      remote_loopback_port: 0,
+      identity: { issuer: "local" },
+      lease_policy: "Exclusive",
+      agent_probe_interval_ms: 250,
+      kranz_bin: "/usr/local/bin/kranz",
+      machines: [{ name: "devbox" }],
+      future_custom_key: { nested: true },
+    });
+    expect(Object.prototype.hasOwnProperty.call(out, "__proto__")).toBe(false);
+    expect({}.polluted).toBeUndefined();
   });
 
   it("handles absent config", () => {

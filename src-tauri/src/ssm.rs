@@ -1720,14 +1720,14 @@ pub(crate) fn encode_ws_client_frame(opcode: u8, payload: &[u8]) -> Result<Vec<u
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedWsUrl {
+pub(crate) struct ParsedWsUrl {
     tls: bool,
-    host: String,
-    port: u16,
-    path_and_query: String,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) path_and_query: String,
 }
 
-fn parse_ws_url(raw: &str) -> Result<ParsedWsUrl, String> {
+pub(crate) fn parse_ws_url(raw: &str) -> Result<ParsedWsUrl, String> {
     let trimmed = raw.trim();
     let (tls, rest, default_port) = if let Some(r) = trimmed.strip_prefix("wss://") {
         (true, r, 443_u16)
@@ -1746,6 +1746,15 @@ fn parse_ws_url(raw: &str) -> Result<ParsedWsUrl, String> {
     if authority.is_empty() {
         return Err("StreamUrl has empty host".to_string());
     }
+    if authority
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace())
+        || path_and_query
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err("invalid control or whitespace character in StreamUrl".to_string());
+    }
 
     let (host, port) = if let Some(bracket_rest) = authority.strip_prefix('[') {
         let end = bracket_rest
@@ -1757,8 +1766,10 @@ fn parse_ws_url(raw: &str) -> Result<ParsedWsUrl, String> {
             port_str
                 .parse::<u16>()
                 .map_err(|_| format!("invalid port in StreamUrl: '{port_str}'"))?
-        } else {
+        } else if after.is_empty() {
             default_port
+        } else {
+            return Err(format!("invalid host suffix in StreamUrl: '{after}'"));
         };
         (h, p)
     } else if let Some((h, port_str)) = authority.rsplit_once(':') {
@@ -2490,9 +2501,8 @@ fn kms_challenge_context_enabled() -> bool {
         .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE"))
 }
 
-fn remote_ssm_discovery_command(workspace: &str) -> String {
-    let escaped = workspace.replace('"', "\\\"");
-    format!("sgian ctl --workspace \"{escaped}\" --json ipc-endpoint")
+pub(crate) fn remote_ssm_discovery_command(workspace: &str) -> String {
+    crate::machines::remote_discovery_command(workspace)
 }
 
 /// Discover the remote workspace's `loopback_port` via a short-lived

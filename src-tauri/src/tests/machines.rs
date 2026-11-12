@@ -1048,3 +1048,21 @@ fn daemon_client_machine_reconnect_recovers_after_tunnel_drop() {
     let _ = bridge2.join();
     daemon.shutdown();
 }
+
+#[test]
+fn remote_discovery_command_escapes_backslashes_quotes_and_expansions() {
+    assert_eq!(
+        remote_discovery_command("/home/ubuntu/repo"),
+        r#"sgian ctl --workspace "/home/ubuntu/repo" --json ipc-endpoint"#
+    );
+    // Trailing backslash must become `\\` so the closing `"` is never escaped.
+    assert_eq!(
+        remote_discovery_command(r"C:\Users\dev\"),
+        r#"sgian ctl --workspace "C:\\Users\\dev\\" --json ipc-endpoint"#
+    );
+    // Combined `\"` + metacharacters must stay inside the quoted argument.
+    assert_eq!(
+        remote_discovery_command("foo\\\"; id #`$(whoami)\n"),
+        r#"sgian ctl --workspace "foo\\\"; id #\`\$(whoami)" --json ipc-endpoint"#
+    );
+}

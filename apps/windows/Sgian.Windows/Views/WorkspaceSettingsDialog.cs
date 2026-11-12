@@ -124,7 +124,13 @@ internal static class WorkspaceSettingsDialog
             {
                 var next = (JsonObject)config.DeepClone();
                 next["shell"] = string.IsNullOrWhiteSpace(shell.Text) ? null : shell.Text;
-                next["shell_args"] = new JsonArray(shellArgs.Text.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(value => (JsonNode?)JsonValue.Create(value.TrimEnd('\r'))).ToArray());
+                var parsedShellArgs = shellArgs.Text
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(value => value.TrimEnd('\r'))
+                    .Where(value => value.Length > 0)
+                    .Select(value => (JsonNode?)JsonValue.Create(value))
+                    .ToArray();
+                next["shell_args"] = parsedShellArgs.Length == 0 ? null : new JsonArray(parsedShellArgs);
                 next["agent_claude_bin"] = string.IsNullOrWhiteSpace(claude.Text) ? null : claude.Text;
                 next["agent_droid_bin"] = string.IsNullOrWhiteSpace(droid.Text) ? null : droid.Text;
                 next["agent_codex_bin"] = string.IsNullOrWhiteSpace(codex.Text) ? null : codex.Text;

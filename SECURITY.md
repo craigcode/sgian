@@ -22,8 +22,9 @@ or an AWS Systems Manager Session Manager (`transport: "ssm"`, #115) `wss://`
 data-channel tunnel forwarding `127.0.0.1:<loopback_port>` over `smux` v1
 (authenticating AWS control-plane calls with the operator's ambient IAM/SSO
 credentials via `aws ssm`, verifying SHA-256 `PayloadDigest` on every binary
-`AgentMessage` frame with a strict `10 MiB` pre-allocation cap, failing closed
-if KMS `EncChallenge` is requested, and still requiring a valid Sgian
+`AgentMessage` frame with a strict `10 MiB` pre-allocation cap, negotiating
+AES-256-GCM session encryption when KMS `EncChallenge` is requested (and failing
+closed on invalid or tampered KMS challenges), and still requiring a valid Sgian
 `client_token` on the forwarded loopback IPC stream); the daemon never listens on `0.0.0.0` or external interfaces.
 Two opt-in `127.0.0.1`-only loopback listeners exist for SSH port forwarding:
 1. `remote_loopback_port` (`--listen-loopback <PORT>`, #116), primarily so a

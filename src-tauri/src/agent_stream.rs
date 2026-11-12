@@ -2195,18 +2195,8 @@ pub(crate) fn agent_reader_main(ctx: AgentReaderCtx) {
         if line.is_empty() {
             continue;
         }
-        let raw: Value = match serde_json::from_str(line) {
-            Ok(raw) => raw,
-            Err(error) => {
-                tracing::warn!(
-                    pane_id = %pane_id,
-                    event = "agent_line_malformed",
-                    %error,
-                    "malformed agent output line: {}",
-                    &line[..line.len().min(200)]
-                );
-                continue;
-            }
+        let Some(raw) = parse_agent_output_line(&pane_id, line) else {
+            continue;
         };
         let adapter = backend.adapter();
         if let Some(response) = (adapter.immediate_reply)(&raw) {
@@ -2395,6 +2385,108 @@ pub(crate) struct PreparedPerTurnSpawn {
     pub(crate) stderr: std::process::ChildStderr,
 }
 
+#[cfg(any(unix, windows))]
+pub(crate) struct ArmedPerTurnSpawn {
+    pub(crate) backend: AgentBackendKind,
+    pub(crate) child: Arc<Mutex<std::process::Child>>,
+    pub(crate) reaped: Arc<AtomicBool>,
+    pub(crate) stdout: std::process::ChildStdout,
+    pub(crate) stderr: std::process::ChildStderr,
+}
+
+#[cfg(any(unix, windows))]
+impl PreparedPerTurnSpawn {
+    /// Wrap the child handle and install its `AgentChildKiller` in
+    /// `killer_slot` before releasing the terminal store lock so a concurrent
+    /// `ClosePane`, `RestartPaneTerminal`, `InterruptAgent`, or shutdown can
+    /// always kill the turn process.
+    pub(crate) fn arm_killer(
+        self,
+        killer_slot: &Arc<Mutex<Option<AgentChildKiller>>>,
+    ) -> ArmedPerTurnSpawn {
+        let PreparedPerTurnSpawn {
+            backend,
+            child,
+            #[cfg(windows)]
+            job,
+            stdout,
+            stderr,
+        } = self;
+
+        #[cfg(unix)]
+        let pid = child.id();
+        let reaped = Arc::new(AtomicBool::new(false));
+        let child = Arc::new(Mutex::new(child));
+
+        #[cfg(unix)]
+        let turn_killer = AgentChildKiller {
+            pid,
+            reaped: Arc::clone(&reaped),
+            process_group: true,
+        };
+        #[cfg(windows)]
+        let turn_killer = AgentChildKiller {
+            child: Arc::clone(&child),
+            job,
+        };
+        if let Ok(mut guard) = killer_slot.lock() {
+            *guard = Some(turn_killer);
+        }
+        ArmedPerTurnSpawn {
+            backend,
+            child,
+            reaped,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// Synchronously kill and reap a freshly spawned per-turn child if the
+    /// pane closed or restarted before the killer could be armed.
+    pub(crate) fn kill_and_reap(mut self) {
+        #[cfg(windows)]
+        self.job.terminate();
+        #[cfg(unix)]
+        {
+            let pgid = -(self.child.id() as libc::pid_t);
+            unsafe {
+                libc::kill(pgid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Return a UTF-8 prefix of `text` spanning at most `max_bytes` bytes without
+/// splitting a multi-byte scalar value.
+pub(crate) fn utf8_prefix_max_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn parse_agent_output_line(pane_id: &str, line: &str) -> Option<Value> {
+    match serde_json::from_str(line) {
+        Ok(raw) => Some(raw),
+        Err(error) => {
+            tracing::warn!(
+                pane_id = %pane_id,
+                event = "agent_line_malformed",
+                %error,
+                "malformed agent output line: {}",
+                utf8_prefix_max_bytes(line, 200)
+            );
+            None
+        }
+    }
+}
+
 /// Spawn one turn of a per-turn provider (`codex exec`, `gemini`), streaming
 /// `prompt` into `stdin` on a helper thread and closing `stdin` (`EOF`)
 /// immediately so even 256 KiB prompts never block pipe buffers.
@@ -2552,18 +2644,8 @@ fn per_turn_agent_reader_main(ctx: PerTurnReaderCtx) {
         if line.is_empty() {
             continue;
         }
-        let raw: Value = match serde_json::from_str(line) {
-            Ok(raw) => raw,
-            Err(error) => {
-                tracing::warn!(
-                    pane_id = %pane_id,
-                    event = "agent_line_malformed",
-                    %error,
-                    "malformed agent output line: {}",
-                    &line[..line.len().min(200)]
-                );
-                continue;
-            }
+        let Some(raw) = parse_agent_output_line(&pane_id, line) else {
+            continue;
         };
         for event in normalize_provider_agent_event(backend, &raw) {
             match event.get("kind").and_then(Value::as_str).unwrap_or("") {
@@ -2668,7 +2750,7 @@ fn per_turn_agent_reader_main(ctx: PerTurnReaderCtx) {
 pub(crate) fn start_per_turn_agent_workers(
     pane_id: String,
     generation: u64,
-    prepared: PreparedPerTurnSpawn,
+    armed: ArmedPerTurnSpawn,
     killer_slot: Arc<Mutex<Option<AgentChildKiller>>>,
     shared: Arc<Mutex<AgentShared>>,
     liveness: Arc<Mutex<HashMap<String, PaneLiveness>>>,
@@ -2676,34 +2758,13 @@ pub(crate) fn start_per_turn_agent_workers(
     events: Arc<Mutex<AgentEventLog>>,
     dirty: Arc<AtomicBool>,
 ) {
-    let PreparedPerTurnSpawn {
+    let ArmedPerTurnSpawn {
         backend,
         child,
-        #[cfg(windows)]
-        job,
+        reaped,
         stdout,
         stderr,
-    } = prepared;
-
-    #[cfg(unix)]
-    let pid = child.id();
-    let reaped = Arc::new(AtomicBool::new(false));
-    let child = Arc::new(Mutex::new(child));
-
-    #[cfg(unix)]
-    let turn_killer = AgentChildKiller {
-        pid,
-        reaped: Arc::clone(&reaped),
-        process_group: true,
-    };
-    #[cfg(windows)]
-    let turn_killer = AgentChildKiller {
-        child: Arc::clone(&child),
-        job,
-    };
-    if let Ok(mut guard) = killer_slot.lock() {
-        *guard = Some(turn_killer);
-    }
+    } = armed;
 
     let stderr_router = router.clone();
     let stderr_pane_id = pane_id.clone();

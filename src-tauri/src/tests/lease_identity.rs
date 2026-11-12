@@ -3134,7 +3134,25 @@ fn output_guard_counts_hiding_tricks_not_redraws() {
         url_host("www.example.com/x"),
         Some("www.example.com".to_string())
     );
+    assert_eq!(
+        url_host("WWW.Example.COM/x"),
+        Some("www.example.com".to_string())
+    );
+    assert_eq!(
+        url_host("https://[::1]:8443/path"),
+        Some("[::1]".to_string())
+    );
+    assert_eq!(
+        url_host("https://user@[2001:DB8::1]/path"),
+        Some("[2001:db8::1]".to_string())
+    );
     assert_eq!(url_host("just words"), None);
+
+    // U+00AD (soft hyphen), U+034F (combining grapheme joiner), and Unicode Tag
+    // characters (U+E0000..=U+E007F) must be scrubbed and counted as invisible tricks.
+    let (scrubbed, tricks, _) = scrub_agent_text("hi\u{00ad}\u{034f}\u{e0041}!\n");
+    assert_eq!(scrubbed, "hi!\n");
+    assert_eq!(tricks.invisible, 3);
 }
 
 #[test]
@@ -4256,6 +4274,10 @@ fn security_audit_2026_10_18_pure_guards() {
     ));
     assert!(!origin_and_fetch_site_allowed(
         "POST /api/invoke HTTP/1.1\r\nHost: localhost:8421\r\nContent-Type: text/plain\r\n",
+        Some("localhost:8421")
+    ));
+    assert!(!origin_and_fetch_site_allowed(
+        "POST /api/invoke?foo=bar HTTP/1.1\r\nHost: localhost:8421\r\nContent-Type: text/plain\r\n",
         Some("localhost:8421")
     ));
 }

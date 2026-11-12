@@ -348,7 +348,8 @@ fn host_port(host: &str) -> Option<&str> {
 /// (curl, raw socket tests) that omit `Origin` and `Sec-Fetch-Site` continue
 /// to authenticate via the session key.
 pub(crate) fn origin_and_fetch_site_allowed(head: &str, host: Option<&str>) -> bool {
-    let is_post_invoke = head.starts_with("POST /api/invoke ");
+    let is_post_invoke =
+        head.starts_with("POST /api/invoke ") || head.starts_with("POST /api/invoke?");
     let mut has_custom_header = false;
     let mut has_simple_content_type = false;
     for line in head.split("\r\n").skip(1) {
@@ -595,6 +596,24 @@ pub(crate) fn start_serve_with(
     })
 }
 
+fn read_with_deadline(
+    stream: &mut std::net::TcpStream,
+    buf: &mut [u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<usize> {
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "request read deadline exceeded",
+            )
+        })?;
+    let _ = stream.set_read_timeout(Some(remaining));
+    stream.read(buf)
+}
+
 fn handle_connection(mut stream: std::net::TcpStream, session: &ServeSession) {
     if session.active.fetch_add(1, Ordering::SeqCst) >= SERVE_MAX_CONNECTIONS {
         session.active.fetch_sub(1, Ordering::SeqCst);
@@ -611,8 +630,9 @@ fn handle_connection(mut stream: std::net::TcpStream, session: &ServeSession) {
     let client = &session.client;
     let holder = session.holder.as_str();
     let allow_write = session.allow_write;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    // Read the head, then exactly Content-Length bytes of body.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // Read the head, then exactly Content-Length bytes of body within a fixed
+    // overall deadline so trickle writes cannot reset the socket timeout.
     let mut raw: Vec<u8> = Vec::new();
     let mut buf = [0u8; 4096];
     let head_end = loop {
@@ -627,7 +647,7 @@ fn handle_connection(mut stream: std::net::TcpStream, session: &ServeSession) {
             );
             return;
         }
-        match stream.read(&mut buf) {
+        match read_with_deadline(&mut stream, &mut buf, deadline) {
             Ok(0) => return,
             Ok(n) => raw.extend_from_slice(&buf[..n]),
             Err(_) => return,
@@ -716,7 +736,7 @@ fn handle_connection(mut stream: std::net::TcpStream, session: &ServeSession) {
     }
     let mut body = raw[head_end + 4..].to_vec();
     while body.len() < request.content_length {
-        match stream.read(&mut buf) {
+        match read_with_deadline(&mut stream, &mut buf, deadline) {
             Ok(0) => break,
             Ok(n) => body.extend_from_slice(&buf[..n]),
             Err(_) => return,
