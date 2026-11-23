@@ -216,6 +216,7 @@ final class WorkspaceModel: ObservableObject {
         chats = [:]
         layout = nil
         zoomed = false
+        showingSearch = false
         panePendingClose = nil
         return generation
     }

@@ -138,6 +138,8 @@ struct TerminalSearchBar: View {
         }
         .padding(8).background(.bar)
         .onAppear { focused = true }
+        .onChange(of: model.selectedPaneID) { _ in result = "" }
+        .onChange(of: query) { _ in result = "" }
         .onExitCommand { close() }
     }
 
