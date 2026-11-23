@@ -1,9 +1,11 @@
 # Public-readiness gate
 
-**Status (2026-09-30):** repository public; `v0.1.0` published as a source
-release (`docs/reviews/release-0.1.0.md`). The distribution machinery is
-still unexercised: every unticked item below gates the first release that
-carries installers, and none gated 0.1.0.
+**Status (2026-11-23):** repository public; `v0.1.0` is still the latest
+source-only release and has no downloadable assets. See the
+[fresh validation report](acceptance-macos-2026-11-23.md) and
+[Windows handoff](windows-acceptance.md). Every unticked item below gates
+the first installer release; local and CI development builds do not complete
+production signing, clean-machine installation or installed-update acceptance.
 
 Kranz needed a history rewrite into a fresh public origin. Sgian does not:
 `scripts/audit-public-history.sh` passes on the existing origin (gitleaks over
@@ -30,8 +32,8 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
 - [x] `CHANGELOG.md` finalised for the chosen version: `0.1.0 - 2026-09-30`.
 - [x] Version chosen by the owner: `0.1.0`, already set in
       `src-tauri/Cargo.toml`, `package.json` and `src-tauri/tauri.conf.json`
-      (`npm run release:check` verifies they agree). The owner creates the
-      `v0.1.0` tag after the visibility change.
+      (`npm run release:check` verifies they agree). `v0.1.0` is already
+      published; choose a new version before the first installer candidate.
 - [x] Repository description and topics set on 2026-09-30: "Terminal multiplexer for supervising
       coding agents: a Rust daemon keeps shells and agent sessions alive per
       workspace, with native macOS and Windows clients, keyboard leases, a
@@ -47,18 +49,27 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
 - [x] macOS hands-on acceptance of the packaged native app with a real Claude
       Code session (`docs/acceptance-macos-2026-09-23.md`): passed, with four
       non-blocking findings and the step list the Windows pass should follow.
+      Packaged build, terminal controls, workspace output isolation and
+      quit/reopen checks were refreshed through background automation on
+      [November 23](acceptance-macos-2026-11-23.md); this does not refresh
+      authenticated provider or screen-reader acceptance.
 - [ ] **Windows hands-on acceptance** (ENHANCEMENTS §1): Claude Code's
       full-screen TUI in the packaged app through splits and resizes; the
       lease dialog, unattended badge and project views exercised by a person.
-      CI compiles the WinUI client; nobody has used these screens on it.
+      CI builds and runs the native two-terminal smoke and daemon checks;
+      physical acceptance on the separate Windows machine remains pending.
+      Use [windows-acceptance.md](windows-acceptance.md) and the dated kit.
 - [x] **macOS architecture scope decided: universal.** One app covers Apple
       Silicon and Intel. The release workflow already builds with
       `SGIAN_MAC_ARCH=universal` (only the per-push validation job builds for
-      the runner's architecture), and a local universal build on 2026-10-04
+      the runner's architecture), and a local universal build on 2026-11-23
       produced a client and a bundled helper that both carry `x86_64` and
       `arm64` slices. The Intel slice has not been run on Intel hardware.
-- [x] Rust, vitest, Swift and Windows protocol tests green on every job for
-      every merged pull request; RustSec and npm audits are gates.
+- [x] Candidate `efe664b` passes all four CI jobs, including Rust, vitest,
+      Swift, Windows protocol/runtime checks and dependency audits:
+      [run 45276671936](https://github.com/craigcode/sgian/actions/runs/45276671936).
+      The November 23 refresh patches `url` and `cookie`; four existing
+      non-blocking RustSec warnings remain recorded in the validation report.
 - [x] Output-flood, process-tree kill, IPC fault and transport soak
       coverage in the suite.
 
@@ -71,21 +82,24 @@ throwaway Sparkle key: universal bundle checks, DMG, appcast and the
 independent signature check all passed, so only notarization and the
 installed acceptance below remain unexercised on that platform.
 
-- [ ] The 11 repository secrets and the `SPARKLE_PUBLIC_KEY` variable named
-      in `native-release.md` are provisioned; `release-signing-setup.md` is
-      the walk-through. As of 2026-10-06 the repository has **zero**
-      secrets and variables. The Windows certificate needs a decision
-      first: a new certificate no longer comes as an exportable PFX, which
-      is what the workflow imports.
+- [ ] Provision the protected environment's credentials from
+      [native-release.md](native-release.md); [release-signing-setup.md](release-signing-setup.md)
+      is the walk-through. As of November 23, both the repository and
+      `native-release` environment have **zero secrets and variables**.
+      Windows supports Azure Trusted Signing through OIDC or an existing
+      exportable PFX; choose and provision one path. Apple Developer ID,
+      notarization, Sparkle and Linux updater credentials are also required.
 - [ ] A candidate built by the manual workflow from protected `main`
       installs on clean macOS, Windows and Linux hosts.
 - [ ] A second candidate updates an installed first candidate (Sparkle on
       macOS, App Installer on Windows, Tauri updater on Linux). Until an
       installed-version update has been observed, the updater is untested
       code with keys in it.
-- [ ] The updater feed URL
-      (`https://github.com/craigcode/sgian/releases/latest/download/latest.json`)
-      resolves anonymously; it cannot while the repository is private.
+- [ ] The stable Sparkle `appcast.xml`, Windows `Sgian.appinstaller` and
+      Linux `latest.json` URLs under
+      `https://github.com/craigcode/sgian/releases/latest/download/` resolve
+      anonymously and reference verified assets. The repository is public;
+      the missing installer release and feed assets are the remaining issue.
 
 ## GitHub controls
 
@@ -95,19 +109,24 @@ installed acceptance below remain unexercised on that platform.
 - [x] The `native-release` environment exists; the release workflow is
       `workflow_dispatch` only.
 - [ ] The `native-release` environment requires owner approval for the
-      publish job (a paid-plan feature on private repositories; verify after
-      the visibility change).
+      release workflow. Verified November 23: protected branches only,
+      **no required-reviewer rule**. The workflow creates a draft; publishing
+      remains a separate owner action after installed acceptance.
 - [x] Private vulnerability reporting enabled (2026-09-30).
 - [x] Dependabot alerts and security updates, secret scanning and push
       protection enabled (2026-09-30).
 
-## Visibility change
+## Remaining acceptance scope
 
-1. Record the passing audit output and the exact commit.
-2. Owner approves public visibility explicitly.
-3. Change visibility without pushing a tag or publishing a release.
-4. Clone anonymously into a new directory; rerun
-   `scripts/audit-public-history.sh`; confirm the README, `SECURITY.md`,
-   licence and release list look right to a visitor.
-5. Enable private vulnerability reporting and the environment approval rule.
-6. Only then follow `releasing.md` for the first tagged release.
+- [ ] Intel Mac execution (the universal slices are built, not yet exercised
+      on Intel hardware), real sleep/wake and VoiceOver.
+- [ ] Current authenticated provider sessions and permission prompts on both
+      native clients. Claude, Codex and Gemini are supported. Droid/Factory
+      live acceptance is **deferred because no subscription is available**;
+      protocol tests do not replace it. Do not claim it passed.
+- [ ] Clean signed installs and a second signed candidate updating the first
+      on macOS, Windows and Linux, including recovery and preserved sessions.
+
+Public visibility and the source release were completed in September 2026;
+see [the source-release review](reviews/release-0.1.0.md). Do not repeat that
+transition or reuse its published version for installer artifacts.
