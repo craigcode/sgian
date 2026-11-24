@@ -124,7 +124,9 @@ private struct ChatMessageView: View {
         switch message.kind {
         case .user:
             HStack {
-                Spacer(minLength: 100)
+                // A fixed 100-point gutter can leave no text width in a
+                // narrow split. Let the spacer expand only when room permits.
+                Spacer(minLength: 12)
                 Text(message.text)
                     .textSelection(.enabled)
                     .padding(.horizontal, 13)

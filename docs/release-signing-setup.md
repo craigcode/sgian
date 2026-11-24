@@ -45,10 +45,11 @@ value on a command line that a shell history would keep.
 
 ## 0. The environment itself
 
-The `native-release` environment exists and is limited to protected
-branches. Add yourself as a required reviewer so the publish job waits for
-an explicit approval: Settings, Environments, `native-release`, Required
-reviewers. This is free on a public repository.
+The `native-release` environment is limited to protected branches and, as of
+2026-11-24, requires approval from `craigcode`. Self-review is allowed so the
+owner can approve a workflow they dispatched. Review occurs before release
+jobs use signing credentials; publishing the resulting draft is a separate
+owner action. Check this configuration with `npm run release:preflight`.
 
 ## 1. Apple: Developer ID certificate
 
@@ -268,17 +269,22 @@ procedure but has not run yet; its first run is the first candidate.
 ## 6. Check, then rehearse, then run
 
 ```bash
-gh secret list --env native-release
-gh variable list --env native-release
+npm run release:preflight
 ```
 
-Eleven secrets and one variable on the PFX path; on the Trusted Signing
-path, twelve secrets and five variables, with the two PFX secrets left
-unset. Then, before dispatching the workflow, run
-the macOS packaging rehearsal from `native-release.md` once more with your
-real Sparkle public key in the build and a throwaway private key in the
-rehearsal. It costs nothing and proves the embedded public key is the one
-you expect.
+The preflight reads environment protection, secret names and public variables;
+it never reads secret values, changes configuration or dispatches a workflow.
+It checks the PFX path when `WINDOWS_CERTIFICATE` exists, otherwise the Azure
+path, and exits nonzero with the missing inputs. The Linux updater password is
+optional when the key is unencrypted. A passing metadata check does not prove
+that credentials are valid or private/public keys match.
+
+Before dispatching, run the macOS packaging rehearsal from `native-release.md`
+with a **matching throwaway Sparkle key pair**: its public key in the rehearsal
+app and its private key supplied to packaging. A real public key paired with
+a throwaway private key must fail signature verification. Keep production keys
+out of rehearsals. The production workflow embeds the configured release
+public key and verifies its signed package against that same key.
 
 Then follow "Create a candidate" in `native-release.md`: dispatch the
 workflow from `main`, let it build and sign on all three platforms, and
