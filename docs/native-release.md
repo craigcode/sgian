@@ -95,6 +95,9 @@ The [November 23 validation report](acceptance-macos-2026-11-23.md) records the
 earlier `0.1.0` development candidate and the checks actually completed.
 Version `0.2.0` is now prepared in source, with [draft release notes](releases/0.2.0.md);
 it has not been tagged, signed or published.
+The [November 24 acceptance report](acceptance-macos-2026-11-24.md) covers the
+`0.2.0` DMG rehearsal, live Claude/Codex native sessions and Intel-only smoke
+under Rosetta, and identifies the remaining external acceptance blockers.
 
 ## Signing configuration
 

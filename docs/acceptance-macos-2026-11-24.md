@@ -39,8 +39,8 @@ a clean production installation or an installed Sparkle update.
 
 ## Live native acceptance
 
-Used separately identified QA apps and new temporary workspaces. Background
-accessibility automation kept the user's foreground application unchanged.
+Used separately identified QA apps and new temporary workspaces through the
+background accessibility driver, with no explicit app activation requested.
 No private project files were sent to the provider services; prompts requested
 only fixed response markers and explicitly forbade tools or file inspection.
 
@@ -71,6 +71,14 @@ keeping narrow messages readable. Conversation history itself was intact.
 The rebuilt universal app passes the same five-pane reproduction: both user
 prompts and completed replies are visible at the original window dimensions.
 The final build passes deep/strict ad-hoc signature checks for both slices.
+Final binary source is `e5ca2e8af083a9fbad6c8ecd85c76686447b0099`; the following
+documentation update does not change those binaries. Packaged native smoke
+passes on Apple Silicon and with the Intel-only client/helper under Rosetta.
+The final rehearsal DMG also passes packaging, Sparkle verification and DMG
+integrity, with SHA-256
+`49b13fdadd845171e8550ede7c0d69c8712486d5382b64878f943b69a2cc6f01`.
+It is saved under `final-rehearsal/`, distinct from the initial DMG above.
+Tracking PR: [#136](https://github.com/craigcode/sgian/pull/136).
 
 `release:check` now validates the npm root lock entry, the Sgian Cargo lock
 entry, both macOS version fields and the Windows Identity version, alongside
