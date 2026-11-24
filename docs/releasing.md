@@ -29,7 +29,8 @@ build from the tag. Sections 2 and 3 do not apply.
 - The owner picks the version (`0.2.0` is prepared, not published). Set it in
   `src-tauri/Cargo.toml` and its lockfile, `package.json` and its lockfile,
   `src-tauri/tauri.conf.json`, and the native Info.plist/MSIX manifest
-  defaults. `npm run release:check` checks the main version sources agree.
+  defaults. `npm run release:check` checks all those version sources agree,
+  including the Windows package version limits.
 - Move the `Unreleased` section of `CHANGELOG.md` under the version. Keep
   the `Unreleased` heading; mark the version unreleased until publication,
   then replace that marker with the actual release date.
@@ -39,6 +40,9 @@ build from the tag. Sections 2 and 3 do not apply.
 ## 2. Candidate
 
 - Run `scripts/audit-public-history.sh` from a full clone.
+- Run `npm run release:preflight` with authenticated GitHub CLI access. It
+  checks signing input names and environment protection without reading
+  private keys or dispatching builds; address every reported blocker.
 - Dispatch the native release workflow from protected `main`
   (`native-release.md`, "Create a candidate"). It builds, signs and verifies
   every platform artifact against the embedded keys and uploads a draft.

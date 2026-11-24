@@ -41,6 +41,9 @@ to the [release gates](docs/public-readiness.md).
 
 ### Project
 
+- Release checks now cover native manifest defaults and both lockfiles.
+  A read-only `release:preflight` command reports missing signing inputs and
+  release-environment protection before a candidate build is dispatched.
 - Cross-client accessibility hardening (#82):
   - `apps/macos`: `TerminalSurface` enables `SwiftTerm`'s `notifyUpdateChanges`
     (previously `false`, leaving `rangeChanged` dead and `AXValue` empty),
@@ -215,6 +218,8 @@ to the [release gates](docs/public-readiness.md).
 
 ### Fixes
 
+- macOS agent messages remain readable in narrow splits; the fixed user-message
+  gutter no longer consumes the entire available text width.
 - macOS terminal search resets when switching workspaces, panes or queries,
   preventing stale match counts and search state from carrying over.
 - The vendored `portable-pty` fork drops its serial-port module and with it
