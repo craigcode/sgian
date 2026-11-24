@@ -10,9 +10,10 @@ have been completed; an ad-hoc macOS app or unsigned MSIX is a development build
 
 Both native clients provide persistent horizontal/vertical splits, draggable
 separators, pane zoom, keyboard navigation, terminal search, command discovery,
-recent workspaces, terminal and Claude/Droid chat panes, permission decisions,
-restart/rename/close, and workspace settings with named profiles. Layouts use
-the same daemon schema as Tauri, so switching clients preserves the arrangement.
+recent workspaces, terminal and Claude/Codex/Gemini/Droid chat panes,
+permission decisions, restart/rename/close, and workspace settings with named
+profiles. Layouts use the same daemon schema as Tauri, so switching clients
+preserves the arrangement.
 Closing the window leaves the daemon and sessions running. Closing a pane stops
 its process and requires confirmation. Each macOS window owns its terminal
 views; commands and Settings follow the active window.
@@ -89,6 +90,11 @@ App Installer descriptor is the supported Windows distribution/update path.
 CI exercises two native terminal surfaces, persisted split layout and terminal
 search, in addition to protocol tests and daemon smoke checks. It does not
 replace real provider-TUI, accessibility or installed-update acceptance.
+For the separate Windows machine, use the [Windows acceptance handoff](windows-acceptance.md).
+The [November 23 validation report](acceptance-macos-2026-11-23.md) records the
+earlier `0.1.0` development candidate and the checks actually completed.
+Version `0.2.0` is now prepared in source, with [draft release notes](releases/0.2.0.md);
+it has not been tagged, signed or published.
 
 ## Signing configuration
 
@@ -123,8 +129,10 @@ afterward. It removes only certificates imported by that build.
 
 ## Create a candidate
 
-1. Bump `package.json`, the npm lockfile, Cargo package/lockfile and Tauri version
-   together. macOS bundle and Windows package versions are stamped at build time.
+1. Confirm the prepared `0.2.0` version and release notes. `v0.1.0` is already
+   a published source-only release and must not be reused. Future bumps must
+   update package/lockfiles, Tauri and native manifest defaults together;
+   macOS bundle and Windows package versions are also stamped at build time.
 2. Merge the reviewed source through the four required CI checks.
 3. Run **Native release candidate** from `main`. It re-runs validation against
    that commit, then builds from clean source without compiled signing caches.
@@ -141,9 +149,10 @@ afterward. It removes only certificates imported by that build.
 
 Release assets include `appcast.xml`, `Sgian.appinstaller`, Linux `latest.json`,
 and `SHA256SUMS.txt`. Asset download URLs are pinned to their versioned release.
-The stable feed URLs use GitHub's latest release. This repository and its release
-assets must be anonymously readable before public distribution, or the feed
-and asset URLs must be migrated to a public distribution repository together.
+The stable feed URLs use GitHub's latest release. The repository is already
+public, but `v0.1.0` has no installer or feed assets. Verify anonymous access
+to all three feeds and their versioned downloads when publishing the first
+installer release.
 
 ## Required installed acceptance before publication
 
@@ -151,9 +160,11 @@ and asset URLs must be migrated to a public distribution repository together.
   Macs. Install in Applications and launch through normal Gatekeeper checks.
 - Install the Windows MSIX through `Sgian.appinstaller` on a clean Windows
   machine. Verify publisher identity and the bundled helper's launch.
-- Exercise real Claude/Droid login and streaming, allow/deny prompts, terminal
+- Exercise supported providers' real login and streaming, allow/deny prompts, terminal
   TUIs, resize/copy/paste/search, close/reopen and sleep/wake. Test VoiceOver and
   Narrator, including pane focus and splitter adjustment.
+  Record each provider separately. Droid/Factory live acceptance is deferred
+  while no subscription is available; do not substitute mock results for it.
 - Switch between two projects with identically named/numbered panes. Confirm
   neither terminal content nor pending input crosses workspaces.
 - Install an older production-signed native version and update to the candidate

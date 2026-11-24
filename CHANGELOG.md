@@ -5,8 +5,18 @@ follow SemVer once the first public tag exists.
 
 ## Unreleased
 
+## 0.2.0 - Unreleased
+
+Prepared on 2026-11-23; not tagged or published. Publication remains subject
+to the [release gates](docs/public-readiness.md).
+
 ### Security
 
+- Update `url` to 2.5.9, `cookie` to 0.18.3, `rustix` to 1.1.6 and `tokio`
+  to 1.53.3 for current RustSec advisories. Disable unused Nix default
+  features in the PTY fork, removing the unmaintained `pin-utils` dependency.
+  The remaining Chrono warning concerns an inactive optional dependency;
+  its disposition is recorded in [the dependency review](docs/reviews/dependencies-0.2.0.md).
 - Full-stack security hardening across the daemon, loopback HTTP server, CLI,
   native desktop clients, and CI workflows (#101):
   - Loopback HTTP (`ctl serve`) and IPC: constant-time session-key and token
@@ -63,11 +73,11 @@ follow SemVer once the first public tag exists.
   PFX certificate is set: it logs in with an OIDC identity, installs
   Microsoft's signtool plug-in, takes the MSIX publisher from a variable
   and signs the package after building it. The PFX path is unchanged.
-  CI also runs weekly on `main`, so a dependency advisory published between
-  pushes fails a run instead of waiting for the next change.
-- `docs/release-signing-setup.md`: a step-by-step for obtaining the
-  eleven signing secrets and the Sparkle public key, including the
-  Windows certificate decision the workflow's PFX import now forces.
+  CI also runs weekly on `main`, so dependency audits surface advisories
+  published between pushes instead of waiting for the next change.
+- `docs/release-signing-setup.md`: a step-by-step for provisioning Apple,
+  Sparkle and Linux credentials, plus either Azure Trusted Signing or a
+  Windows PFX certificate.
 - `scripts/package-macos-native.sh` gains a rehearsal mode
   (`SGIAN_PACKAGE_REHEARSAL=1`) that runs the bundle checks, the DMG, the
   Sparkle appcast and its verification with ad-hoc signing and no
@@ -205,11 +215,14 @@ follow SemVer once the first public tag exists.
 
 ### Fixes
 
+- macOS terminal search resets when switching workspaces, panes or queries,
+  preventing stale match counts and search state from carrying over.
 - The vendored `portable-pty` fork drops its serial-port module and with it
   the `serial` crate, unmaintained since 2017; Sgian never opened serial
   ports. `.cargo/audit.toml` records the two advisories that remain
-  accepted on purpose, each with its reason and removal condition, so a
-  new audit warning fails CI instead of joining a known list.
+  accepted on purpose, each with its reason and removal condition.
+  Unignored vulnerabilities fail CI; informational warnings remain visible
+  for review and do not fail cargo-audit by default.
 - `ctl send` treats a real line feed in the text as Enter, like the `\n`
   escape, so `sgian ctl send pane $'text\n'` submits to a shell and to a
   full-screen agent input alike; `--lf` and `--raw` still send it as given.

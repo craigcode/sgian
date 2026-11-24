@@ -17,7 +17,8 @@ installer remains a compatibility validation target. The current branch also:
 - exercises a 32-client named-pipe burst in native Windows CI.
 
 What remains is acceptance on the Windows machine that originally reproduced
-the failures:
+the failures. The [Windows handoff](docs/windows-acceptance.md) provides the
+portable-build smoke and hands-on procedure for that later pass:
 
 - Run Claude Code's full-screen TUI from the packaged app at several pane sizes,
   including repeated splits and resizes. Confirm that borders no longer
@@ -46,9 +47,9 @@ signing configuration, installation/update acceptance, and recovery.
   packages, and assembles a draft only after all platform artifacts validate.
 - Install each candidate on clean machines and exercise an installed-version
   update. Complete the native acceptance checklist before publishing the draft.
-- Ensure published GitHub release downloads are accessible to customers. This
-  private repository's unauthenticated update URLs require a public release
-  channel before external distribution.
+- Verify anonymous downloads and all three updater feeds when publishing the
+  first installer release. The repository is public; the existing `v0.1.0`
+  release has source only and no feed assets. Use a fresh version.
 
 ## 3. Agent and orchestration improvements
 

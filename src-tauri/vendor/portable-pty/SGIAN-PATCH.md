@@ -38,4 +38,11 @@ with it; check upstream's dependency list at that point.
 `env_allow` filter) and `scrub_env: ["SHELL"]` do not unconditionally re-inject
 `SHELL` into the child environment.
 
+## Narrow Nix features (2026-11-23)
+
+Disable Nix's default feature set and retain only `fs` (`unistd::access`)
+and `term` (`Termios` / `tcgetattr`), the APIs used by this fork. The unused
+`aio` feature pulled in the unmaintained `pin-utils` crate
+(RUSTSEC-2026-0441). No PTY behavior or Nix API version changes. Recheck this
+feature list if new Nix calls are added or the fork is replaced upstream.
 

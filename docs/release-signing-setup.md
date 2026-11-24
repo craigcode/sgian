@@ -1,7 +1,9 @@
 # Provisioning the release signing credentials
 
-The native release workflow needs eleven secrets and one variable, all on the
-`native-release` GitHub environment. This is the walk-through for obtaining
+The native release workflow needs the credentials listed in
+[native-release.md](native-release.md), all on the `native-release` GitHub
+environment. The Windows requirements depend on whether PFX or Azure Trusted
+Signing is selected. This is the walk-through for obtaining
 each one, in the order that avoids waiting on anyone twice. Nothing here is
 run by Sgian or by an agent session; these are operator steps, and every
 secret is created by you and pasted by you.

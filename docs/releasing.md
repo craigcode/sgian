@@ -1,7 +1,7 @@
 # Cutting a release
 
-Sgian ships a notarized macOS DMG, a signed Windows MSIX plus App Installer
-feed, and signed Linux packages, all from one manual GitHub workflow that
+Sgian's installer release workflow produces a notarized macOS DMG, a signed
+Windows MSIX plus App Installer feed, and signed Linux packages. It
 assembles a draft release only after every platform artifact validates. There
 is no crates.io publication: the reserved crate names are placeholders.
 
@@ -17,20 +17,22 @@ tags or publishes releases.
 ## Source release
 
 A release without installers, as 0.1.0 is. It needs none of the signing
-prerequisites above: the version pull request below, a passing
-`scripts/audit-public-history.sh`, the visibility change in
-`public-readiness.md`, then the owner creates the `v<version>` tag on the
+prerequisites above: the version pull request below and a passing
+`scripts/audit-public-history.sh`. The repository is already public. The
+owner then creates the `v<version>` tag on the
 merge commit and publishes a release whose notes are that version's
 changelog section, with no artifacts attached. The README tells readers to
 build from the tag. Sections 2 and 3 do not apply.
 
 ## 1. Version pull request
 
-- The owner picks the version. Set it in `src-tauri/Cargo.toml`,
-  `package.json` and `src-tauri/tauri.conf.json`; `npm run release:check`
-  verifies they agree.
-- Move the `Unreleased` section of `CHANGELOG.md` under the version and
-  date. Keep the `Unreleased` heading.
+- The owner picks the version (`0.2.0` is prepared, not published). Set it in
+  `src-tauri/Cargo.toml` and its lockfile, `package.json` and its lockfile,
+  `src-tauri/tauri.conf.json`, and the native Info.plist/MSIX manifest
+  defaults. `npm run release:check` checks the main version sources agree.
+- Move the `Unreleased` section of `CHANGELOG.md` under the version. Keep
+  the `Unreleased` heading; mark the version unreleased until publication,
+  then replace that marker with the actual release date.
 - Merge through the normal pull-request path; all four CI checks must pass
   on the merge commit.
 
