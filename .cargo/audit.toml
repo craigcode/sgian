@@ -2,7 +2,9 @@
 # from the repository root, which reads this file; run it the same way locally.
 #
 # Every advisory listed here is accepted deliberately, with the reason and the
-# condition for removing the entry. Anything not listed fails the audit.
+# condition for removing the entry. Unignored vulnerabilities fail the audit;
+# informational warnings remain visible but do not fail cargo-audit by default.
+# See docs/reviews/dependencies-0.2.0.md for the current warning review.
 [advisories]
 ignore = [
   # proc-macro-error is unmaintained. It reaches the build only on Linux,

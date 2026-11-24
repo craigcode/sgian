@@ -92,7 +92,9 @@ search, in addition to protocol tests and daemon smoke checks. It does not
 replace real provider-TUI, accessibility or installed-update acceptance.
 For the separate Windows machine, use the [Windows acceptance handoff](windows-acceptance.md).
 The [November 23 validation report](acceptance-macos-2026-11-23.md) records the
-current development candidate and the checks actually completed.
+earlier `0.1.0` development candidate and the checks actually completed.
+Version `0.2.0` is now prepared in source, with [draft release notes](releases/0.2.0.md);
+it has not been tagged, signed or published.
 
 ## Signing configuration
 
@@ -127,9 +129,10 @@ afterward. It removes only certificates imported by that build.
 
 ## Create a candidate
 
-1. Choose a fresh version: `v0.1.0` is already a published source-only release.
-   Bump `package.json`, the npm lockfile, Cargo package/lockfile and Tauri version
-   together. macOS bundle and Windows package versions are stamped at build time.
+1. Confirm the prepared `0.2.0` version and release notes. `v0.1.0` is already
+   a published source-only release and must not be reused. Future bumps must
+   update package/lockfiles, Tauri and native manifest defaults together;
+   macOS bundle and Windows package versions are also stamped at build time.
 2. Merge the reviewed source through the four required CI checks.
 3. Run **Native release candidate** from `main`. It re-runs validation against
    that commit, then builds from clean source without compiled signing caches.

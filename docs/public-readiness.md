@@ -1,7 +1,9 @@
 # Public-readiness gate
 
 **Status (2026-11-23):** repository public; `v0.1.0` is still the latest
-source-only release and has no downloadable assets. See the
+source-only release and has no downloadable assets. Version `0.2.0` is
+prepared in source with [draft release notes](releases/0.2.0.md) and a
+[dependency review](reviews/dependencies-0.2.0.md); it is not published. See the
 [fresh validation report](acceptance-macos-2026-11-23.md) and
 [Windows handoff](windows-acceptance.md). Every unticked item below gates
 the first installer release; local and CI development builds do not complete
@@ -29,11 +31,11 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
       `.gitleaksignore` (commit, file, rule, line); never by path or rule.
 - [x] crates.io names held by the owner: `sgian` 0.0.1, `sgian-pty` 0.0.1,
       `sgian-protocol` 0.0.1 (placeholders whose READMEs state the intent).
-- [x] `CHANGELOG.md` finalised for the chosen version: `0.1.0 - 2026-09-30`.
-- [x] Version chosen by the owner: `0.1.0`, already set in
-      `src-tauri/Cargo.toml`, `package.json` and `src-tauri/tauri.conf.json`
-      (`npm run release:check` verifies they agree). `v0.1.0` is already
-      published; choose a new version before the first installer candidate.
+- [x] `CHANGELOG.md` and draft release notes prepared for `0.2.0`, marked
+      unreleased until the actual publication date is known.
+- [x] Version `0.2.0` approved by the owner and set in Cargo, npm, Tauri and
+      native manifest defaults, including both lockfiles.
+      `npm run release:check` verifies the main version sources agree.
 - [x] Repository description and topics set on 2026-09-30: "Terminal multiplexer for supervising
       coding agents: a Rust daemon keeps shells and agent sessions alive per
       workspace, with native macOS and Windows clients, keyboard leases, a
@@ -65,11 +67,15 @@ human commits under the GitHub noreply identity, no blobs over 5 MiB).
       the runner's architecture), and a local universal build on 2026-11-23
       produced a client and a bundled helper that both carry `x86_64` and
       `arm64` slices. The Intel slice has not been run on Intel hardware.
-- [x] Candidate `efe664b` passes all four CI jobs, including Rust, vitest,
+- [x] Historical `0.1.0` development candidate `efe664b` passes all four CI jobs, including Rust, vitest,
       Swift, Windows protocol/runtime checks and dependency audits:
       [run 45276671936](https://github.com/craigcode/sgian/actions/runs/45276671936).
-      The November 23 refresh patches `url` and `cookie`; four existing
-      non-blocking RustSec warnings remain recorded in the validation report.
+      Its artifacts and manual checks retain that version and source identity.
+      The `0.2.0` preparation additionally patches Rustix and Tokio and removes
+      `pin-utils`; only inactive optional Chrono remains as an unignored
+      informational warning. See the dependency review. All four checks must
+      pass on the updated [version PR](https://github.com/craigcode/sgian/pull/133)
+      before merge and again on its merge commit before making a candidate.
 - [x] Output-flood, process-tree kill, IPC fault and transport soak
       coverage in the suite.
 

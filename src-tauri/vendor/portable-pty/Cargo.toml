@@ -37,7 +37,8 @@ version = "0.4"
 
 [dependencies.nix]
 version = "0.25"
-features = ["term"]
+default-features = false
+features = ["fs", "term"]
 
 [dependencies.serde]
 version = "1.0"
